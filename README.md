@@ -107,18 +107,15 @@ filesystem store:
 The compacted result includes the artifact ID and sha256 so a human can retrieve
 it later with `noisegate cat <artifact-id>`.
 
-## Hermes-LCM And Hindsight
+## Compatibility
 
-Noisegate is not Hermes-LCM and does not require Hermes-LCM.
+Noisegate is designed as a small, standalone Hermes Agent plugin. It does one
+job: compact noisy tool output before it is appended to model context.
 
-If Hermes-LCM is installed, current Hermes hook ordering means LCM sees and
-stores the post-Noisegate tool result. That is usually what you want for model
-context hygiene, but it is not a raw-output archive. A future raw-before-compact
-LCM integration could store the original separately; today, use Noisegate
-artifact mode when you explicitly need retrievable raw terminal output.
-
-Hindsight is separate semantic memory. Noisegate does not integrate with
-Hindsight and never writes to it.
+If you run additional context, memory, or transcript layers around Hermes, treat
+Noisegate as an inline compaction step rather than a storage system. Downstream
+layers will usually see the compacted result. When exact raw output needs to be
+recoverable, enable Noisegate artifact mode for that run.
 
 ## Safety Defaults
 
