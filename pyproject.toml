@@ -1,0 +1,63 @@
+[project]
+name = "noisegate-hermes"
+version = "0.1.0"
+description = "Standalone Hermes Agent plugin and CLI for deterministic terminal/tool-output compaction."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+  { name = "Noisegate contributors" },
+]
+keywords = ["agent", "cli", "compaction", "hermes", "plugin"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.scripts]
+noisegate = "noisegate.cli:main"
+
+[project.entry-points."hermes_agent.plugins"]
+noisegate = "noisegate"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["noisegate"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"noisegate/plugin.yaml" = "noisegate/plugin.yaml"
+"noisegate/py.typed" = "noisegate/py.typed"
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/LICENSE",
+  "/README.md",
+  "/pyproject.toml",
+  "/tests",
+  "/noisegate",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]

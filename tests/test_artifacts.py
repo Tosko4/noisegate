@@ -1,0 +1,116 @@
+from __future__ import annotations
+
+import os
+import stat
+from pathlib import Path
+
+import pytest
+
+from noisegate.artifacts import ArtifactSecurityError, ArtifactStore, ArtifactTooLarge
+from noisegate.engine import NoisegateOptions, reduce_text
+
+
+def numbered(prefix: str, count: int) -> str:
+    return "\n".join(f"{prefix} {index:03d}" for index in range(1, count + 1))
+
+
+def mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def test_artifacts_are_disabled_by_default(tmp_path: Path) -> None:
+    raw = numbered("line", 100)
+    options = NoisegateOptions(max_chars=120, artifact_dir=tmp_path / "artifacts")
+
+    result = reduce_text(raw, command="pytest", options=options)
+
+    assert result.changed is True
+    assert "artifact" not in result.metadata
+    assert not (tmp_path / "artifacts").exists()
+
+
+def test_artifact_store_uses_private_directory_and_file_modes(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "store", size_cap=1024)
+
+    artifact = store.store("raw terminal output")
+
+    assert artifact.artifact_id.startswith("ng_")
+    assert artifact.sha256
+    assert mode(tmp_path / "store") == 0o700
+    assert mode(tmp_path / "store" / f"{artifact.artifact_id}.txt") == 0o600
+    assert store.read(artifact.artifact_id) == "raw terminal output"
+
+
+def test_reduce_text_records_artifact_metadata_when_enabled(tmp_path: Path) -> None:
+    raw = numbered("line", 100)
+    options = NoisegateOptions(
+        max_chars=120,
+        artifact_enabled=True,
+        artifact_dir=tmp_path / "store",
+    )
+
+    result = reduce_text(raw, command="pytest", options=options)
+
+    artifact = result.metadata["artifact"]
+    assert isinstance(artifact, dict)
+    assert artifact["id"].startswith("ng_")
+    assert artifact["sha256"]
+    assert str(artifact["id"]) in result.text
+    assert str(artifact["sha256"])[:16] in result.text
+    assert ArtifactStore(tmp_path / "store").read(str(artifact["id"])) == raw
+
+
+def test_artifact_store_refuses_outputs_over_size_cap(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "store", size_cap=4)
+
+    with pytest.raises(ArtifactTooLarge):
+        store.store("too large")
+
+
+def test_reduce_text_reports_too_large_artifact_without_failing(tmp_path: Path) -> None:
+    raw = numbered("line", 100)
+    options = NoisegateOptions(
+        max_chars=120,
+        artifact_enabled=True,
+        artifact_dir=tmp_path / "store",
+        artifact_size_cap=10,
+    )
+
+    result = reduce_text(raw, command="pytest", options=options)
+
+    assert result.changed is True
+    assert result.metadata["artifact"] == {
+        "stored": False,
+        "reason": "too_large",
+        "size_bytes": len(raw.encode("utf-8")),
+        "size_cap": 10,
+    }
+
+
+def test_artifact_store_rejects_symlink_root(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    os.symlink(real, link)
+
+    with pytest.raises(ArtifactSecurityError):
+        ArtifactStore(link).store("raw")
+
+
+def test_artifact_store_rejects_path_traversal_ids(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "store")
+    _ = store.store("raw")
+
+    with pytest.raises(ArtifactSecurityError):
+        store.read("../ng_bad")
+
+
+def test_artifact_store_rejects_symlink_artifact_file(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "store")
+    artifact = store.store("raw")
+    path = tmp_path / "store" / f"{artifact.artifact_id}.txt"
+    path.unlink()
+    os.symlink(tmp_path / "outside", path)
+
+    with pytest.raises(ArtifactSecurityError):
+        store.read(artifact.artifact_id)
