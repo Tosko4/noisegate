@@ -4,7 +4,9 @@ import errno
 import hashlib
 import os
 import re
+import stat
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 DEFAULT_SIZE_CAP = 1_000_000
@@ -38,6 +40,22 @@ class StoredArtifact:
             "sha256": self.sha256,
             "size_bytes": self.size_bytes,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactInfo:
+    artifact_id: str
+    sha256: str
+    size_bytes: int
+    modified_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactCheck:
+    artifact_id: str
+    ok: bool
+    reason: str
+    path: str
 
 
 def default_artifact_dir() -> Path:
@@ -96,19 +114,134 @@ class ArtifactStore:
         return StoredArtifact(artifact_id, digest, len(data))
 
     def read(self, artifact_id: str) -> str:
+        return self._read_bytes(artifact_id).decode("utf-8")
+
+    def list(self) -> list[ArtifactInfo]:
         root = self._ensure_root()
-        path = self._path_for(artifact_id, root=root)
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        try:
-            fd = os.open(path, flags)
-        except OSError as exc:
-            if exc.errno == errno.ELOOP:
-                raise ArtifactSecurityError("artifact path resolves through a symlink") from exc
-            raise
-        with os.fdopen(fd, "rb") as handle:
-            return handle.read().decode("utf-8")
+        artifacts: list[ArtifactInfo] = []
+        for path in sorted(root.glob("ng_*.txt")):
+            artifact_id = path.stem
+            if ARTIFACT_ID_RE.fullmatch(artifact_id) is None:
+                continue
+            try:
+                data = self._read_bytes(artifact_id, root=root)
+            except ArtifactError:
+                continue
+            stat_result = path.stat()
+            artifacts.append(
+                ArtifactInfo(
+                    artifact_id=artifact_id,
+                    sha256=hashlib.sha256(data).hexdigest(),
+                    size_bytes=len(data),
+                    modified_at=datetime.fromtimestamp(
+                        stat_result.st_mtime,
+                        tz=UTC,
+                    ).isoformat(),
+                )
+            )
+        return artifacts
+
+    def stats(self) -> dict[str, int]:
+        artifacts = self.list()
+        return {
+            "artifacts": len(artifacts),
+            "total_size_bytes": sum(artifact.size_bytes for artifact in artifacts),
+        }
+
+    def verify(self) -> list[ArtifactCheck]:
+        root = self._ensure_root()
+        checks: list[ArtifactCheck] = []
+        for path in sorted(root.iterdir()):
+            if path.name.startswith("."):
+                continue
+            if path.suffix != ".txt" or not path.name.startswith("ng_"):
+                continue
+            artifact_id = path.stem
+            if ARTIFACT_ID_RE.fullmatch(artifact_id) is None:
+                checks.append(
+                    ArtifactCheck(
+                        artifact_id=artifact_id,
+                        ok=False,
+                        reason="invalid_id",
+                        path=str(path),
+                    )
+                )
+                continue
+            if path.is_symlink():
+                checks.append(
+                    ArtifactCheck(
+                        artifact_id=artifact_id,
+                        ok=False,
+                        reason="symlink",
+                        path=str(path),
+                    )
+                )
+                continue
+            try:
+                stat_result = path.lstat()
+            except OSError as exc:
+                checks.append(
+                    ArtifactCheck(
+                        artifact_id=artifact_id,
+                        ok=False,
+                        reason=type(exc).__name__,
+                        path=str(path),
+                    )
+                )
+                continue
+            if not stat.S_ISREG(stat_result.st_mode):
+                checks.append(
+                    ArtifactCheck(
+                        artifact_id=artifact_id,
+                        ok=False,
+                        reason="non_regular",
+                        path=str(path),
+                    )
+                )
+                continue
+            if stat_result.st_size > self.size_cap:
+                checks.append(
+                    ArtifactCheck(
+                        artifact_id=artifact_id,
+                        ok=False,
+                        reason="too_large",
+                        path=str(path),
+                    )
+                )
+                continue
+            try:
+                data = self._read_bytes(artifact_id, root=root)
+            except ArtifactError as exc:
+                checks.append(
+                    ArtifactCheck(
+                        artifact_id=artifact_id,
+                        ok=False,
+                        reason=type(exc).__name__,
+                        path=str(path),
+                    )
+                )
+                continue
+            digest = hashlib.sha256(data).hexdigest()
+            expected_prefix = artifact_id.removeprefix("ng_")
+            if not digest.startswith(expected_prefix):
+                checks.append(
+                    ArtifactCheck(
+                        artifact_id=artifact_id,
+                        ok=False,
+                        reason="sha_mismatch",
+                        path=str(path),
+                    )
+                )
+                continue
+            checks.append(
+                ArtifactCheck(
+                    artifact_id=artifact_id,
+                    ok=True,
+                    reason="ok",
+                    path=str(path),
+                )
+            )
+        return checks
 
     def _ensure_root(self) -> Path:
         if self.root.is_symlink():
@@ -127,6 +260,29 @@ class ArtifactStore:
         if path.parent != resolved_root:
             raise ArtifactSecurityError("artifact path escapes artifact root")
         return path
+
+    def _read_bytes(self, artifact_id: str, *, root: Path | None = None) -> bytes:
+        resolved_root = root if root is not None else self._ensure_root()
+        path = self._path_for(artifact_id, root=resolved_root)
+        try:
+            stat_result = path.lstat()
+        except OSError as exc:
+            raise ArtifactSecurityError(type(exc).__name__) from exc
+        if not stat.S_ISREG(stat_result.st_mode):
+            raise ArtifactSecurityError("artifact path must be a regular file")
+        if stat_result.st_size > self.size_cap:
+            raise ArtifactTooLarge(stat_result.st_size, self.size_cap)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(path, flags)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise ArtifactSecurityError("artifact path resolves through a symlink") from exc
+            raise ArtifactSecurityError(type(exc).__name__) from exc
+        with os.fdopen(fd, "rb") as handle:
+            return handle.read()
 
 
 def _parse_int(value: str | None, default: int) -> int:

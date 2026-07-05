@@ -39,12 +39,40 @@ before a tool result is appended to model context.
 ## CLI
 
 ```bash
+noisegate wrap -- pytest -q
+noisegate wrap --store-artifact -- pytest -q
+noisegate wrap --raw -- cat exact-output.txt
 noisegate reduce --command "pytest" < noisy.log
 noisegate reduce-json < hermes-tool-result.json
 noisegate doctor
 noisegate cat ng_<artifact-id>
 noisegate cat --artifact-dir /tmp/noisegate-artifacts ng_<artifact-id>
+noisegate artifacts list
+noisegate artifacts stats
+noisegate artifacts verify
 ```
+
+`wrap` runs a command without a shell, captures stdout and stderr, writes the
+compacted result to stdout, and exits with the wrapped command's exit code. It
+captures up to 4 MiB per stream by default; use `--max-capture-bytes <n>` to
+change that. If capture is truncated, Noisegate adds a
+`[noisegate: capture truncated]` marker to the captured stream.
+
+Use `--raw` or `--full` to bypass reducer compaction for a wrapped command while
+still keeping the text capture cap:
+
+```bash
+noisegate wrap --raw -- pytest -q
+noisegate wrap --full -- ./script-that-must-stay-exact
+```
+
+`wrap` is a bounded text-capture surface: it decodes captured bytes as UTF-8
+with replacement and may truncate at the capture boundary. Use a higher
+`--max-capture-bytes` or run the command directly when byte-perfect terminal
+replay matters.
+
+If compaction itself errors, `wrap` fails open and prints the captured text
+unchanged.
 
 `reduce` reads stdin and writes compacted text. `reduce-json` accepts either a
 Hermes-like envelope with a `result` string or a direct JSON tool result. Bad
@@ -106,6 +134,17 @@ filesystem store:
 
 The compacted result includes the artifact ID and sha256 so a human can retrieve
 it later with `noisegate cat <artifact-id>`.
+
+Artifact inspection commands:
+
+```bash
+noisegate artifacts list --artifact-dir /tmp/noisegate-artifacts
+noisegate artifacts stats --artifact-dir /tmp/noisegate-artifacts
+noisegate artifacts verify --artifact-dir /tmp/noisegate-artifacts
+```
+
+`verify` recomputes sha256 prefixes from the stored files and returns a non-zero
+exit code if an artifact was tampered with or has an invalid private-store path.
 
 ## Compatibility
 

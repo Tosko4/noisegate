@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import json
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ from ._version import __version__
 from .artifacts import ArtifactError, ArtifactStore
 from .engine import NoisegateOptions, reduce_text
 from .plugin import transform_tool_result
+from .wrap import DEFAULT_MAX_CAPTURE_BYTES, WrappedCommandInterrupted, run_wrapped_command
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -35,6 +37,19 @@ def build_parser() -> argparse.ArgumentParser:
     _add_reduce_options(reduce_json)
     reduce_json.set_defaults(func=cmd_reduce_json)
 
+    wrap = subparsers.add_parser("wrap", help="run a command and print compacted output")
+    _add_reduce_options(wrap, default_source="wrap")
+    wrap.add_argument("--raw", action="store_true", help="print captured output without compaction")
+    wrap.add_argument("--full", action="store_true", help="alias for --raw")
+    wrap.add_argument(
+        "--max-capture-bytes",
+        type=_nonnegative_int,
+        default=DEFAULT_MAX_CAPTURE_BYTES,
+        help="maximum bytes to capture per stream before truncating",
+    )
+    wrap.add_argument("argv", nargs=argparse.REMAINDER, help="command after --")
+    wrap.set_defaults(func=cmd_wrap)
+
     doctor = subparsers.add_parser("doctor", help="report package and artifact health")
     doctor.set_defaults(func=cmd_doctor)
 
@@ -42,6 +57,21 @@ def build_parser() -> argparse.ArgumentParser:
     cat.add_argument("--artifact-dir", default=None)
     cat.add_argument("artifact_id")
     cat.set_defaults(func=cmd_cat)
+
+    artifacts = subparsers.add_parser("artifacts", help="inspect the private artifact store")
+    artifact_subparsers = artifacts.add_subparsers(dest="artifact_command", required=True)
+
+    artifacts_list = artifact_subparsers.add_parser("list", help="list stored artifacts")
+    artifacts_list.add_argument("--artifact-dir", default=None)
+    artifacts_list.set_defaults(func=cmd_artifacts_list)
+
+    artifacts_stats = artifact_subparsers.add_parser("stats", help="summarize stored artifacts")
+    artifacts_stats.add_argument("--artifact-dir", default=None)
+    artifacts_stats.set_defaults(func=cmd_artifacts_stats)
+
+    artifacts_verify = artifact_subparsers.add_parser("verify", help="verify stored artifacts")
+    artifacts_verify.add_argument("--artifact-dir", default=None)
+    artifacts_verify.set_defaults(func=cmd_artifacts_verify)
     return parser
 
 
@@ -82,6 +112,39 @@ def cmd_reduce_json(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_wrap(args: argparse.Namespace) -> int:
+    argv = _passthrough_argv(args.argv)
+    if not argv:
+        print("noisegate wrap: requires a command after --", file=sys.stderr)
+        return 2
+
+    options = _options_from_args(args)
+    raw = bool(args.raw or args.full)
+    command = args.command or shlex.join(argv)
+    try:
+        result = run_wrapped_command(
+            argv,
+            command=command,
+            source=args.source,
+            max_capture_bytes=args.max_capture_bytes,
+            raw=raw,
+            options=options,
+        )
+    except FileNotFoundError:
+        print(f"noisegate wrap: command not found: {argv[0]}", file=sys.stderr)
+        return 127
+    except PermissionError:
+        print(f"noisegate wrap: permission denied: {argv[0]}", file=sys.stderr)
+        return 126
+    except WrappedCommandInterrupted as exc:
+        return 128 + exc.signum
+    except KeyboardInterrupt:
+        return 130
+
+    sys.stdout.write(result.text)
+    return _normalize_process_exit_code(result.exit_code)
+
+
 def cmd_doctor(_args: argparse.Namespace) -> int:
     dist_version = _distribution_version()
     print("Noisegate doctor")
@@ -111,6 +174,52 @@ def cmd_cat(args: argparse.Namespace) -> int:
     except Exception as exc:
         print(f"noisegate cat: {exc}", file=sys.stderr)
         return 2
+
+
+def cmd_artifacts_list(args: argparse.Namespace) -> int:
+    try:
+        store = _artifact_store_from_args(args)
+        for artifact in store.list():
+            print(
+                f"{artifact.artifact_id} "
+                f"size_bytes={artifact.size_bytes} "
+                f"sha256={artifact.sha256} "
+                f"modified_at={artifact.modified_at}"
+            )
+        return 0
+    except Exception as exc:
+        print(f"noisegate artifacts list: {exc}", file=sys.stderr)
+        return 2
+
+
+def cmd_artifacts_stats(args: argparse.Namespace) -> int:
+    try:
+        store = _artifact_store_from_args(args)
+        stats = store.stats()
+        print(f"artifacts: {stats['artifacts']}")
+        print(f"total_size_bytes: {stats['total_size_bytes']}")
+        return 0
+    except Exception as exc:
+        print(f"noisegate artifacts stats: {exc}", file=sys.stderr)
+        return 2
+
+
+def cmd_artifacts_verify(args: argparse.Namespace) -> int:
+    try:
+        store = _artifact_store_from_args(args)
+        checks = store.verify()
+    except Exception as exc:
+        print(f"noisegate artifacts verify: {exc}", file=sys.stderr)
+        return 2
+
+    failed = [check for check in checks if not check.ok]
+    if not checks:
+        print("artifacts: none")
+        return 0
+    for check in checks:
+        status = "ok" if check.ok else "error"
+        print(f"{check.artifact_id} {status} reason={check.reason}")
+    return 2 if failed else 0
 
 
 def _reduce_json_value(parsed: Any, raw: str, options: NoisegateOptions) -> str:
@@ -209,10 +318,14 @@ def _options_to_hook_kwargs(options: NoisegateOptions) -> dict[str, object]:
     return values
 
 
-def _add_reduce_options(parser: argparse.ArgumentParser) -> None:
+def _artifact_store_from_args(args: argparse.Namespace) -> ArtifactStore:
+    return ArtifactStore(args.artifact_dir) if args.artifact_dir else ArtifactStore.from_env()
+
+
+def _add_reduce_options(parser: argparse.ArgumentParser, *, default_source: str = "cli") -> None:
     parser.add_argument("--command", default="", help="command that produced the text")
     parser.add_argument("--tool", default="", help="Hermes tool name")
-    parser.add_argument("--source", default="cli", help="source label for metadata")
+    parser.add_argument("--source", default=default_source, help="source label for metadata")
     parser.add_argument("--mode", choices=["auto", "head_tail", "off"], default=None)
     parser.add_argument("--max-chars", type=int, default=None)
     parser.add_argument("--max-lines", type=int, default=None)
@@ -225,6 +338,25 @@ def _add_reduce_options(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--artifact-dir", default=None)
     parser.add_argument("--artifact-size-cap", type=int, default=None)
+
+
+def _passthrough_argv(argv: list[str]) -> list[str]:
+    if argv and argv[0] == "--":
+        return argv[1:]
+    return argv
+
+
+def _normalize_process_exit_code(exit_code: int) -> int:
+    if exit_code < 0:
+        return 128 + abs(exit_code)
+    return exit_code
+
+
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return parsed
 
 
 def _distribution_version() -> str:
