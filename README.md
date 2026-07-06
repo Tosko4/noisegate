@@ -1,26 +1,87 @@
 # Noisegate
 
-Gate the noise. Keep the signal.
+<p align="center">
+  <img src="assets/noisegate-hero.png" alt="Noisegate: Gate the noise. Keep the signal." width="100%">
+</p>
 
-Noisegate is a standalone Hermes Agent plugin and CLI that compacts noisy
-terminal and tool output before it floods the model context. It is deterministic:
-no model calls, no summaries by vibes, just command classification, safe
-bypasses, head/tail fallback, and machine-readable metadata.
+<p align="center">
+  <a href="https://github.com/Tosko4/noisegate/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Tosko4/noisegate/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/Tosko4/noisegate/releases"><img alt="GitHub release" src="https://img.shields.io/github/v/release/Tosko4/noisegate?include_prereleases&sort=semver"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-black"></a>
+  <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-orange">
+</p>
 
-One-line agent instruction:
+**Gate the noise. Keep the signal.**
+
+Noisegate is a tiny, deterministic compaction layer for Hermes Agent. It catches the massive terminal walls, test logs, build spam, and search dumps before they flood your model context, while leaving exact content alone.
+
+No model calls. No fuzzy summaries. No "trust me bro" compression.
+
+Just predictable reducers, safe bypasses, protected outputs, and enough metadata to know what happened.
+
+## The problem
+
+Agents are great at running tools.
+
+Tools are great at producing nonsense amounts of output.
+
+A single test run, package install, Docker build, or search command can dump thousands of lines into context. Most of it is noise. Some of it matters. If you blindly truncate it, you lose the useful part. If you blindly keep it, you burn context and make the next model call worse.
+
+Noisegate sits in the middle:
 
 ```text
-Install and enable Noisegate for Hermes, then stop dumping terminal walls into context; use NOISEGATE_BYPASS when exact bytes matter.
+noisy tool output  ->  Noisegate  ->  compact signal-rich result
 ```
 
-## Install For Hermes
+It is built for agent work where the context window is valuable and exactness matters.
 
-From this checkout, install into the same Python environment that runs `hermes`,
-then enable the entry-point plugin in Hermes config:
+## What it does
+
+Noisegate gives Hermes Agent two surfaces:
+
+- a **Hermes plugin** that can compact noisy tool results before they enter the conversation
+- a **CLI** you can use directly in terminals, scripts, CI jobs, and smoke tests
+
+It knows how to reduce common noisy outputs:
+
+- `pytest` and `unittest`
+- `npm`, `pnpm`, and `yarn`
+- `git status` and `git log`
+- search output from `rg`, `grep`, `ag`, and `ack`
+- Docker build-style logs
+- generic long output with deterministic head/tail fallback
+
+And it refuses to touch things that should stay exact:
+
+- file reads
+- patches and diffs
+- skill documents
+- memory, LCM, Hindsight, MCP, search, and web extraction results
+- unknown future tools unless explicitly allowed
+
+That last bit matters. A compactor that damages retrieved context is worse than no compactor.
+
+## Install for Hermes
+
+Install Noisegate into the same Python environment that runs `hermes`.
+
+From this checkout:
 
 ```bash
 HERMES_PYTHON="$(head -1 "$(command -v hermes)" | sed 's/^#!//')"
 uv pip install --python "$HERMES_PYTHON" -e .
+```
+
+From a GitHub release wheel, use the wheel URL from the [latest release](https://github.com/Tosko4/noisegate/releases):
+
+```bash
+HERMES_PYTHON="$(head -1 "$(command -v hermes)" | sed 's/^#!//')"
+uv pip install --python "$HERMES_PYTHON" "https://github.com/Tosko4/noisegate/releases/download/v0.1.0/noisegate_hermes-0.1.0-py3-none-any.whl"
+```
+
+Then enable the entry-point plugin in Hermes config:
+
+```bash
 "$HERMES_PYTHON" - <<'PY'
 from hermes_cli.config import load_config, save_config
 cfg = load_config()
@@ -34,96 +95,157 @@ save_config(cfg)
 PY
 ```
 
-Newer Hermes versions may also support `hermes plugins enable noisegate`. On
-Hermes versions where that command says the pip package is not installed or
-bundled, the config edit above is the compatible path. Existing enabled plugins
-should stay in `plugins.enabled`; the change takes effect on the next session or
-plugin reload.
-
-From a built package:
+Newer Hermes versions may also support:
 
 ```bash
-HERMES_PYTHON="$(head -1 "$(command -v hermes)" | sed 's/^#!//')"
-uv pip install --python "$HERMES_PYTHON" noisegate-hermes
-# then add "noisegate" to plugins.enabled as shown above
+hermes plugins enable noisegate
 ```
 
-Hermes discovers the pip entry point `hermes_agent.plugins:noisegate`. The
-plugin registers `transform_terminal_output` for full terminal output before
-Hermes' own truncation, plus `transform_tool_result` as the generic safety net
-before a tool result is appended to model context.
+If that command says the pip package is not installed or bundled, use the config-helper snippet above. Hermes discovers the pip entry point `hermes_agent.plugins:noisegate`.
 
-## CLI
+Noisegate registers two hooks:
+
+```text
+transform_terminal_output
+transform_tool_result
+```
+
+## Try it in 30 seconds
+
+Run the health check:
+
+```bash
+noisegate doctor
+```
+
+Compact a noisy stream:
+
+```bash
+python - <<'PY' | noisegate reduce --command "pytest"
+for i in range(300):
+    print(f"collecting test line {i:03d}")
+print("FAILED tests/test_example.py::test_signal")
+print("AssertionError: expected signal, got noise")
+PY
+```
+
+Wrap a command and keep its exit code:
 
 ```bash
 noisegate wrap -- pytest -q
-noisegate wrap --store-artifact -- pytest -q
-noisegate wrap --raw -- cat exact-output.txt
+```
+
+Bypass compaction when exact output matters:
+
+```bash
+NOISEGATE_BYPASS=1 noisegate reduce < exact-output.txt
+noisegate wrap --raw -- ./script-that-must-stay-exact
+noisegate wrap --full -- ./another-exact-command
+```
+
+## CLI reference
+
+```bash
 noisegate reduce --command "pytest" < noisy.log
 noisegate reduce-json < hermes-tool-result.json
+noisegate wrap -- pytest -q
+noisegate wrap --store-artifact -- pytest -q
+noisegate wrap --raw -- cat exact-output.txt
 noisegate doctor
 noisegate cat ng_<artifact-id>
 noisegate cat --artifact-dir /tmp/noisegate-artifacts ng_<artifact-id>
-noisegate artifacts list
-noisegate artifacts stats
-noisegate artifacts verify
+noisegate artifacts list --artifact-dir /tmp/noisegate-artifacts
+noisegate artifacts stats --artifact-dir /tmp/noisegate-artifacts
+noisegate artifacts verify --artifact-dir /tmp/noisegate-artifacts
 ```
 
-`wrap` runs a command without a shell, captures stdout and stderr in arrival
-order, writes the compacted result to stdout, and exits with the wrapped
-command's exit code. It captures up to 4 MiB of combined output by default; use
-`--max-capture-bytes <n>` to change that. If capture is truncated, Noisegate adds
-a `[noisegate: capture truncated]` marker to the captured stream.
+`wrap` runs a command without a shell, captures stdout and stderr in arrival order, writes the compacted result to stdout, and exits with the wrapped command's exit code. It captures up to 4 MiB of combined output by default; use `--max-capture-bytes <n>` to change that.
 
-Use `--raw` or `--full` to bypass reducer compaction for a wrapped command while
-still keeping the text capture cap:
+If capture is truncated, Noisegate adds this marker:
+
+```text
+[noisegate: capture truncated]
+```
+
+`reduce-json` accepts either a Hermes-like envelope with a `result` string or a direct JSON tool result. Bad JSON fails open and is written back unchanged.
+
+## For AI agents
+
+If you are an AI agent working in this repo, read this first.
+
+**One-line instruction:**
+
+```text
+Install and enable Noisegate for Hermes, then stop dumping terminal walls into context; use NOISEGATE_BYPASS when exact bytes matter.
+```
+
+Operational rules:
+
+1. Use Noisegate for noisy terminal/tool output, not for exact source material.
+2. Do not compact file reads, patches, diffs, retrieved context, skill docs, memory results, MCP results, or web extraction output.
+3. Do not treat Noisegate as a raw-output archive. Raw artifacts are off by default.
+4. Keep Hermes-LCM optional. Noisegate must work without it.
+5. Do not write raw terminal output into Hindsight.
+6. If compaction fails, preserve the original output.
+7. Before committing, run the quality gate and scan the diff for secrets and personal/private data.
+
+Safe smoke test for a lane or installation:
 
 ```bash
-noisegate wrap --raw -- pytest -q
-noisegate wrap --full -- ./script-that-must-stay-exact
+noisegate doctor
+python - <<'PY' | noisegate reduce --command "pytest"
+for i in range(260):
+    print(f"line {i:03d}")
+print("FAILED tests/test_demo.py::test_keeps_signal")
+print("AssertionError: signal survived")
+PY
+printf '%s\n' '[noisegate:bypass]' 'line that must stay exact' | noisegate reduce --command "pytest"
 ```
 
-`wrap` is a bounded text-capture surface: it decodes captured bytes as UTF-8
-with replacement and may truncate at the capture boundary. Use a higher
-`--max-capture-bytes` or run the command directly when byte-perfect terminal
-replay matters.
+Expected result:
 
-If compaction itself errors, `wrap` fails open and prints the captured text
-unchanged.
+- `doctor` reports a healthy package/plugin state
+- long noisy output gets smaller
+- the failure line stays visible
+- bypass output stays unchanged
+- no config writes, git writes, service restarts, or artifact writes happen unless explicitly requested
 
-`reduce` reads stdin and writes compacted text. `reduce-json` accepts either a
-Hermes-like envelope with a `result` string or a direct JSON tool result. Bad
-JSON fails open and is written back unchanged.
+## Safety model
 
-## What It Compacts
+Noisegate is intentionally conservative.
 
-Noisegate compacts explicit terminal/noisy surfaces. For Hermes hook traffic,
-that means `terminal`, `process`, `read_terminal`, and `browser_console` only.
-For explicit operator use, the CLI can still reduce unnamed stdin text.
+For Hermes hook traffic, it compacts only this explicit allowlist:
 
-Built-in reducers cover:
+```text
+terminal
+process
+read_terminal
+browser_console
+```
 
-- `git status` and `git log`
-- `pytest` and `unittest`
-- `npm`, `pnpm`, and `yarn`
-- `rg`, `grep`, `ag`, and `ack`
-- Docker build-style logs
-- generic long output through deterministic head/tail compaction
+Protected surfaces include:
 
-`git diff`, skill documents, memory/context retrieval, MCP results,
-web-search/extraction results, and patch/file-content tools are protected by
-default. For Hermes hook traffic, Noisegate now uses an explicit noisy-tool
-allowlist (`terminal`, `process`, `read_terminal`, `browser_console`) instead
-of compacting arbitrary tool results. It does not rewrite `skill_view`,
-`session_search`, `lcm_*`, `hindsight_*`, `mcp_*`/`mcp__*`, `web_extract`,
-`execute_code`, `search_files`, `read_file`, `write_file`, `patch`,
-`apply_patch`, unknown future tools, or similar exact/useful context results.
-The standalone CLI follows the same rule when `--tool` names a Hermes tool;
-unnamed stdin reduction remains available for explicit operator use.
+```text
+read_file
+write_file
+patch
+apply_patch
+skill_view
+skill_manage
+session_search
+memory
+hindsight_*
+lcm_*
+mcp_* / mcp__*
+web_search
+web_extract
+execute_code
+search_files
+git diff / unified diffs
+unknown future tools
+```
 
-## Bypass
-
-Use any of these when the next tool result must stay exact:
+Bypass controls:
 
 ```text
 NOISEGATE_BYPASS
@@ -136,34 +258,31 @@ Environment flags:
 
 ```bash
 NOISEGATE_DISABLE=1      # turn compaction off
-NOISEGATE_ARTIFACTS=1    # opt in to private raw-output artifacts after redaction-safe hooks
+NOISEGATE_ARTIFACTS=1    # opt in to private raw-output artifacts
+NOISEGATE_ARTIFACT_DIR=/path/to/artifacts
 ```
 
-Hermes' early `transform_terminal_output` hook runs before terminal redaction, so
-Noisegate intentionally disables artifact storage on that hook. Inline terminal
-compaction still passes through Hermes' normal redaction path.
-
-Hook options use the `noisegate_` prefix, for example
-`noisegate_max_chars`, `noisegate_head_lines`, `noisegate_tail_lines`, and
-`noisegate_mode=off`.
+Hermes calls `transform_terminal_output` before its built-in terminal redaction pass. Noisegate still compacts inline terminal output there, but it disables raw artifact storage on that early hook so pre-redaction output is not persisted.
 
 ## Artifacts
 
 Raw terminal output is not stored by default.
 
-When artifact mode is enabled, Noisegate writes the original output to a private
-filesystem store:
+When artifact mode is enabled, Noisegate writes the original output to a private filesystem store:
 
 - directory mode `0700`
 - file mode `0600`
 - default size cap of 1,000,000 bytes
-- artifact IDs are content-addressed (`ng_<sha256-prefix>`)
-- IDs are validated, paths stay contained, and symlink traversal is rejected
+- content-addressed IDs shaped like `ng_<sha256-prefix>`
+- path containment and symlink traversal checks
 
-The compacted result includes the artifact ID and sha256 so a human can retrieve
-it later with `noisegate cat <artifact-id>`.
+Retrieve an artifact:
 
-Artifact inspection commands:
+```bash
+noisegate cat ng_<artifact-id>
+```
+
+Inspect the store:
 
 ```bash
 noisegate artifacts list --artifact-dir /tmp/noisegate-artifacts
@@ -171,70 +290,73 @@ noisegate artifacts stats --artifact-dir /tmp/noisegate-artifacts
 noisegate artifacts verify --artifact-dir /tmp/noisegate-artifacts
 ```
 
-`verify` recomputes sha256 prefixes from the stored files and returns a non-zero
-exit code if an artifact was tampered with or has an invalid private-store path.
+`verify` recomputes hashes and returns a non-zero exit code if an artifact was tampered with or has an invalid private-store path.
 
-## Compatibility
+## Hermes-LCM and memory layers
 
-Noisegate is designed as a small, standalone Hermes Agent plugin. It does one
-job: compact noisy tool output before it is appended to model context.
+Noisegate is not Hermes-LCM and does not require Hermes-LCM.
 
-If you run additional context, memory, or transcript layers around Hermes, treat
-Noisegate as an inline compaction step rather than a storage system. Downstream
-layers will usually see the compacted result. When exact raw output needs to be
-recoverable, enable Noisegate artifact mode for that run.
+If Hermes-LCM is installed, Noisegate acts as an inline compaction step before noisy output inflates active context. Downstream context or transcript layers usually see the compacted result.
 
-## CI and Release Management
+Hindsight is semantic long-term memory, not a raw output bucket. Noisegate must not write raw terminal output into Hindsight.
 
-GitHub Actions run the full quality gate on pushes and pull requests:
+## Development
+
+Start clean:
+
+```bash
+git status --short --branch
+git remote -v
+```
+
+Run the local quality gate:
 
 ```bash
 uv run ruff check .
 uv run python -m pytest -q
 uv run python scripts/check_release.py
 uv run python scripts/check_contributors.py
+rm -rf dist
 uv build
 uvx twine check dist/*
+git diff --check
 ```
 
-Release metadata is intentionally checked in three places and must match:
-
-- `pyproject.toml` → `[project].version`
-- `noisegate/_version.py` → `__version__`
-- `noisegate/plugin.yaml` → plugin manifest `version`
-- `uv.lock` → locked editable project version
-
-Release notes come from `CHANGELOG.md`. Contributor checks compare git author
-names to `CONTRIBUTORS.md` so a new contributor is noticed before publishing a
-release.
-
-To prepare a release locally:
+Release helpers:
 
 ```bash
 uv run python scripts/prepare_release.py 0.2.0
 uv run python scripts/check_release.py --tag v0.2.0
-uv run python scripts/build_release_notes.py v0.2.0
+uv run python scripts/build_release_notes.py v0.2.0 --output dist/release-notes.md
 ```
 
-The GitHub `Release` workflow can also be run manually with a semantic version.
-Manual dispatch updates version files, promotes changelog notes, runs checks,
-commits the release metadata, creates an annotated `vX.Y.Z` tag, builds the
-package, and publishes or updates the GitHub Release with built artifacts and
-extracted release notes. Manual releases are restricted to the `main` branch.
-Pushing a `v*` tag directly also runs the release verifier and publish path.
+Release metadata must stay aligned across:
 
-## Safety Defaults
+- `pyproject.toml` -> `[project].version`
+- `noisegate/_version.py` -> `__version__`
+- `noisegate/plugin.yaml` -> plugin manifest `version`
+- `uv.lock` -> locked editable project version
 
-- Fail open: hook errors and bad JSON leave the original result alone.
-- Exact reads, writes, patches, and diffs are preserved by default.
-- Raw output storage is opt-in.
-- Artifact storage uses private permissions, size limits, containment checks,
-  and symlink rejection.
-- No adapters for unrelated hosts are included. Noisegate targets Hermes Agent.
+GitHub Actions run linting, tests, release metadata checks, contributor checks, package build, `twine check`, and wheel install smoke tests on Python 3.11, 3.12, and 3.13.
+
+## What Noisegate is not
+
+Noisegate is not a model summarizer.
+
+It is not a replacement for logs.
+
+It is not a database.
+
+It is not a magic context engine.
+
+It is a small gate in front of noisy agent output. That is the whole point.
 
 ## Attribution
 
-Noisegate was informed by the MIT-licensed Tokenjuice project, especially its
-ideas around deterministic reducers, command classification, safe bypasses,
-artifact opt-in, and machine-readable metadata. This package is a fresh Python
-implementation focused on Hermes Agent.
+Noisegate was informed by the MIT-licensed [Tokenjuice](https://github.com/denthought/tokenjuice) project, especially its ideas around deterministic reducers, command classification, safe bypasses, artifact opt-in, and machine-readable metadata.
+
+Noisegate is a fresh Python implementation focused on Hermes Agent.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
