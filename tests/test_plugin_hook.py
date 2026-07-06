@@ -113,6 +113,12 @@ def test_read_file_and_write_file_are_not_touched() -> None:
     assert transform_tool_result(raw, tool_name="write_file", noisegate_max_chars=100) is None
 
 
+def test_skill_view_is_not_touched() -> None:
+    raw = json.dumps({"content": numbered("skill instruction", 120), "path": "SKILL.md"})
+
+    assert transform_tool_result(raw, tool_name="skill_view", noisegate_max_chars=100) is None
+
+
 def test_patch_tool_result_is_not_touched() -> None:
     raw = "\n".join(["*** Begin Patch", *numbered("+line", 100), "*** End Patch"])
 

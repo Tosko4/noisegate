@@ -26,6 +26,7 @@ PROTECTED_TOOL_NAMES = frozenset(
         "read_file",
         "read_files",
         "read_text_file",
+        "skill_view",
         "write_file",
         "patch",
         "apply_patch",

@@ -110,9 +110,9 @@ Built-in reducers cover:
 - Docker build-style logs
 - generic long output through deterministic head/tail compaction
 
-`git diff` and patch/file-content tools are protected by default. Noisegate
-does not rewrite `read_file`, `write_file`, `patch`, `apply_patch`, or similar
-exact-content results.
+`git diff`, skill documents, and patch/file-content tools are protected by
+default. Noisegate does not rewrite `skill_view`, `read_file`, `write_file`,
+`patch`, `apply_patch`, or similar exact-content results.
 
 ## Bypass
 
