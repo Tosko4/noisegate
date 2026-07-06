@@ -92,7 +92,7 @@ def test_transform_tool_result_preserves_failure_lines_in_stderr() -> None:
 
     transformed = transform_tool_result(
         raw,
-        tool_name="execute_code",
+        tool_name="process",
         noisegate_max_chars=500,
         noisegate_head_lines=2,
         noisegate_tail_lines=2,
@@ -104,6 +104,12 @@ def test_transform_tool_result_preserves_failure_lines_in_stderr() -> None:
     assert "npm ERR! code ELIFECYCLE" in stderr
     assert "Error: build failed" in stderr
     assert payload["exit_code"] == 1
+
+
+def test_execute_code_is_not_touched_by_default() -> None:
+    raw = json.dumps({"output": numbered("computed result", 120), "exit_code": 0})
+
+    assert transform_tool_result(raw, tool_name="execute_code", noisegate_max_chars=100) is None
 
 
 def test_read_file_and_write_file_are_not_touched() -> None:
@@ -119,6 +125,140 @@ def test_skill_view_is_not_touched() -> None:
     assert transform_tool_result(raw, tool_name="skill_view", noisegate_max_chars=100) is None
 
 
+def test_context_retrieval_tools_are_not_touched() -> None:
+    raw = json.dumps({"content": numbered("retrieved context", 120)})
+
+    for tool_name in (
+        "session_search",
+        "hindsight_recall",
+        "hindsight_reflect",
+        "lcm_expand",
+        "lcm_expand_query",
+        "mcp__mindlyos__get_note_page",
+        "mcp__remarkable__remarkable_read",
+        "web_extract",
+        "web_search",
+        "search_files",
+        "skills_list",
+        "todo",
+        "ha_get_state",
+        "browser_snapshot",
+        "vision_analyze",
+        "image_generate",
+        "x_search",
+    ):
+        assert transform_tool_result(raw, tool_name=tool_name, noisegate_max_chars=100) is None
+
+
+def test_unknown_tool_result_is_not_touched() -> None:
+    raw = json.dumps({"content": numbered("unknown but useful", 120)})
+
+    assert transform_tool_result(raw, tool_name="future_tool", noisegate_max_chars=100) is None
+
+
+def test_only_known_noisy_tool_results_are_compacted() -> None:
+    long_text = numbered("tool output", 120)
+    cases = {
+        "terminal": json.dumps({"stdout": long_text, "exit": 0}),
+        "process": json.dumps({"output": long_text, "exit_code": 0}),
+        "read_terminal": json.dumps({"output": long_text, "status": "ok"}),
+        "browser_console": json.dumps({"logs": long_text}),
+    }
+
+    for tool_name, raw in cases.items():
+        transformed = transform_tool_result(raw, tool_name=tool_name, noisegate_max_chars=100)
+        assert isinstance(transformed, str)
+
+
+def test_known_context_and_side_effect_tool_results_are_not_compacted() -> None:
+    raw = json.dumps(
+        {
+            "content": numbered("important context", 120),
+            "output": numbered("important output", 120),
+            "logs": numbered("important logs", 120),
+        }
+    )
+    # Snapshot of current Hermes built-in/MCP-facing tool names, minus the
+    # explicit noisy allowlist covered above.
+    non_noisy_tools = (
+        "browser_back",
+        "browser_cdp",
+        "browser_click",
+        "browser_dialog",
+        "browser_get_images",
+        "browser_navigate",
+        "browser_press",
+        "browser_scroll",
+        "browser_snapshot",
+        "browser_type",
+        "browser_vision",
+        "clarify",
+        "close_terminal",
+        "computer_use",
+        "cronjob",
+        "delegate_task",
+        "discord",
+        "discord_admin",
+        "execute_code",
+        "feishu_doc_read",
+        "feishu_drive_add_comment",
+        "feishu_drive_list_comment_replies",
+        "feishu_drive_list_comments",
+        "feishu_drive_reply_comment",
+        "ha_call_service",
+        "ha_get_state",
+        "ha_list_entities",
+        "ha_list_services",
+        "image_generate",
+        "kanban_block",
+        "kanban_comment",
+        "kanban_complete",
+        "kanban_create",
+        "kanban_heartbeat",
+        "kanban_link",
+        "kanban_list",
+        "kanban_show",
+        "kanban_unblock",
+        "memory",
+        "patch",
+        "project_create",
+        "project_list",
+        "project_switch",
+        "read_file",
+        "search_files",
+        "session_search",
+        "skill_manage",
+        "skill_view",
+        "skills_list",
+        "spotify_albums",
+        "spotify_devices",
+        "spotify_library",
+        "spotify_playback",
+        "spotify_playlists",
+        "spotify_queue",
+        "spotify_search",
+        "text_to_speech",
+        "todo",
+        "video_analyze",
+        "video_generate",
+        "vision_analyze",
+        "web_extract",
+        "web_search",
+        "write_file",
+        "x_search",
+        "xai_video_edit",
+        "xai_video_extend",
+        "yb_query_group_info",
+        "yb_query_group_members",
+        "yb_search_sticker",
+        "yb_send_dm",
+        "yb_send_sticker",
+    )
+
+    for tool_name in non_noisy_tools:
+        assert transform_tool_result(raw, tool_name=tool_name, noisegate_max_chars=100) is None
+
+
 def test_patch_tool_result_is_not_touched() -> None:
     raw = "\n".join(["*** Begin Patch", *numbered("+line", 100), "*** End Patch"])
 
@@ -131,15 +271,15 @@ def test_bad_json_fails_open_for_tool_result_hook() -> None:
     assert transform_tool_result(raw, tool_name="terminal", noisegate_max_chars=100) is None
 
 
-def test_generic_json_string_field_can_be_compacted() -> None:
-    raw = json.dumps({"output": numbered("log", 100), "ok": True})
+def test_noisy_generic_json_string_field_can_be_compacted() -> None:
+    raw = json.dumps({"logs": numbered("console log", 100), "ok": True})
 
-    transformed = transform_tool_result(raw, tool_name="web_extract", noisegate_max_chars=120)
+    transformed = transform_tool_result(raw, tool_name="browser_console", noisegate_max_chars=120)
 
     payload = parse_hook_result(transformed)
     assert payload["ok"] is True
-    assert "[noisegate: omitted" in payload["output"]
-    assert payload["noisegate"]["fields"]["output"]["original_lines"] == 100
+    assert "[noisegate: omitted" in payload["logs"]
+    assert payload["noisegate"]["fields"]["logs"]["original_lines"] == 100
 
 
 def test_transform_tool_result_skips_json_rewrite_when_metadata_would_grow_result() -> None:
@@ -211,7 +351,7 @@ def test_transform_tool_result_rebuilds_artifact_notice_after_store_failure(tmp_
 def test_transform_tool_result_does_not_treat_http_status_code_as_exit_code() -> None:
     raw = json.dumps({"status_code": 200, "content": numbered("html", 200)})
 
-    transformed = transform_tool_result(raw, tool_name="web_extract", noisegate_max_chars=500)
+    transformed = transform_tool_result(raw, tool_name="browser_console", noisegate_max_chars=500)
 
     payload = parse_hook_result(transformed)
     content = payload["content"]
@@ -258,3 +398,20 @@ def test_transform_terminal_output_accepts_hermes_returncode_kwarg() -> None:
 
     assert isinstance(transformed, str)
     assert "[noisegate: exit_code=7]" in transformed
+
+
+def test_transform_terminal_output_does_not_store_artifacts_before_redaction(
+    tmp_path: Path,
+) -> None:
+    transformed = transform_terminal_output(
+        command="env",
+        output=numbered("SECRET_TOKEN=value", 1000),
+        exit_code=0,
+        noisegate_max_chars=1000,
+        noisegate_artifacts=True,
+        noisegate_artifact_dir=str(tmp_path / "artifacts"),
+    )
+
+    assert isinstance(transformed, str)
+    assert "[noisegate artifact:" not in transformed
+    assert not (tmp_path / "artifacts").exists()

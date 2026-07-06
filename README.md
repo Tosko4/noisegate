@@ -110,9 +110,16 @@ Built-in reducers cover:
 - Docker build-style logs
 - generic long output through deterministic head/tail compaction
 
-`git diff`, skill documents, and patch/file-content tools are protected by
-default. Noisegate does not rewrite `skill_view`, `read_file`, `write_file`,
-`patch`, `apply_patch`, or similar exact-content results.
+`git diff`, skill documents, memory/context retrieval, MCP results,
+web-search/extraction results, and patch/file-content tools are protected by
+default. For Hermes hook traffic, Noisegate now uses an explicit noisy-tool
+allowlist (`terminal`, `process`, `read_terminal`, `browser_console`) instead
+of compacting arbitrary tool results. It does not rewrite `skill_view`,
+`session_search`, `lcm_*`, `hindsight_*`, `mcp_*`/`mcp__*`, `web_extract`,
+`execute_code`, `search_files`, `read_file`, `write_file`, `patch`,
+`apply_patch`, unknown future tools, or similar exact/useful context results.
+The standalone CLI follows the same rule when `--tool` names a Hermes tool;
+unnamed stdin reduction remains available for explicit operator use.
 
 ## Bypass
 
@@ -129,8 +136,12 @@ Environment flags:
 
 ```bash
 NOISEGATE_DISABLE=1      # turn compaction off
-NOISEGATE_ARTIFACTS=1    # opt in to private raw-output artifacts
+NOISEGATE_ARTIFACTS=1    # opt in to private raw-output artifacts after redaction-safe hooks
 ```
+
+Hermes' early `transform_terminal_output` hook runs before terminal redaction, so
+Noisegate intentionally disables artifact storage on that hook. Inline terminal
+compaction still passes through Hermes' normal redaction path.
 
 Hook options use the `noisegate_` prefix, for example
 `noisegate_max_chars`, `noisegate_head_lines`, `noisegate_tail_lines`, and

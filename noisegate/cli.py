@@ -10,7 +10,7 @@ from typing import Any
 
 from ._version import __version__
 from .artifacts import ArtifactError, ArtifactStore
-from .engine import NoisegateOptions, reduce_text
+from .engine import NoisegateOptions, _is_compactable_tool_name, reduce_text
 from .plugin import transform_tool_result
 from .wrap import DEFAULT_MAX_CAPTURE_BYTES, WrappedCommandInterrupted, run_wrapped_command
 
@@ -241,7 +241,11 @@ def _reduce_json_value(parsed: Any, raw: str, options: NoisegateOptions) -> str:
             args=call_args,
             **hook_kwargs,
         )
-        if transformed is None and not _is_json_text(result_text):
+        if (
+            transformed is None
+            and _is_compactable_tool_name(tool_name)
+            and not _is_json_text(result_text)
+        ):
             command = str(call_args.get("command") or parsed.get("command") or "")
             reduced = reduce_text(
                 result_text,

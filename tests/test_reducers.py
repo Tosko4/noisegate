@@ -35,6 +35,32 @@ def test_generic_long_output_uses_deterministic_head_tail() -> None:
     assert result.metadata["omitted_chars"] > 0
 
 
+def test_named_non_noisy_tools_are_protected_by_default() -> None:
+    raw = numbered("useful context", 100)
+
+    for tool_name in (
+        "execute_code",
+        "search_files",
+        "web_extract",
+        "session_search",
+        "mcp_github_create_issue",
+        "mcp__mindlyos__get_note_page",
+        "future_tool",
+    ):
+        result = reduce_text(raw, tool_name=tool_name, options=options(max_chars=120))
+        assert result.changed is False
+        assert result.text == raw
+        assert result.metadata["reducer"] == "protected_tool"
+
+
+def test_named_noisy_tools_can_still_reduce() -> None:
+    raw = numbered("noisy output", 100)
+
+    for tool_name in ("terminal", "process", "read_terminal", "browser_console"):
+        result = reduce_text(raw, tool_name=tool_name, options=options(max_chars=120))
+        assert result.changed is True
+
+
 def test_char_budget_below_marker_floor_is_honored() -> None:
     raw = "A" * 130
 

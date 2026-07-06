@@ -7,11 +7,11 @@ from typing import Any, Protocol, TypeAlias
 
 from ._version import __version__
 from .engine import (
-    PROTECTED_TOOL_NAMES,
     JsonValue,
     NoisegateOptions,
     _append_recovery_notices,
     _drop_artifact_if_notice_cannot_fit,
+    _is_compactable_tool_name,
     _plan_artifact,
     _store_artifact,
     reduce_text,
@@ -19,7 +19,7 @@ from .engine import (
 
 HookCallback: TypeAlias = Callable[..., str | None]
 
-TERMINAL_TOOL_NAMES = frozenset({"terminal", "execute_code"})
+TERMINAL_TOOL_NAMES = frozenset({"terminal", "process", "read_terminal"})
 TERMINAL_TEXT_FIELDS = ("stdout", "stderr", "output")
 GENERIC_TEXT_FIELDS = (
     "stdout",
@@ -51,7 +51,7 @@ def transform_tool_result(
     **kwargs: Any,
 ) -> str | None:
     try:
-        if tool_name in PROTECTED_TOOL_NAMES or not isinstance(result, str):
+        if not _is_compactable_tool_name(tool_name) or not isinstance(result, str):
             return None
         options = NoisegateOptions.from_env().with_mapping(kwargs)
         if not options.enabled or options.mode == "off":
@@ -166,6 +166,11 @@ def transform_terminal_output(
 ) -> str | None:
     try:
         options = NoisegateOptions.from_env().with_mapping(kwargs)
+        # Hermes calls transform_terminal_output before its built-in terminal
+        # redaction pass. Inline compaction is still safe because Hermes redacts
+        # the returned string afterwards, but raw artifact storage would persist
+        # pre-redaction output. Keep artifacts disabled for this early hook.
+        options = replace(options, artifact_enabled=False)
         reduced = reduce_text(
             output,
             command=command,

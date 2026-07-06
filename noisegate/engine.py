@@ -23,10 +23,15 @@ BYPASS_MARKERS = (
 )
 PROTECTED_TOOL_NAMES = frozenset(
     {
+        "memory",
         "read_file",
         "read_files",
         "read_text_file",
+        "session_search",
+        "skill_manage",
         "skill_view",
+        "web_extract",
+        "web_search",
         "write_file",
         "patch",
         "apply_patch",
@@ -34,6 +39,8 @@ PROTECTED_TOOL_NAMES = frozenset(
         "replace_in_file",
     }
 )
+PROTECTED_TOOL_PREFIXES = ("hindsight_", "lcm_", "mcp_", "mcp__")
+COMPACTABLE_TOOL_NAMES = frozenset({"terminal", "process", "read_terminal", "browser_console"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,7 +170,7 @@ def _reduce_text(
         return _unchanged(text, "disabled", command_class, reason="disabled")
     if _has_bypass_marker(text) or _has_bypass_marker(command or ""):
         return _unchanged(text, "bypass", command_class, reason="bypass_marker")
-    if tool_name in PROTECTED_TOOL_NAMES:
+    if tool_name and not _is_compactable_tool_name(tool_name):
         return _unchanged(text, "protected_tool", command_class, reason="protected_tool")
     if command_class == "git_diff" and options.preserve_diffs:
         return _unchanged(text, "protected_diff", command_class, reason="diff_passthrough")
@@ -252,6 +259,18 @@ def classify_command(command: str | None, text: str) -> str:
     if _is_search_command(command_l):
         return "search"
     return "generic"
+
+
+def _is_protected_tool_name(tool_name: str | None) -> bool:
+    if not tool_name:
+        return False
+    return tool_name in PROTECTED_TOOL_NAMES or tool_name.startswith(PROTECTED_TOOL_PREFIXES)
+
+
+def _is_compactable_tool_name(tool_name: str | None) -> bool:
+    if not tool_name or _is_protected_tool_name(tool_name):
+        return False
+    return tool_name in COMPACTABLE_TOOL_NAMES
 
 
 def _apply_reducer(

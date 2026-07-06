@@ -61,6 +61,21 @@ def test_reduce_cli_preserves_protected_tool_output() -> None:
     assert proc.stdout == raw
 
 
+def test_reduce_cli_preserves_unknown_tool_output() -> None:
+    raw = numbered("future exact context", 100)
+    proc = run_cli(
+        "reduce",
+        "--tool",
+        "future_tool",
+        "--max-chars",
+        "120",
+        input_text=raw,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == raw
+
+
 def test_reduce_json_rewrites_result_field() -> None:
     envelope = {
         "tool_name": "terminal",
@@ -91,6 +106,19 @@ def test_reduce_json_rewrites_plain_result_string() -> None:
     assert "[noisegate: omitted" in outer["result"]
     assert "line 001" in outer["result"]
     assert "line 100" in outer["result"]
+
+
+def test_reduce_json_preserves_plain_result_for_non_noisy_tool() -> None:
+    envelope = {
+        "tool_name": "web_extract",
+        "result": numbered("important article context", 100),
+        "noisegate": {"max_chars": 120},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == envelope
 
 
 def test_reduce_json_bad_input_fails_open() -> None:
