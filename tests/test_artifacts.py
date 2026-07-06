@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from noisegate.artifacts import ArtifactSecurityError, ArtifactStore, ArtifactTooLarge
+from noisegate.artifacts import (
+    DEFAULT_SIZE_CAP,
+    ArtifactSecurityError,
+    ArtifactStore,
+    ArtifactTooLarge,
+)
 from noisegate.engine import NoisegateOptions, reduce_text
 
 
@@ -27,6 +32,12 @@ def test_artifacts_are_disabled_by_default(tmp_path: Path) -> None:
     assert result.changed is True
     assert "artifact" not in result.metadata
     assert not (tmp_path / "artifacts").exists()
+
+
+def test_negative_artifact_size_cap_env_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NOISEGATE_ARTIFACT_SIZE_CAP", "-1")
+
+    assert NoisegateOptions.from_env().artifact_size_cap == DEFAULT_SIZE_CAP
 
 
 def test_artifact_store_uses_private_directory_and_file_modes(tmp_path: Path) -> None:

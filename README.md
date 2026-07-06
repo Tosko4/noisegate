@@ -260,7 +260,10 @@ Environment flags:
 NOISEGATE_DISABLE=1      # turn compaction off
 NOISEGATE_ARTIFACTS=1    # opt in to private raw-output artifacts
 NOISEGATE_ARTIFACT_DIR=/path/to/artifacts
+NOISEGATE_ARTIFACT_SIZE_CAP=1000000
 ```
+
+`noisegate doctor` reports ignored or fallback environment values, so typos like `NOISEGATE_ARTIFACTS=maybe` do not fail silently.
 
 Hermes calls `transform_terminal_output` before its built-in terminal redaction pass. Noisegate still compacts inline terminal output there, but it disables raw artifact storage on that early hook so pre-redaction output is not persisted.
 

@@ -152,13 +152,24 @@ def changelog_notes_for_version(root: Path, version: str) -> str:
 
 
 def git_contributor_names(root: Path) -> list[str]:
-    proc = subprocess.run(
-        ["git", "log", "--format=%aN"],
-        cwd=root,
-        text=True,
-        capture_output=True,
-        check=True,
-    )
+    root = Path(root)
+    if not root.exists():
+        raise ReleaseError(
+            f"repository root does not exist while reading contributor names: {root}"
+        )
+    try:
+        proc = subprocess.run(
+            ["git", "log", "--no-merges", "--format=%aN"],
+            cwd=root,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+    except FileNotFoundError as exc:
+        raise ReleaseError("git executable was not found while reading contributor names") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip() or f"exit code {exc.returncode}"
+        raise ReleaseError(f"git log failed while reading contributor names: {detail}") from exc
     return sorted({line.strip() for line in proc.stdout.splitlines() if line.strip()})
 
 
