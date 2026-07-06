@@ -45,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-capture-bytes",
         type=_nonnegative_int,
         default=DEFAULT_MAX_CAPTURE_BYTES,
-        help="maximum bytes to capture per stream before truncating",
+        help="maximum combined stdout/stderr bytes to capture before truncating",
     )
     wrap.add_argument("argv", nargs=argparse.REMAINDER, help="command after --")
     wrap.set_defaults(func=cmd_wrap)

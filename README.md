@@ -15,20 +15,37 @@ Install and enable Noisegate for Hermes, then stop dumping terminal walls into c
 
 ## Install For Hermes
 
-From this checkout, install into the same Python environment that runs `hermes`:
+From this checkout, install into the same Python environment that runs `hermes`,
+then enable the entry-point plugin in Hermes config:
 
 ```bash
 HERMES_PYTHON="$(head -1 "$(command -v hermes)" | sed 's/^#!//')"
 uv pip install --python "$HERMES_PYTHON" -e .
-hermes plugins enable noisegate
+"$HERMES_PYTHON" - <<'PY'
+from hermes_cli.config import load_config, save_config
+cfg = load_config()
+plugins = cfg.setdefault("plugins", {})
+enabled = plugins.get("enabled") if isinstance(plugins.get("enabled"), list) else []
+if "noisegate" not in enabled:
+    enabled.append("noisegate")
+plugins["enabled"] = enabled
+plugins.setdefault("disabled", [])
+save_config(cfg)
+PY
 ```
+
+Newer Hermes versions may also support `hermes plugins enable noisegate`. On
+Hermes versions where that command says the pip package is not installed or
+bundled, the config edit above is the compatible path. Existing enabled plugins
+should stay in `plugins.enabled`; the change takes effect on the next session or
+plugin reload.
 
 From a built package:
 
 ```bash
 HERMES_PYTHON="$(head -1 "$(command -v hermes)" | sed 's/^#!//')"
 uv pip install --python "$HERMES_PYTHON" noisegate-hermes
-hermes plugins enable noisegate
+# then add "noisegate" to plugins.enabled as shown above
 ```
 
 Hermes discovers the pip entry point `hermes_agent.plugins:noisegate`. The
@@ -52,11 +69,11 @@ noisegate artifacts stats
 noisegate artifacts verify
 ```
 
-`wrap` runs a command without a shell, captures stdout and stderr, writes the
-compacted result to stdout, and exits with the wrapped command's exit code. It
-captures up to 4 MiB per stream by default; use `--max-capture-bytes <n>` to
-change that. If capture is truncated, Noisegate adds a
-`[noisegate: capture truncated]` marker to the captured stream.
+`wrap` runs a command without a shell, captures stdout and stderr in arrival
+order, writes the compacted result to stdout, and exits with the wrapped
+command's exit code. It captures up to 4 MiB of combined output by default; use
+`--max-capture-bytes <n>` to change that. If capture is truncated, Noisegate adds
+a `[noisegate: capture truncated]` marker to the captured stream.
 
 Use `--raw` or `--full` to bypass reducer compaction for a wrapped command while
 still keeping the text capture cap:

@@ -41,28 +41,30 @@ class _CapturedStream:
     bytes_seen: int = 0
     truncated: bool = False
 
-    def append(self, chunk: bytes) -> None:
+    def append(self, chunk: bytes) -> str:
         if self.truncated:
-            return
+            return ""
         if self.max_bytes <= 0:
             self.text = CAPTURE_TRUNCATED_SUFFIX
             self.truncated = True
-            return
+            return CAPTURE_TRUNCATED_SUFFIX
 
         remaining = self.max_bytes - self.bytes_seen
         if remaining <= 0:
             self.text += CAPTURE_TRUNCATED_SUFFIX
             self.truncated = True
-            return
+            return CAPTURE_TRUNCATED_SUFFIX
         if len(chunk) <= remaining:
-            self.text += chunk.decode("utf-8", errors="replace")
+            fragment = chunk.decode("utf-8", errors="replace")
+            self.text += fragment
             self.bytes_seen += len(chunk)
-            return
+            return fragment
 
-        self.text += chunk[:remaining].decode("utf-8", errors="replace")
-        self.text += CAPTURE_TRUNCATED_SUFFIX
+        fragment = chunk[:remaining].decode("utf-8", errors="replace") + CAPTURE_TRUNCATED_SUFFIX
+        self.text += fragment
         self.bytes_seen = self.max_bytes
         self.truncated = True
+        return fragment
 
 
 def run_wrapped_command(
@@ -77,8 +79,10 @@ def run_wrapped_command(
     if not argv:
         raise ValueError("wrap requires a command after --")
 
-    stdout, stderr, exit_code = _capture_command(argv, max_capture_bytes=max_capture_bytes)
-    raw_text = f"{stdout.text}{stderr.text}"
+    stdout, stderr, raw_text, exit_code = _capture_command(
+        argv,
+        max_capture_bytes=max_capture_bytes,
+    )
     capture_truncated = stdout.truncated or stderr.truncated
     if raw:
         return WrappedCommandResult(
@@ -133,27 +137,36 @@ def _capture_command(
     argv: list[str],
     *,
     max_capture_bytes: int,
-) -> tuple[_CapturedStream, _CapturedStream, int]:
+) -> tuple[_CapturedStream, _CapturedStream, str, int]:
     process = subprocess.Popen(
         argv,
         stdin=None,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         shell=False,
         start_new_session=(os.name == "posix"),
     )
+    # Use one OS pipe for stdout+stderr so wrapped output follows the order a
+    # terminal-like combined stream would see. Separate stdout/stderr fields are
+    # retained for API shape, but stderr is intentionally empty in wrap mode.
     stdout = _CapturedStream(max(0, max_capture_bytes))
     stderr = _CapturedStream(max(0, max_capture_bytes))
+    combined_parts: list[str] = []
     old_handlers = _install_interrupt_handlers(process)
     try:
-        exit_code = _drain_process_pipes(process, stdout=stdout, stderr=stderr)
+        exit_code = _drain_process_pipes(
+            process,
+            stdout=stdout,
+            stderr=stderr,
+            combined_parts=combined_parts,
+        )
     except (KeyboardInterrupt, WrappedCommandInterrupted):
         _terminate_wrapped_process(process)
         raise
     finally:
         _restore_interrupt_handlers(old_handlers)
 
-    return stdout, stderr, exit_code
+    return stdout, stderr, "".join(combined_parts), exit_code
 
 
 def _install_interrupt_handlers(process: subprocess.Popen[bytes]) -> dict[int, Any]:
@@ -202,6 +215,7 @@ def _drain_process_pipes(
     *,
     stdout: _CapturedStream,
     stderr: _CapturedStream,
+    combined_parts: list[str],
 ) -> int:
     selector = selectors.DefaultSelector()
     streams: dict[int, IO[Any]] = {}
@@ -244,7 +258,9 @@ def _drain_process_pipes(
                 if not chunk:
                     _unregister_and_close(selector, streams, fd)
                     continue
-                captures[fd].append(chunk)
+                fragment = captures[fd].append(chunk)
+                if fragment:
+                    combined_parts.append(fragment)
         if exit_code is None:
             exit_code = process.wait()
         return exit_code

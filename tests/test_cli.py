@@ -274,6 +274,50 @@ def test_wrap_cli_full_is_raw_bypass_alias() -> None:
     assert proc.stdout == "usage: cmd\nflag\n"
 
 
+def test_wrap_cli_preserves_stdout_stderr_arrival_order() -> None:
+    script = (
+        "import sys, time\n"
+        "sys.stdout.write('out-1\\n'); sys.stdout.flush(); time.sleep(0.02)\n"
+        "sys.stderr.write('err-1\\n'); sys.stderr.flush(); time.sleep(0.02)\n"
+        "sys.stdout.write('out-2\\n'); sys.stdout.flush(); time.sleep(0.02)\n"
+        "sys.stderr.write('err-2\\n'); sys.stderr.flush()\n"
+    )
+
+    proc = run_cli(
+        "wrap",
+        "--raw",
+        "--",
+        sys.executable,
+        "-c",
+        script,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "out-1\nerr-1\nout-2\nerr-2\n"
+
+
+def test_wrap_cli_preserves_fast_stdout_stderr_write_order() -> None:
+    script = (
+        "import sys\n"
+        "sys.stdout.write('out-1\\n'); sys.stdout.flush()\n"
+        "sys.stderr.write('err-1\\n'); sys.stderr.flush()\n"
+        "sys.stdout.write('out-2\\n'); sys.stdout.flush()\n"
+        "sys.stderr.write('err-2\\n'); sys.stderr.flush()\n"
+    )
+
+    proc = run_cli(
+        "wrap",
+        "--raw",
+        "--",
+        sys.executable,
+        "-c",
+        script,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "out-1\nerr-1\nout-2\nerr-2\n"
+
+
 def test_wrap_cli_limits_captured_output() -> None:
     script = "import sys\nsys.stdout.write('a' * 2000)\n"
 
