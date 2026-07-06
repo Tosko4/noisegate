@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from noisegate.engine import NoisegateOptions, reduce_text
+import re
+
+from noisegate.engine import NoisegateOptions, _first_pattern_match, reduce_text
 
 
 def numbered(prefix: str, count: int) -> str:
@@ -61,13 +63,27 @@ def test_named_noisy_tools_can_still_reduce() -> None:
         assert result.changed is True
 
 
-def test_char_budget_below_marker_floor_is_honored() -> None:
+def test_tiny_char_budget_fails_open_instead_of_emitting_garbage() -> None:
     raw = "A" * 130
 
-    result = reduce_text(raw, options=options(max_chars=10))
+    for max_chars in (0, 1, 2, 10, 30):
+        result = reduce_text(raw, options=options(max_chars=max_chars))
+
+        assert result.changed is False
+        assert result.text == raw
+        assert result.metadata["reason"] == "invalid_budget"
+
+
+def test_char_budget_reduces_only_when_notice_and_content_fit() -> None:
+    raw = "A" * 130
+
+    result = reduce_text(raw, options=options(max_chars=40))
 
     assert result.changed is True
-    assert len(result.text) <= 10
+    assert len(result.text) <= 40
+    assert result.text.startswith("A")
+    assert result.text.endswith("A")
+    assert "[noisegate: omitted" in result.text
 
 
 def test_recovery_notices_do_not_exceed_budget_or_grow_output() -> None:
@@ -122,6 +138,38 @@ def test_important_line_char_cap_keeps_middle_failure() -> None:
     assert len(result.text) <= 500
     assert "test_middle.py::test_breaks" in result.text
     assert "AssertionError: boom" in result.text
+
+
+def test_first_pattern_match_short_circuits_after_first_matching_pattern() -> None:
+    match = _first_pattern_match("FIRST then SECOND", (re.compile("FIRST"), re.compile("SECOND")))
+
+    assert match is not None
+    assert match.group(0) == "FIRST"
+
+
+def test_important_line_reducer_handles_high_volume_repeated_failures() -> None:
+    raw = "\n".join(
+        f"FAILED tests/test_load_{index}.py::test_case - AssertionError: {'x' * 80}"
+        for index in range(20_000)
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        options=options(
+            max_chars=1_200,
+            max_lines=80,
+            head_lines=8,
+            tail_lines=8,
+            max_important_lines=20_000,
+        ),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 1_200
+    assert result.metadata["reducer"] == "pytest"
+    assert "FAILED tests/test_load_" in result.text
+    assert "[noisegate: omitted" in result.text
 
 
 def test_terminal_file_read_commands_are_protected_by_default() -> None:

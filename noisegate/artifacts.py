@@ -5,12 +5,15 @@ import hashlib
 import os
 import re
 import stat
+import tempfile
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 DEFAULT_SIZE_CAP = 1_000_000
 ARTIFACT_ID_RE = re.compile(r"ng_[a-f0-9]{24,64}")
+
 
 
 class ArtifactError(RuntimeError):
@@ -90,27 +93,32 @@ class ArtifactStore:
         artifact_id = f"ng_{digest[:24]}"
         path = self._path_for(artifact_id, root=root)
 
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-
+        temp_path: Path | None = None
         try:
-            fd = os.open(path, flags, 0o600)
+            fd, raw_temp_path = tempfile.mkstemp(
+                prefix=f".{artifact_id}.",
+                suffix=".tmp",
+                dir=root,
+            )
+            temp_path = Path(raw_temp_path)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            os.chmod(temp_path, 0o600)
+            os.link(temp_path, path)
         except FileExistsError:
             existing = self.read(artifact_id)
             if hashlib.sha256(existing.encode("utf-8")).hexdigest() != digest:
                 raise ArtifactSecurityError(
                     "artifact id collision with different content"
                 ) from None
-            return StoredArtifact(artifact_id, digest, len(data))
         except OSError as exc:
             if exc.errno == errno.ELOOP:
                 raise ArtifactSecurityError("artifact path resolves through a symlink") from exc
             raise
-
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-        os.chmod(path, 0o600)
+        finally:
+            if temp_path is not None:
+                with suppress(FileNotFoundError):
+                    temp_path.unlink()
         return StoredArtifact(artifact_id, digest, len(data))
 
     def read(self, artifact_id: str) -> str:
@@ -243,13 +251,15 @@ class ArtifactStore:
             )
         return checks
 
+
     def _ensure_root(self) -> Path:
         if self.root.is_symlink():
             raise ArtifactSecurityError("artifact root must not be a symlink")
         if self.root.exists() and not self.root.is_dir():
             raise ArtifactSecurityError("artifact root must be a directory")
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(self.root, 0o700)
+        # Private raw-output artifact directory: owner-only access is intentional.
+        os.chmod(self.root, 0o700)  # nosemgrep
         return self.root.resolve(strict=True)
 
     def _path_for(self, artifact_id: str, *, root: Path | None = None) -> Path:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import stat
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -125,3 +126,19 @@ def test_artifact_store_rejects_symlink_artifact_file(tmp_path: Path) -> None:
 
     with pytest.raises(ArtifactSecurityError):
         store.read(artifact.artifact_id)
+
+
+def test_artifact_store_handles_concurrent_same_content_writes(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "store", size_cap=10_000)
+    raw = numbered("concurrent terminal output", 200)
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        artifacts = list(executor.map(lambda _: store.store(raw), range(64)))
+
+    artifact_ids = {artifact.artifact_id for artifact in artifacts}
+    assert len(artifact_ids) == 1
+    artifact_id = artifact_ids.pop()
+    assert store.read(artifact_id) == raw
+    assert mode(tmp_path / "store") == 0o700
+    assert mode(tmp_path / "store" / f"{artifact_id}.txt") == 0o600
+    assert len(list((tmp_path / "store").glob("ng_*.txt"))) == 1

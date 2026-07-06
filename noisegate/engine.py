@@ -14,6 +14,7 @@ JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "Jso
 
 TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}
 FALSE_VALUES = {"0", "false", "no", "off", "disabled"}
+MIN_HEAD_TAIL_CHARS = 2
 BYPASS_MARKERS = (
     "NOISEGATE_BYPASS",
     "NOISEGATE_RAW",
@@ -200,6 +201,8 @@ def _reduce_text(
 
     if not options.enabled or options.mode == "off":
         return _unchanged(text, "disabled", command_class, reason="disabled")
+    if not _has_usable_budget(text, options):
+        return _unchanged(text, "invalid_budget", command_class, reason="invalid_budget")
     if _has_bypass_marker(text) or _has_bypass_marker(command or ""):
         return _unchanged(text, "bypass", command_class, reason="bypass_marker")
     if tool_name and not _is_compactable_tool_name(tool_name):
@@ -446,13 +449,15 @@ def _trim_indices_around_priority(
     if limit <= 0:
         return []
     selected: list[int] = []
+    selected_set: set[int] = set()
     for index in priority:
-        if index not in selected:
+        if index not in selected_set:
             selected.append(index)
+            selected_set.add(index)
         if len(selected) >= limit:
             return sorted(selected)
 
-    remaining = [index for index in indices if index not in selected]
+    remaining = [index for index in indices if index not in selected_set]
     left = 0
     right = len(remaining) - 1
     take_left = True
@@ -512,23 +517,22 @@ def _char_head_tail_preserving_patterns(
 ) -> str | None:
     if len(text) <= options.max_chars:
         return None
-    matches = [match for pattern in patterns for match in pattern.finditer(text)]
-    if not matches:
+    match = _first_pattern_match(text, patterns)
+    if match is None:
         return _char_head_tail(text, options)
 
     budget = max(0, options.max_chars)
     if budget == 0:
-        return ""
+        return None
     marker_a = "\n[noisegate: omitted before important output]\n"
     marker_b = "\n[noisegate: omitted after important output]\n"
     available = budget - len(marker_a) - len(marker_b)
     if available <= 0:
-        return text[matches[0].start() : matches[0].start() + budget]
+        return _char_head_tail(text, options)
 
     head_chars = max(1, available // 5)
     tail_chars = max(1, available // 5)
     focus_chars = max(1, available - head_chars - tail_chars)
-    match = matches[0]
     focus_start = max(head_chars, match.start() - focus_chars // 3)
     focus_end = min(len(text) - tail_chars, focus_start + focus_chars)
     focus_start = max(head_chars, focus_end - focus_chars)
@@ -541,12 +545,23 @@ def _char_head_tail_preserving_patterns(
     )
 
 
+def _first_pattern_match(
+    text: str,
+    patterns: tuple[re.Pattern[str], ...],
+) -> re.Match[str] | None:
+    for pattern in patterns:
+        match = pattern.search(text)
+        if match is not None:
+            return match
+    return None
+
+
 def _char_head_tail(text: str, options: NoisegateOptions) -> str | None:
     if len(text) <= options.max_chars:
         return None
     budget = max(0, options.max_chars)
     if budget == 0:
-        return ""
+        return None
     omitted = 0
     marker = ""
     available = budget
@@ -555,8 +570,8 @@ def _char_head_tail(text: str, options: NoisegateOptions) -> str | None:
     for _ in range(3):
         marker = f"\n[noisegate: omitted {omitted} chars]\n"
         available = max(0, budget - len(marker))
-        if available <= 0:
-            break
+        if available < MIN_HEAD_TAIL_CHARS:
+            return None
         head_chars = max(1, (available * 3) // 5)
         tail_chars = max(1, available - head_chars)
         if head_chars + tail_chars >= len(text):
@@ -565,8 +580,8 @@ def _char_head_tail(text: str, options: NoisegateOptions) -> str | None:
 
     marker = f"\n[noisegate: omitted {omitted} chars]\n"
     available = max(0, budget - len(marker))
-    if available <= 0:
-        return marker.strip()[:budget]
+    if available < MIN_HEAD_TAIL_CHARS:
+        return None
     head_chars = max(1, (available * 3) // 5)
     tail_chars = max(1, available - head_chars)
     overflow = head_chars + tail_chars + len(marker) - budget
@@ -719,7 +734,7 @@ def _append_recovery_notices(
     if len(text) + len(suffix) <= budget:
         return f"{text}{suffix}"
     if len(suffix) >= budget:
-        return suffix[:budget]
+        return _enforce_final_budget(text, options)
 
     text_budget = budget - len(suffix)
     reserved_options = replace(options, max_chars=text_budget)
@@ -753,6 +768,15 @@ def _recovery_notices(
             notices.append(f"[noisegate artifact: not stored; reason={reason}]")
 
     return notices
+
+
+def _has_usable_budget(text: str, options: NoisegateOptions) -> bool:
+    if options.max_chars <= 0 or options.max_lines <= 0:
+        return False
+    if len(text) <= options.max_chars and _line_count(text) <= options.max_lines:
+        return True
+    longest_marker = f"\n[noisegate: omitted {len(text)} chars]\n"
+    return options.max_chars >= len(longest_marker) + (MIN_HEAD_TAIL_CHARS * 2)
 
 
 def _should_reduce(text: str, options: NoisegateOptions) -> bool:
