@@ -97,9 +97,9 @@ JSON fails open and is written back unchanged.
 
 ## What It Compacts
 
-Noisegate recognizes terminal-like Hermes results from `terminal` and
-`execute_code`, plus generic JSON tool results with long string fields such as
-`stdout`, `stderr`, `output`, `text`, or `logs`.
+Noisegate compacts explicit terminal/noisy surfaces. For Hermes hook traffic,
+that means `terminal`, `process`, `read_terminal`, and `browser_console` only.
+For explicit operator use, the CLI can still reduce unnamed stdin text.
 
 Built-in reducers cover:
 
@@ -183,6 +183,45 @@ If you run additional context, memory, or transcript layers around Hermes, treat
 Noisegate as an inline compaction step rather than a storage system. Downstream
 layers will usually see the compacted result. When exact raw output needs to be
 recoverable, enable Noisegate artifact mode for that run.
+
+## CI and Release Management
+
+GitHub Actions run the full quality gate on pushes and pull requests:
+
+```bash
+uv run ruff check .
+uv run python -m pytest -q
+uv run python scripts/check_release.py
+uv run python scripts/check_contributors.py
+uv build
+uvx twine check dist/*
+```
+
+Release metadata is intentionally checked in three places and must match:
+
+- `pyproject.toml` → `[project].version`
+- `noisegate/_version.py` → `__version__`
+- `noisegate/plugin.yaml` → plugin manifest `version`
+- `uv.lock` → locked editable project version
+
+Release notes come from `CHANGELOG.md`. Contributor checks compare git author
+names to `CONTRIBUTORS.md` so a new contributor is noticed before publishing a
+release.
+
+To prepare a release locally:
+
+```bash
+uv run python scripts/prepare_release.py 0.2.0
+uv run python scripts/check_release.py --tag v0.2.0
+uv run python scripts/build_release_notes.py v0.2.0
+```
+
+The GitHub `Release` workflow can also be run manually with a semantic version.
+Manual dispatch updates version files, promotes changelog notes, runs checks,
+commits the release metadata, creates an annotated `vX.Y.Z` tag, builds the
+package, and publishes or updates the GitHub Release with built artifacts and
+extracted release notes. Manual releases are restricted to the `main` branch.
+Pushing a `v*` tag directly also runs the release verifier and publish path.
 
 ## Safety Defaults
 

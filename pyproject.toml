@@ -30,6 +30,7 @@ noisegate = "noisegate"
 [dependency-groups]
 dev = [
   "pytest>=8.0.0",
+  "ruff>=0.8.0",
 ]
 
 [build-system]
@@ -45,9 +46,12 @@ packages = ["noisegate"]
 
 [tool.hatch.build.targets.sdist]
 include = [
+  "/CHANGELOG.md",
+  "/CONTRIBUTORS.md",
   "/LICENSE",
   "/README.md",
   "/pyproject.toml",
+  "/scripts",
   "/tests",
   "/noisegate",
 ]

@@ -1,0 +1,120 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semantic version to release, e.g. 0.2.0
+        required: true
+        type: string
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: uv sync --locked --group dev
+
+      - name: Prepare release metadata for manual release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          uv run python scripts/prepare_release.py "$RELEASE_VERSION"
+
+      - name: Validate release metadata
+        env:
+          RELEASE_REF: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          RELEASE_TAG="v${RELEASE_REF#v}"
+          uv run python scripts/check_release.py --tag "$RELEASE_TAG"
+          uv run python scripts/check_contributors.py
+
+      - name: Quality gate
+        run: |
+          set -euo pipefail
+          uv run ruff check .
+          uv run python -m pytest -q
+          rm -rf dist
+          uv build
+          uvx twine check dist/*
+          git diff --check
+
+      - name: Commit version bump and tag for manual release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_VERSION#v}"
+          TAG="v$VERSION"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if ! git diff --quiet; then
+            git add pyproject.toml noisegate/_version.py noisegate/plugin.yaml CHANGELOG.md uv.lock
+            git commit -m "release: $TAG"
+          fi
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists locally"
+            if [ "$(git rev-parse "$TAG^{commit}")" != "$(git rev-parse HEAD)" ]; then
+              echo "Tag $TAG exists but does not point at HEAD" >&2
+              exit 1
+            fi
+          else
+            git tag -a "$TAG" -m "Noisegate $TAG"
+          fi
+          git push origin HEAD:main
+          git push origin "$TAG"
+
+      - name: Build release notes
+        env:
+          RELEASE_REF: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          RELEASE_TAG="v${RELEASE_REF#v}"
+          uv run python scripts/build_release_notes.py "$RELEASE_TAG" --output dist/release-notes.md
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          RELEASE_TAG="v${RELEASE_REF#v}"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --title "Noisegate $RELEASE_TAG" \
+              --notes-file dist/release-notes.md \
+              --verify-tag
+          fi
