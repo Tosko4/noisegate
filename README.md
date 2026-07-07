@@ -418,11 +418,7 @@ It is not a magic context engine.
 
 It is a small gate in front of noisy agent output. That is the whole point.
 
-## Attribution
-
-Noisegate was informed by the MIT-licensed [Tokenjuice](https://github.com/vincentkoc/tokenjuice) project, especially its ideas around deterministic reducers, command classification, safe bypasses, artifact opt-in, and machine-readable metadata.
-
-Noisegate is a fresh Python implementation focused on Hermes Agent.
+Noisegate was built from the ground up for Hermes after exploring existing approaches to terminal-output compaction.
 
 ## License
 
