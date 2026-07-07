@@ -53,6 +53,84 @@ LCM_EXTERNALIZED_PATTERNS = tuple(
         r"\bexternalized_ref\b\s*[:=]\s*[^,\s}\]]+",
     )
 )
+SHELL_SEPARATORS = {"|", "||", "&&", ";"}
+SOURCE_SEARCH_COMMANDS = {"rg", "grep", "ag", "ack"}
+OPTIONS_WITH_VALUES = {
+    "-C",
+    "-H",
+    "-I",
+    "-h",
+    "-i",
+    "-n",
+    "-P",
+    "-c",
+    "-f",
+    "-o",
+    "-p",
+    "-t",
+    "-w",
+    "--ansi",
+    "--builder",
+    "--cache-dir",
+    "--call",
+    "--cert",
+    "--config",
+    "--config-file",
+    "--constraint",
+    "--context",
+    "--directory",
+    "--dir",
+    "--editable",
+    "--env-file",
+    "--extra-index-url",
+    "--file",
+    "--find-links",
+    "--from",
+    "--host",
+    "--index-url",
+    "--log-level",
+    "--max-args",
+    "--max-procs",
+    "--option",
+    "--package",
+    "--parallel",
+    "--profile",
+    "--progress",
+
+    "--prefix",
+    "--project-directory",
+    "--project-name",
+    "--proxy",
+    "--project",
+    "--python",
+    "--replace",
+    "--requirement",
+    "--spec",
+    "--trusted-host",
+    "--tlscacert",
+    "--tlscert",
+    "--tlskey",
+    "--target-release",
+    "--timeout",
+    "--retries",
+    "--with",
+    "--with-editable",
+    "--with-requirements",
+    "--workspace",
+    "--filter",
+}
+SOURCE_READ_COMMANDS = {
+    "bat",
+    "cat",
+    "head",
+    "jq",
+    "less",
+    "more",
+    "nl",
+    "sed",
+    "tail",
+    "yq",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +317,13 @@ def _reduce_text(
             command_class,
             reason="file_read_passthrough",
         )
+    if command_class == "source_search":
+        return _unchanged(
+            text,
+            "protected_source_search",
+            command_class,
+            reason="source_search_passthrough",
+        )
     if not _should_reduce(text, options):
         return _unchanged(text, "below_threshold", command_class, reason="below_threshold")
 
@@ -358,33 +443,45 @@ def _reduce_text(
                     )
     return ReducedOutput(compacted, True, metadata)
 
-
 def classify_command(command: str | None, text: str) -> str:
     command_l = (command or "").strip().lower()
     sample_l = text[:4_000].lower()
+    text_l = text.lower()
 
     if _looks_like_file_read_command(command_l):
         return "file_read"
+    if _is_source_search_command(command_l):
+        return "source_search"
     if _looks_like_v4a_patch(text):
         return "patch"
-    if _looks_like_diff_command(command_l):
-        return "git_diff"
-    if "diff --git " in text or _looks_like_unified_diff(text):
+    if (
+        _looks_like_diff_command(command_l)
+        or "diff --git " in text
+        or _looks_like_unified_diff(text)
+    ):
         return "git_diff"
     if "git status" in command_l or ("on branch " in sample_l and "working tree" in sample_l):
         return "git_status"
     if "git log" in command_l:
         return "git_log"
+    command_variants = _command_intent_variants(command_l)
+    if any(_is_apt_command(variant) for variant in command_variants):
+        return "apt"
+    if any(_is_python_package_command(variant) for variant in command_variants):
+        return "python_package"
     if _contains_command(command_l, ("pytest", "py.test")) or "=== failures ===" in sample_l:
         return "pytest"
     if "unittest" in command_l or re.search(r"ran \d+ tests?", sample_l):
         return "unittest"
-    if _is_node_command(command_l, sample_l):
-        return "node"
-    if "docker build" in command_l or "docker compose" in command_l or "dockerfile" in sample_l:
+    if any(_is_docker_log_command(variant) for variant in command_variants):
+        return "docker_logs"
+    if any(_is_docker_build_command(variant) for variant in command_variants) or (
+        _looks_like_docker_build_output(text_l)
+        and any(_can_infer_docker_build_from_output(variant) for variant in command_variants)
+    ):
         return "docker_build"
-    if _is_search_command(command_l):
-        return "search"
+    if any(_is_node_command(variant, sample_l) for variant in command_variants):
+        return "node"
     return "generic"
 
 
@@ -412,9 +509,25 @@ def _preserve_patterns_for_output(
 ) -> tuple[re.Pattern[str], ...] | None:
     lcm_patterns = _lcm_externalized_patterns_for(text)
     if command_class in {"pytest", "unittest"}:
-        return CRITICAL_PATTERNS + lcm_patterns
+        return _preservation_patterns(text, CRITICAL_PATTERNS)
+    if command_class in {"apt", "python_package"}:
+        return _priority_preservation_patterns(
+            text,
+            PACKAGE_PATTERNS,
+            PACKAGE_HIGH_SIGNAL_PRIORITY_PATTERNS,
+        )
     if command_class == "node":
-        return NODE_PRESERVATION_PATTERNS + lcm_patterns
+        return _preservation_patterns(text, NODE_PATTERNS)
+    if command_class == "docker_build":
+        return _priority_preservation_patterns(
+            text,
+            DOCKER_PATTERNS,
+            DOCKER_BUILD_HIGH_SIGNAL_PRIORITY_PATTERNS,
+        )
+    if command_class == "docker_logs":
+        return _preservation_patterns(text, DOCKER_LOG_PATTERNS)
+    if command_class == "generic" and _first_pattern_match(text, CRITICAL_PATTERNS):
+        return _preservation_patterns(text, CRITICAL_PATTERNS)
     return lcm_patterns or None
 
 
@@ -424,7 +537,6 @@ def _apply_reducer(
     options: NoisegateOptions,
     exit_code: int | None,
 ) -> tuple[str, str | None]:
-    del exit_code
     lcm_patterns = _lcm_externalized_patterns_for(text)
     if options.mode == "head_tail":
         if lcm_patterns:
@@ -432,6 +544,13 @@ def _apply_reducer(
         return "generic_head_tail", _head_tail(text, options)
     if command_class in {"pytest", "unittest"}:
         return command_class, _important_lines(text, options, TEST_PATTERNS + lcm_patterns)
+    if command_class in {"apt", "python_package"}:
+        return command_class, _important_lines(
+            text,
+            options,
+            PACKAGE_PATTERNS + lcm_patterns,
+            priority_patterns=PACKAGE_HIGH_SIGNAL_PRIORITY_PATTERNS,
+        )
     if command_class == "node":
         return "node", _important_lines(
             text,
@@ -439,15 +558,24 @@ def _apply_reducer(
             NODE_PRESERVATION_PATTERNS + lcm_patterns,
         )
     if command_class == "docker_build":
-        return "docker_build", _important_lines(text, options, DOCKER_PATTERNS + lcm_patterns)
+        return "docker_build", _important_lines(
+            text,
+            options,
+            DOCKER_PATTERNS + lcm_patterns,
+            priority_patterns=DOCKER_BUILD_HIGH_SIGNAL_PRIORITY_PATTERNS,
+        )
+    if command_class == "docker_logs":
+        return "docker_logs", _important_lines(text, options, DOCKER_LOG_PATTERNS + lcm_patterns)
     if command_class == "git_status":
         return "git_status", _important_lines(text, options, GIT_STATUS_PATTERNS + lcm_patterns)
     if command_class == "git_log":
         return "git_log", _head_tail(text, replace(options, head_lines=40, tail_lines=8))
-    if command_class == "search":
-        if lcm_patterns:
-            return "search", _important_lines(text, options, lcm_patterns)
-        return "search", _head_tail(text, options)
+    if (
+        command_class == "generic"
+        and exit_code != 0
+        and _first_pattern_match(text, CRITICAL_PATTERNS)
+    ):
+        return "generic_critical", _important_lines(text, options, CRITICAL_PATTERNS + lcm_patterns)
     if lcm_patterns:
         return "generic_head_tail", _important_lines(text, options, lcm_patterns)
     return "generic_head_tail", _head_tail(text, options)
@@ -469,14 +597,30 @@ TEST_PATTERNS = tuple(
 CRITICAL_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
+        r"\bFAILED\b|\bERROR\b",
+        r"^(failed|error)\s+",
+        r"^(e:|err:|error:)",
         r"assertionerror|traceback|exceptiongroup|baseexception|\bexception\b\s*:",
         r"\bunhandled\s+exception\b",
         r"\bexception\s+in\b",
         r"^\s*E\s+",
         r"\d+\s+failed",
-        r"^(failed|error)\s+",
-        r"\bFAILED\b|\bERROR\b",
         r"\berror\b|\bfailed\b|\bfail\b",
+        r"unable to locate package|no matching distribution found|resolutionimpossible",
+        r"\b(conflict|conflicts|conflicting)\b",
+        r"hash sum mismatch|dependency problems|unmet dependencies|permission denied",
+    )
+)
+
+PACKAGE_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"^(e:|err:|error:)",
+        r"unable to locate package|no matching distribution found|resolutionimpossible",
+        r"\b(error|failed|failure|fail|conflict|conflicts|conflicting|traceback|exception)\b",
+        r"hash sum mismatch|dependency problems|unmet dependencies|permission denied",
+        r"npm err!|pnpm err!|yarn.*error|err_pnpm|elifecycle",
+        r"^(warning:|warn:)",
     )
 )
 
@@ -501,6 +645,113 @@ DOCKER_PATTERNS = tuple(
     )
 )
 
+DOCKER_LOG_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\berror\b|\bfailed\b|\bfail\b",
+        r"traceback|exception|fatal|critical|panic|segmentation fault|segfault",
+        r"valueerror|typeerror|runtimeerror|assertionerror",
+        r"unable to|denied|not found|permission denied",
+    )
+)
+
+HIGH_SIGNAL_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"valueerror|typeerror|runtimeerror|assertionerror",
+        r"traceback \(most recent call last\)",
+        r"resolutionimpossible|because .*conflicts? with",
+        r"no matching distribution found|unable to locate package",
+        r"failed to solve|did not complete successfully",
+        r"fatal|critical|panic|segmentation fault|segfault",
+        r"permission denied|access denied|denied|not found",
+    )
+)
+
+HIGH_SIGNAL_PRIORITY_PATTERNS = tuple(
+    tuple(re.compile(pattern, re.IGNORECASE) for pattern in group)
+    for group in (
+        (
+            r"traceback \(most recent call last\)",
+            r"valueerror|typeerror|runtimeerror|assertionerror",
+        ),
+        (
+            r"resolutionimpossible",
+            r"because .*conflicts? with",
+            r"no matching distribution found",
+            r"unable to locate package",
+        ),
+        (
+            r"failed to solve",
+            r"did not complete successfully",
+        ),
+        (
+            r"fatal|critical|panic|segmentation fault|segfault",
+            r"permission denied|access denied",
+        ),
+        (
+            r"denied|not found",
+        ),
+    )
+)
+
+PACKAGE_HIGH_SIGNAL_PRIORITY_PATTERNS = tuple(
+    tuple(re.compile(pattern, re.IGNORECASE) for pattern in group)
+    for group in (
+        (
+            r"resolutionimpossible",
+            r"because .*conflicts? with",
+            r"no matching distribution found",
+            r"unable to locate package",
+            r"dependency problems|unmet dependencies",
+            r"hash sum mismatch",
+        ),
+        (
+            r"traceback \(most recent call last\)",
+            r"valueerror|typeerror|runtimeerror|assertionerror",
+        ),
+        (
+            r"fatal|critical|panic|segmentation fault|segfault",
+            r"permission denied|access denied",
+        ),
+        (
+            r"failed|failure|fail",
+        ),
+        (
+            r"^(e:|err:|error:)",
+            r"\berror\b",
+        ),
+    )
+)
+
+DOCKER_BUILD_HIGH_SIGNAL_PRIORITY_PATTERNS = tuple(
+    tuple(re.compile(pattern, re.IGNORECASE) for pattern in group)
+    for group in (
+        (
+            r"failed to solve",
+            r"did not complete successfully",
+        ),
+        (
+            r"traceback \(most recent call last\)",
+            r"valueerror|typeerror|runtimeerror|assertionerror",
+        ),
+        (
+            r"resolutionimpossible",
+            r"because .*conflicts? with",
+            r"no matching distribution found",
+            r"unable to locate package",
+        ),
+        (
+            r"fatal|critical|panic|segmentation fault|segfault",
+            r"permission denied|access denied",
+        ),
+        (
+            r"denied|not found",
+        ),
+    )
+)
+
+
 GIT_STATUS_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -515,6 +766,8 @@ def _important_lines(
     text: str,
     options: NoisegateOptions,
     patterns: tuple[re.Pattern[str], ...],
+    *,
+    priority_patterns: tuple[tuple[re.Pattern[str], ...], ...] = HIGH_SIGNAL_PRIORITY_PATTERNS,
 ) -> str | None:
     lines = text.splitlines()
     if (
@@ -525,7 +778,7 @@ def _important_lines(
             return _char_head_tail_preserving_patterns(
                 text,
                 options,
-                _preservation_patterns(text, patterns),
+                _priority_preservation_patterns(text, patterns, priority_patterns),
             )
         return _char_head_tail(text, options)
 
@@ -535,7 +788,7 @@ def _important_lines(
             important.append(index)
 
     if len(important) > options.max_important_lines:
-        priority = _important_priority_indices(lines, important)
+        priority = _important_priority_indices(lines, important, priority_patterns)
         if priority:
             important = _trim_indices_around_priority(
                 important,
@@ -558,7 +811,13 @@ def _important_lines(
 
     if len(keep) >= len(lines):
         if len(lines) > options.max_lines:
-            budgeted = _line_budgeted_important_excerpt(lines, important, options, patterns)
+            budgeted = _line_budgeted_important_excerpt(
+                lines,
+                important,
+                options,
+                patterns,
+                priority_patterns,
+            )
             if budgeted is not None:
                 return budgeted
             return _head_tail(text, options)
@@ -566,20 +825,36 @@ def _important_lines(
             return _char_head_tail_preserving_patterns(
                 text,
                 options,
-                _preservation_patterns(text, patterns),
+                _priority_preservation_patterns(text, patterns, priority_patterns),
             )
         return _char_head_tail(text, options)
     selected = _lines_with_markers(lines, sorted(keep))
     if _line_count(selected) > options.max_lines:
-        budgeted = _line_budgeted_important_excerpt(lines, important, options, patterns)
+        budgeted = _line_budgeted_important_excerpt(
+            lines,
+            important,
+            options,
+            patterns,
+            priority_patterns,
+        )
         if budgeted is None:
             return None
         selected = budgeted
     if len(selected) > options.max_chars:
+        if priority_patterns is not HIGH_SIGNAL_PRIORITY_PATTERNS:
+            budgeted = _line_budgeted_important_excerpt(
+                lines,
+                important,
+                options,
+                patterns,
+                priority_patterns,
+            )
+            if budgeted is not None:
+                return budgeted
         return _char_head_tail_preserving_patterns(
             selected,
             options,
-            _preservation_patterns(selected, patterns),
+            _priority_preservation_patterns(selected, patterns, priority_patterns),
         )
     return selected
 
@@ -589,9 +864,17 @@ def _preservation_patterns(
     patterns: tuple[re.Pattern[str], ...],
 ) -> tuple[re.Pattern[str], ...]:
     base_patterns = patterns
+    uses_test_or_critical_patterns = patterns is CRITICAL_PATTERNS or any(
+        pattern in TEST_PATTERNS for pattern in patterns
+    )
     if patterns in {NODE_PATTERNS, NODE_PRESERVATION_PATTERNS}:
         if _first_pattern_match(text, CRITICAL_PATTERNS):
             base_patterns = NODE_PRESERVATION_PATTERNS
+    elif uses_test_or_critical_patterns:
+        if _first_pattern_match(text, CRITICAL_PATTERNS):
+            base_patterns = CRITICAL_PATTERNS
+    elif _first_pattern_match(text, HIGH_SIGNAL_PATTERNS):
+        base_patterns = HIGH_SIGNAL_PATTERNS
     elif _first_pattern_match(text, CRITICAL_PATTERNS):
         base_patterns = CRITICAL_PATTERNS
 
@@ -603,21 +886,73 @@ def _preservation_patterns(
     return base_patterns
 
 
+def _priority_preservation_patterns(
+    text: str,
+    patterns: tuple[re.Pattern[str], ...],
+    priority_patterns: tuple[tuple[re.Pattern[str], ...], ...],
+) -> tuple[re.Pattern[str], ...]:
+    if patterns is CRITICAL_PATTERNS or any(pattern in TEST_PATTERNS for pattern in patterns):
+        return _preservation_patterns(text, patterns)
+    flattened = tuple(pattern for group in priority_patterns for pattern in group)
+    if _first_pattern_match(text, flattened):
+        lcm_patterns = _lcm_externalized_patterns_for(text)
+        if lcm_patterns:
+            return lcm_patterns + tuple(
+                pattern for pattern in flattened if pattern not in lcm_patterns
+            )
+        return flattened
+    return _preservation_patterns(text, patterns)
+
+
+def _priority_indices(
+    lines: list[str],
+    indices: list[int],
+    priority_patterns: tuple[tuple[re.Pattern[str], ...], ...] = HIGH_SIGNAL_PRIORITY_PATTERNS,
+) -> list[int]:
+    for pattern_group in priority_patterns:
+        matches = [
+            index
+            for index in indices
+            if any(pattern.search(lines[index]) for pattern in pattern_group)
+        ]
+        if matches:
+            return matches
+    return [
+        index
+        for index in indices
+        if any(pattern.search(lines[index]) for pattern in CRITICAL_PATTERNS)
+    ]
+
+
 def _line_budgeted_important_excerpt(
     lines: list[str],
     important: list[int],
     options: NoisegateOptions,
     patterns: tuple[re.Pattern[str], ...],
+    priority_patterns: tuple[tuple[re.Pattern[str], ...], ...] = HIGH_SIGNAL_PRIORITY_PATTERNS,
 ) -> str | None:
     if not important:
         return None
     lcm_priority = _matching_indices(lines, important, LCM_EXTERNALIZED_PATTERNS)
+    signal_priority = _priority_indices(lines, important, priority_patterns)
     critical_priority = _matching_indices(lines, important, CRITICAL_PATTERNS)
     ranked_priority = sorted(
-        critical_priority or important,
+        signal_priority or critical_priority or important,
         key=lambda index: (_failure_detail_rank(lines[index]), index),
     )
-    priority = lcm_priority + [index for index in ranked_priority if index not in lcm_priority]
+    fallback_priority = sorted(
+        [
+            index
+            for index in critical_priority
+            if index not in signal_priority and index not in ranked_priority
+        ],
+        key=lambda index: (_failure_detail_rank(lines[index]), index),
+    )
+    priority = lcm_priority + [
+        index
+        for index in ranked_priority + fallback_priority
+        if index not in lcm_priority
+    ]
     best_rank = min(_failure_detail_rank(lines[index]) for index in ranked_priority)
     max_context = max(0, options.important_context_lines)
 
@@ -712,13 +1047,29 @@ def _is_incidental_exception_line(line: str) -> bool:
     return bool(re.search(r"\bexception ignored\b", line, re.IGNORECASE))
 
 
-def _important_priority_indices(lines: list[str], indices: list[int]) -> list[int]:
+def _important_priority_indices(
+    lines: list[str],
+    indices: list[int],
+    priority_patterns: tuple[tuple[re.Pattern[str], ...], ...] = HIGH_SIGNAL_PRIORITY_PATTERNS,
+) -> list[int]:
     lcm_priority = _matching_indices(lines, indices, LCM_EXTERNALIZED_PATTERNS)
-    critical_priority = sorted(
-        _matching_indices(lines, indices, CRITICAL_PATTERNS),
+    signal_priority = sorted(
+        _priority_indices(lines, indices, priority_patterns),
         key=lambda index: (_failure_detail_rank(lines[index]), index),
     )
-    return lcm_priority + [index for index in critical_priority if index not in lcm_priority]
+    critical_priority = sorted(
+        [
+            index
+            for index in _matching_indices(lines, indices, CRITICAL_PATTERNS)
+            if index not in signal_priority
+        ],
+        key=lambda index: (_failure_detail_rank(lines[index]), index),
+    )
+    return lcm_priority + [
+        index
+        for index in signal_priority + critical_priority
+        if index not in lcm_priority
+    ]
 
 
 def _matching_indices(
@@ -1067,15 +1418,10 @@ def _dropped_preserved_line(
 ) -> bool:
     if preserve_patterns is None:
         return False
-    match = _first_pattern_match(before, preserve_patterns)
-    if match is None:
-        return False
-    line_start = before.rfind("\n", 0, match.start()) + 1
-    line_end = before.find("\n", match.end())
-    if line_end == -1:
-        line_end = len(before)
-    preserved_line = before[line_start:line_end]
-    return preserved_line not in after
+    for line in before.splitlines():
+        if any(pattern.search(line) for pattern in preserve_patterns) and line not in after:
+            return True
+    return False
 
 
 def _first_pattern_match(
@@ -1102,7 +1448,9 @@ def _ranked_pattern_line_matches(
     patterns: tuple[re.Pattern[str], ...],
 ) -> list[_SpanMatch]:
     candidates: list[tuple[tuple[int, int, int, int, int], _SpanMatch]] = []
-    pattern_order_first = patterns is NODE_PATTERNS
+    pattern_order_first = patterns is NODE_PATTERNS or _patterns_prefer_declared_order(
+        patterns
+    )
     offset = 0
     for line_index, line in enumerate(text.splitlines(keepends=True)):
         stripped_line = line.rstrip("\r\n")
@@ -1140,6 +1488,19 @@ def _ranked_pattern_line_matches(
             )
         offset += len(line)
     return [match for _, match in sorted(candidates, key=lambda candidate: candidate[0])]
+
+
+def _patterns_prefer_declared_order(patterns: tuple[re.Pattern[str], ...]) -> bool:
+    priority_sets = (
+        HIGH_SIGNAL_PATTERNS,
+        tuple(pattern for group in HIGH_SIGNAL_PRIORITY_PATTERNS for pattern in group),
+        tuple(pattern for group in PACKAGE_HIGH_SIGNAL_PRIORITY_PATTERNS for pattern in group),
+        tuple(pattern for group in DOCKER_BUILD_HIGH_SIGNAL_PRIORITY_PATTERNS for pattern in group),
+    )
+    return any(
+        patterns is priority_set or patterns == priority_set
+        for priority_set in priority_sets
+    )
 
 
 def _char_head_tail(text: str, options: NoisegateOptions) -> str | None:
@@ -1494,27 +1855,26 @@ def _looks_like_v4a_patch(text: str) -> bool:
 
 
 def _looks_like_file_read_command(command: str) -> bool:
-    if not command or _has_unquoted_shell_operator(command):
+    if not command or _has_unsafe_shell_expansion(command):
         return False
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        tokens = command.split()
-    if not tokens:
-        return False
-    executable = tokens[0]
-    if executable in {"cat", "head", "tail", "less", "more", "bat", "nl"}:
-        return True
-    if _looks_like_git_show_file_read_tokens(tokens):
-        return True
-    if executable != "sed":
-        return False
-    if "-i" in tokens or any(token.startswith("-i") and token != "-i" for token in tokens):
-        return False
-    return any(_looks_like_sed_print_script(token) for token in tokens[1:])
+    segments = _command_token_segments(command)
+    for index, tokens in enumerate(segments):
+        if _is_setup_segment(tokens):
+            continue
+        if not _tokens_start_file_read(tokens):
+            continue
+        later_segments = [
+            segment
+            for segment in segments[index + 1 :]
+            if segment and not _is_setup_segment(segment)
+        ]
+        return not any(
+            _tokens_start_compactable_command(segment) for segment in later_segments
+        )
+    return False
 
 
-def _has_unquoted_shell_operator(command: str) -> bool:
+def _has_unsafe_shell_expansion(command: str) -> bool:
     quote: str | None = None
     escaped = False
     for index, char in enumerate(command):
@@ -1541,9 +1901,9 @@ def _has_unquoted_shell_operator(command: str) -> bool:
         if char in {"'", '"'}:
             quote = char
             continue
-        if char in "|;&><`\n\r" or (char == "$" and command[index + 1 : index + 2] == "("):
+        if char in "><`\n\r" or (char == "$" and command[index + 1 : index + 2] == "("):
             return True
-    return False
+    return quote is not None
 
 
 def _looks_like_sed_print_script(token: str) -> bool:
@@ -1555,10 +1915,64 @@ def _looks_like_sed_print_script(token: str) -> bool:
     )
 
 
+def _looks_like_sed_search_script(token: str) -> bool:
+    return bool(re.fullmatch(r"/.+/p", token.strip()))
+
+
+def _looks_like_sed_file_read_tokens(tokens: list[str]) -> bool:
+    if not tokens or Path(tokens[0]).name != "sed":
+        return False
+    saw_script = False
+    has_file_arg = False
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            has_file_arg = any(not item.startswith("-") for item in tokens[index + 1 :])
+            break
+        if token == "-i" or token == "--in-place" or token.startswith("-i"):
+            return False
+        if token in {"-e", "--expression"} and index + 1 < len(tokens):
+            script = tokens[index + 1]
+            if _looks_like_sed_search_script(script):
+                return False
+            saw_script = True
+            index += 2
+            continue
+        if token.startswith("--expression="):
+            script = token.split("=", 1)[1]
+            if _looks_like_sed_search_script(script):
+                return False
+            saw_script = True
+            index += 1
+            continue
+        if token in {"-f", "--file"}:
+            index += 2
+            continue
+        if token.startswith("--file="):
+            index += 1
+            continue
+        if token in {"-n", "-E", "-r", "-u", "-s"} or (
+            token.startswith("-") and not _looks_like_sed_print_script(token)
+        ):
+            index += 1
+            continue
+        if not saw_script:
+            if _looks_like_sed_search_script(token):
+                return False
+            saw_script = True
+        else:
+            has_file_arg = True
+        index += 1
+    return saw_script or has_file_arg
+
+
 def _looks_like_git_show_file_read_tokens(tokens: list[str]) -> bool:
-    if not tokens or tokens[0] != "git" or "show" not in tokens:
+    if not tokens or Path(tokens[0]).name != "git" or "show" not in tokens:
         return False
     show_index = tokens.index("show")
+    if any(token in {"-L", "--line-range"} for token in tokens[show_index + 1 :]):
+        return False
     skip_next = False
     for token in tokens[show_index + 1 :]:
         if skip_next:
@@ -1579,16 +1993,497 @@ def _looks_like_git_show_file_read_tokens(tokens: list[str]) -> bool:
     return False
 
 
+def _is_apt_command(command: str) -> bool:
+    for tokens in _command_segments_after_wrappers(command):
+        if not tokens or Path(tokens[0]).name not in {"apt", "apt-get"}:
+            continue
+        rest = _skip_option_tokens(tokens[1:])
+        if rest and rest[0] in {
+            "update",
+            "install",
+            "upgrade",
+            "dist-upgrade",
+            "full-upgrade",
+        }:
+            return True
+    return False
+
+
+def _is_docker_build_command(command: str) -> bool:
+    for tokens in _command_segments_after_wrappers(command):
+        if not tokens or Path(tokens[0]).name != "docker":
+            continue
+        rest = _skip_option_tokens(tokens[1:])
+        if not rest:
+            continue
+        if rest[0] == "build":
+            return True
+        if rest[0] == "buildx":
+            buildx_rest = _skip_option_tokens(rest[1:])
+            if buildx_rest and buildx_rest[0] in {"bake", "build"}:
+                return True
+            continue
+        if rest[0] in {"builder", "image"}:
+            nested_rest = _skip_option_tokens(rest[1:])
+            if nested_rest and nested_rest[0] == "build":
+                return True
+            continue
+        if rest[0] == "compose":
+            compose_rest = _skip_option_tokens(rest[1:])
+            if compose_rest and (
+                compose_rest[0] == "build"
+                or (compose_rest[0] in {"run", "up"} and "--build" in compose_rest)
+            ):
+                return True
+            continue
+    return False
+
+
+def _is_docker_log_command(command: str) -> bool:
+    for tokens in _command_segments_after_wrappers(command):
+        if not tokens or Path(tokens[0]).name != "docker":
+            continue
+        rest = _skip_option_tokens(tokens[1:])
+        if not rest:
+            continue
+        if rest[0] == "logs":
+            return True
+        if rest[0] == "container":
+            container_rest = _skip_option_tokens(rest[1:])
+            if container_rest and container_rest[0] == "logs":
+                return True
+            continue
+        if rest[0] == "compose":
+            compose_rest = _skip_option_tokens(rest[1:])
+            if compose_rest and compose_rest[0] == "logs":
+                return True
+            continue
+    return False
+
+
+def _looks_like_docker_build_output(sample: str) -> bool:
+    return bool(
+        "failed to solve" in sample
+        or "did not complete successfully" in sample
+        or ("dockerfile" in sample and re.search(r"(?m)^(#\d+|=>)", sample))
+    )
+
+
+def _can_infer_docker_build_from_output(command: str) -> bool:
+    for tokens in _command_segments_after_wrappers(command):
+        if not tokens:
+            continue
+        command_name = Path(tokens[0]).name
+        rest = _skip_option_tokens(tokens[1:])
+        if command_name in {"make", "gmake", "just", "task", "ninja"}:
+            return any(
+                re.search(r"\b(build|image|docker|container)\b", token, re.IGNORECASE)
+                for token in rest
+            )
+    return False
+
+
+
+def _python_module_invocation(tokens: list[str]) -> tuple[str, list[str]] | None:
+    if not tokens or not re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", Path(tokens[0]).name):
+        return None
+    index = 1
+    value_options = {"-c", "-W", "-X"}
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-m" and index + 1 < len(tokens):
+            return tokens[index + 1], tokens[index + 2 :]
+        if token in SHELL_SEPARATORS or not token.startswith("-"):
+            return None
+        option_name = token.split("=", 1)[0]
+        index += 1
+        if option_name in value_options and "=" not in token and index < len(tokens):
+            index += 1
+    return None
+
+
+def _is_python_package_command(command: str) -> bool:
+    for tokens in _command_segments_after_wrappers(command):
+        if not tokens:
+            continue
+        token_name = Path(tokens[0]).name
+        if token_name == "uv":
+            rest = _skip_option_tokens(tokens[1:])
+            if not rest:
+                continue
+            if rest[0] in {"sync", "add", "lock"}:
+                return True
+            if rest[0] == "pip":
+                pip_rest = _skip_option_tokens(rest[1:])
+                if pip_rest and pip_rest[0] in {"install", "sync"}:
+                    return True
+        if re.fullmatch(r"pip(?:\d+(?:\.\d+)?)?", token_name):
+            rest = _skip_option_tokens(tokens[1:])
+            if rest and rest[0] == "install":
+                return True
+        python_module = _python_module_invocation(tokens)
+        if python_module is not None and python_module[0] == "pip":
+            rest = _skip_option_tokens(python_module[1])
+            if rest and rest[0] == "install":
+                return True
+    return False
+
+
 def _is_node_command(command: str, sample: str) -> bool:
-    if re.search(r"(^|[\s;&|])(npm|pnpm|yarn)\s+", command):
+    command_names = [
+        Path(tokens[0]).name for tokens in _command_segments_after_wrappers(command) if tokens
+    ]
+    if any(name in {"npm", "pnpm", "yarn"} for name in command_names):
         return True
-    if re.search(r"(^|[\s;&|])(node|npx|vitest|jest|tsx|mocha)\b", command):
+    if any(name in {"node", "npx", "vitest", "jest", "tsx", "mocha"} for name in command_names):
         return True
     return "npm err!" in sample or "err_pnpm" in sample or "yarn run" in sample
 
 
-def _is_search_command(command: str) -> bool:
-    return bool(re.search(r"(^|[\s;&|])(rg|grep|ag|ack)(\s|$)", command))
+def _is_source_search_command(command: str) -> bool:
+    if not command:
+        return False
+    for tokens in _command_token_segments(command):
+        if _is_setup_segment(tokens):
+            continue
+        if _tokens_start_source_search(tokens) or _tokens_pipe_to_source_search(tokens):
+            return True
+    return False
+
+
+def _is_setup_segment(tokens: list[str]) -> bool:
+    setup_commands = {".", "cd", "export", "popd", "pushd", "pwd", "set", "source", "true"}
+    return bool(tokens and Path(tokens[0]).name in setup_commands)
+
+
+def _tokens_start_source_search(tokens: list[str]) -> bool:
+    tokens = _strip_command_wrappers(tokens)
+    if tokens and Path(tokens[0]).name in {"bash", "sh", "zsh"}:
+        shell_command = _shell_c_argument(tokens[1:])
+        return _is_source_search_command(shell_command) if shell_command is not None else False
+    while tokens and Path(tokens[0]).name in {"time", "gtime", "command"}:
+        tokens = _skip_option_tokens(tokens[1:])
+    runner_tokens = _command_runner_payload(tokens)
+    if runner_tokens is not None:
+        return _tokens_start_source_search(runner_tokens)
+    if tokens and Path(tokens[0]).name == "git":
+        rest = _skip_option_tokens(tokens[1:])
+        return bool(rest and Path(rest[0]).name == "grep")
+    if tokens and Path(tokens[0]).name == "xargs":
+        rest = _skip_option_tokens(tokens[1:])
+        return bool(rest and Path(rest[0]).name in SOURCE_SEARCH_COMMANDS)
+    return bool(tokens and Path(tokens[0]).name in SOURCE_SEARCH_COMMANDS)
+
+
+def _tokens_start_file_read(tokens: list[str]) -> bool:
+    tokens = _strip_command_wrappers(tokens)
+    if tokens and Path(tokens[0]).name in {"bash", "sh", "zsh"}:
+        shell_command = _shell_c_argument(tokens[1:])
+        return _looks_like_file_read_command(shell_command) if shell_command is not None else False
+    while tokens and Path(tokens[0]).name in {"time", "gtime", "command"}:
+        tokens = _skip_option_tokens(tokens[1:])
+    runner_tokens = _command_runner_payload(tokens)
+    if runner_tokens is not None:
+        return _tokens_start_file_read(runner_tokens)
+    if not tokens:
+        return False
+    token_name = Path(tokens[0]).name
+    if token_name == "git":
+        return _looks_like_git_show_file_read_tokens(tokens)
+    if token_name == "sed":
+        return _looks_like_sed_file_read_tokens(tokens)
+    return token_name in SOURCE_READ_COMMANDS
+
+
+def _tokens_start_compactable_command(tokens: list[str]) -> bool:
+    tokens = _strip_command_wrappers(tokens)
+    if not tokens:
+        return False
+    runner_tokens = _command_runner_payload(tokens)
+    if runner_tokens is not None:
+        return _tokens_start_compactable_command(runner_tokens)
+    token_name = Path(tokens[0]).name
+    if token_name in {"apt", "apt-get", "docker", "npm", "pnpm", "yarn"}:
+        return True
+    if token_name in {"uv", "pip", "pip3", "pytest", "py.test", "node"}:
+        return True
+    python_module = _python_module_invocation(tokens)
+    return bool(python_module is not None and python_module[0] == "pip")
+
+
+def _tokens_pipe_to_source_search(tokens: list[str]) -> bool:
+    tokens = _strip_command_wrappers(tokens)
+    for index, token in enumerate(tokens[:-1]):
+        if token == "|":
+            downstream = tokens[index + 1 :]
+            if _tokens_start_source_search(downstream):
+                upstream = tokens[:index]
+                if _tokens_start_compactable_command(upstream):
+                    continue
+                return True
+        if (
+            Path(tokens[0]).name == "find"
+            and token == "-exec"
+            and Path(tokens[index + 1]).name in SOURCE_SEARCH_COMMANDS
+        ):
+            return True
+    return False
+
+
+def _command_runner_payload(tokens: list[str]) -> list[str] | None:
+    if not tokens:
+        return None
+    command = Path(tokens[0]).name
+    if command == "uvx":
+        return _skip_option_tokens(tokens[1:])
+    if command in {"uv", "poetry", "pipx"}:
+        rest = _skip_option_tokens(tokens[1:])
+        if rest and rest[0] == "run":
+            return _skip_option_tokens(rest[1:])
+        return None
+    if command == "npx":
+        shell_command = _shell_c_argument(tokens[1:])
+        if shell_command is not None:
+            return _shell_tokens(shell_command)
+        return _skip_option_tokens(tokens[1:])
+    if command == "xargs":
+        return _xargs_payload_tokens(tokens)
+    if command in {"npm", "pnpm", "yarn"}:
+        rest = _skip_option_tokens(tokens[1:])
+        if rest and rest[0] in {"dlx", "exec"}:
+            shell_command = _shell_c_argument(rest[1:])
+            if shell_command is not None:
+                return _shell_tokens(shell_command)
+            return _skip_option_tokens(rest[1:])
+    return None
+
+
+def _xargs_payload_tokens(tokens: list[str]) -> list[str]:
+    value_options = {
+        "-a",
+        "-d",
+        "-E",
+        "-e",
+        "-I",
+        "-i",
+        "-L",
+        "-l",
+        "-n",
+        "-P",
+        "-s",
+        "--arg-file",
+        "--delimiter",
+        "--eof",
+        "--max-args",
+        "--max-chars",
+        "--max-lines",
+        "--max-procs",
+        "--process-slot-var",
+        "--replace",
+    }
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in SHELL_SEPARATORS:
+            return []
+        if token == "--":
+            return tokens[index + 1 :]
+        if not token.startswith("-"):
+            return tokens[index:]
+        option_name = token.split("=", 1)[0]
+        index += 1
+        if option_name in value_options and "=" not in token and index < len(tokens):
+            index += 1
+    return []
+
+
+def _command_intent_variants(command: str) -> tuple[str, ...]:
+    if not command:
+        return ("",)
+    variants = [command]
+    tokens = _shell_tokens(command)
+    payload_tokens = _command_runner_payload(_strip_command_wrappers(tokens))
+    if payload_tokens:
+        payload_command = shlex.join(payload_tokens)
+        if payload_command not in variants:
+            variants.append(payload_command)
+    shell_command = _shell_wrapped_command(tokens)
+    if shell_command and shell_command not in variants:
+        variants.append(shell_command)
+    return tuple(variants)
+
+
+def _strip_command_wrappers(tokens: list[str]) -> list[str]:
+    tokens = _strip_assignment_tokens(tokens)
+    while tokens:
+        command = Path(tokens[0]).name
+        command_name = Path(command).name
+        if command_name == "sudo":
+            tokens = _strip_assignment_tokens(
+                _skip_wrapper_options(
+                    tokens[1:],
+                    value_options={
+                        "-c",
+                        "-d",
+                        "-g",
+                        "-p",
+                        "-t",
+                        "-u",
+                        "--chdir",
+                        "--group",
+                        "--prompt",
+                        "--user",
+                    },
+                )
+            )
+            continue
+        if command_name == "env":
+            tokens = _strip_assignment_tokens(
+                _skip_wrapper_options(
+                    tokens[1:],
+                    value_options={
+                        "-c",
+                        "-s",
+                        "-u",
+                        "--chdir",
+                        "--split-string",
+                        "--unset",
+                    },
+                )
+            )
+            continue
+        if command_name in {"time", "gtime", "command"}:
+            tokens = _strip_assignment_tokens(
+                _skip_wrapper_options(
+                    tokens[1:],
+                    value_options={"-f", "-o", "--format", "--output"},
+                )
+            )
+            continue
+        break
+    return tokens
+
+
+def _skip_wrapper_options(tokens: list[str], *, value_options: set[str]) -> list[str]:
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in SHELL_SEPARATORS:
+            return []
+        if not token.startswith("-"):
+            break
+        index += 1
+        option_name = token.split("=", 1)[0]
+        if option_name in value_options and "=" not in token and index < len(tokens):
+            index += 1
+    return tokens[index:]
+
+
+def _shell_wrapped_command(tokens: list[str]) -> str | None:
+    tokens = _strip_command_wrappers(tokens)
+    if tokens and Path(tokens[0]).name in {"bash", "sh", "zsh"}:
+        return _shell_c_argument(tokens[1:])
+    return None
+
+
+def _shell_c_argument(tokens: list[str]) -> str | None:
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token.startswith("--call="):
+            return token.split("=", 1)[1]
+        has_short_c = (
+            token.startswith("-") and not token.startswith("--") and token.endswith("c")
+        )
+        if (token in {"-c", "--call"} or has_short_c) and index + 1 < len(tokens):
+            return tokens[index + 1]
+        index += 1
+    return None
+
+
+def _strip_assignment_tokens(tokens: list[str]) -> list[str]:
+    index = 0
+    while index < len(tokens) and re.fullmatch(r"[a-z_][a-z0-9_]*=.*", tokens[index]):
+        index += 1
+    return tokens[index:]
+
+
+def _command_token_segments(command: str) -> list[list[str]]:
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in _shell_tokens(command):
+        if token in {"&&", "||", ";"}:
+            if current:
+                segments.append(current)
+                current = []
+            continue
+        current.append(token)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _command_execution_segments(command: str) -> list[list[str]]:
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in _shell_tokens(command):
+        if token in SHELL_SEPARATORS:
+            if current:
+                segments.append(current)
+                current = []
+            continue
+        current.append(token)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _command_segments_after_wrappers(command: str) -> list[list[str]]:
+    segments: list[list[str]] = []
+    for variant in _command_intent_variants(command):
+        for tokens in _command_execution_segments(variant):
+            tokens = _strip_command_wrappers(tokens)
+            if tokens and Path(tokens[0]).name in {"bash", "sh", "zsh"}:
+                shell_command = _shell_c_argument(tokens[1:])
+                if shell_command is not None:
+                    segments.extend(_command_segments_after_wrappers(shell_command))
+                continue
+            while tokens and not _is_setup_segment(tokens):
+                segments.append(tokens)
+                payload_tokens = _command_runner_payload(tokens)
+                if payload_tokens is None:
+                    break
+                tokens = _strip_command_wrappers(payload_tokens)
+                if tokens and Path(tokens[0]).name in {"bash", "sh", "zsh"}:
+                    shell_command = _shell_c_argument(tokens[1:])
+                    if shell_command is not None:
+                        segments.extend(_command_segments_after_wrappers(shell_command))
+                    break
+    return segments
+
+
+def _skip_option_tokens(tokens: list[str]) -> list[str]:
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in SHELL_SEPARATORS:
+            return []
+        if not token.startswith("-"):
+            break
+        index += 1
+        option_name = token.split("=", 1)[0]
+        if option_name in OPTIONS_WITH_VALUES and "=" not in token and index < len(tokens):
+            index += 1
+    return tokens[index:]
+
+
+def _shell_tokens(command: str) -> list[str]:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        return list(lexer)
+    except ValueError:
+        return command.split()
 
 
 def _option_key(key: str) -> str:

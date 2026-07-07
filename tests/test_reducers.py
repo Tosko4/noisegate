@@ -1083,15 +1083,14 @@ def test_pytest_reducer_preserves_failure_context() -> None:
     assert "[noisegate: omitted" in result.text
 
 
-def test_search_reducer_keeps_first_and_last_matches() -> None:
+def test_search_output_is_source_context_and_stays_exact() -> None:
     raw = "\n".join(f"src/file_{index}.py:match {index}" for index in range(1, 40))
 
     result = reduce_text(raw, command="rg match src", options=options())
 
-    assert result.changed is True
-    assert result.metadata["reducer"] == "search"
-    assert "src/file_1.py:match 1" in result.text
-    assert "src/file_39.py:match 39" in result.text
+    assert result.changed is False
+    assert result.metadata["reducer"] == "protected_source_search"
+    assert result.text == raw
 
 
 def test_bypass_marker_leaves_text_unchanged() -> None:

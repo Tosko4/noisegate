@@ -155,12 +155,17 @@ def test_check_contributors_file_reports_missing_names(tmp_path: Path) -> None:
     assert missing == ["Charlie"]
 
 
-def test_sdist_includes_npm_release_metadata() -> None:
+def test_build_metadata_includes_product_contract_docs() -> None:
     root = Path(__file__).resolve().parents[1]
     pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     include = pyproject["tool"]["hatch"]["build"]["targets"]["sdist"]["include"]
+    wheel_force_include = pyproject["tool"]["hatch"]["build"]["targets"]["wheel"][
+        "force-include"
+    ]
 
     assert "/npm" in include
+    assert "/docs" in include
+    assert wheel_force_include["docs/product-contract.md"] == "docs/product-contract.md"
 
 
 def test_standalone_publish_workflows_checkout_requested_tag() -> None:
