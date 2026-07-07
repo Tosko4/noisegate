@@ -17,6 +17,9 @@ SHELL_LAUNCHER_NAMES = {"bash", "dash", "sh", "zsh"}
 SHELL_ASSIGNMENT_RE = re.compile(
     r"^([A-Za-z_][A-Za-z0-9_]*)=(?P<quote>[\"']?)(.*?)(?P=quote)$"
 )
+SHELL_VARIABLE_REF_RE = re.compile(
+    r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<bare>[A-Za-z_][A-Za-z0-9_]*))"
+)
 ENABLE_PLUGIN_CODE = """
 from hermes_cli.config import load_config, save_config
 cfg = load_config()
@@ -169,10 +172,13 @@ def _shell_assignments(text: str) -> dict[str, str]:
 
 
 def _expand_shell_vars(value: str, assignments: dict[str, str]) -> str:
-    for name, replacement in assignments.items():
-        value = value.replace(f"${name}", replacement)
-        value = value.replace(f"${{{name}}}", replacement)
-    return value
+    def replace(match: re.Match[str]) -> str:
+        name = match.group("braced") or match.group("bare")
+        if name is None:
+            return match.group(0)
+        return assignments.get(name, match.group(0))
+
+    return SHELL_VARIABLE_REF_RE.sub(replace, value)
 
 
 def _candidate_launcher_path(value: str, base: Path) -> Path | None:

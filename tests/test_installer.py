@@ -91,6 +91,47 @@ def test_build_install_hermes_plan_supports_bash_shim_to_console_script(
     assert plan.hermes_python == "/opt/hermes/.venv/bin/python3"
 
 
+def test_build_install_hermes_plan_expands_full_shell_variable_names(
+    tmp_path: Path,
+) -> None:
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    console_script = venv_bin / "hermes"
+    console_script.write_text("#!/opt/hermes/.venv/bin/python3\n", encoding="utf-8")
+    hermes = tmp_path / "hermes"
+    hermes.write_text(
+        "#!/usr/bin/env bash\n"
+        f"HERMES='{tmp_path / 'wrong'}'\n"
+        f"HERMES_CONSOLE='{console_script}'\n"
+        'exec "$HERMES_CONSOLE" "$@"\n',
+        encoding="utf-8",
+    )
+
+    plan = build_install_hermes_plan(hermes=str(hermes), installer="pip")
+
+    assert plan.hermes_python == "/opt/hermes/.venv/bin/python3"
+
+
+def test_build_install_hermes_plan_expands_braced_shell_variable_paths(
+    tmp_path: Path,
+) -> None:
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    console_script = venv_bin / "hermes"
+    console_script.write_text("#!/opt/hermes/.venv/bin/python3\n", encoding="utf-8")
+    hermes = tmp_path / "hermes"
+    hermes.write_text(
+        "#!/usr/bin/env bash\n"
+        f"HERMES_HOME='{venv_bin.parent}'\n"
+        'exec "${HERMES_HOME}/bin/hermes" "$@"\n',
+        encoding="utf-8",
+    )
+
+    plan = build_install_hermes_plan(hermes=str(hermes), installer="pip")
+
+    assert plan.hermes_python == "/opt/hermes/.venv/bin/python3"
+
+
 def test_build_install_hermes_plan_supports_bash_shim_to_python(
     tmp_path: Path,
 ) -> None:
