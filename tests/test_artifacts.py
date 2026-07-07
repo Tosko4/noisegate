@@ -26,6 +26,17 @@ def mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
 
+def test_artifact_store_env_rejects_negative_and_invalid_size_caps(monkeypatch) -> None:
+    monkeypatch.setenv("NOISEGATE_ARTIFACT_SIZE_CAP", "-1")
+    assert ArtifactStore.from_env().size_cap == DEFAULT_SIZE_CAP
+
+    monkeypatch.setenv("NOISEGATE_ARTIFACT_SIZE_CAP", "not-an-int")
+    assert ArtifactStore.from_env().size_cap == DEFAULT_SIZE_CAP
+
+    monkeypatch.setenv("NOISEGATE_ARTIFACT_SIZE_CAP", "123")
+    assert ArtifactStore.from_env().size_cap == 123
+
+
 def test_artifacts_are_disabled_by_default(tmp_path: Path) -> None:
     raw = numbered("line", 100)
     options = NoisegateOptions(max_chars=120, artifact_dir=tmp_path / "artifacts")

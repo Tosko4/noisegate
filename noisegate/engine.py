@@ -278,6 +278,13 @@ def _reduce_text(
                     "reason": "recovery_notice_dropped",
                     "size_bytes": planned_artifact.get("size_bytes"),
                 }
+                compacted = _append_recovery_notices(
+                    compacted_body,
+                    {key: value for key, value in metadata.items() if key != "artifact"},
+                    artifact_dir=options.artifact_dir,
+                    options=options,
+                    preserve_patterns=preserve_patterns,
+                )
             else:
                 metadata["artifact"] = _store_artifact(text, options)
                 compacted = _append_recovery_notices(
@@ -628,6 +635,9 @@ def _char_head_tail_preserving_patterns(
     match = _first_pattern_match(text, patterns)
     if match is None:
         return _char_head_tail(text, options)
+    line_excerpt = _line_centered_excerpt(text, options, match)
+    if line_excerpt is not None:
+        return line_excerpt
 
     budget = max(0, options.max_chars)
     if budget == 0:
@@ -672,24 +682,10 @@ def _match_centered_excerpt(
     match_len = match.end() - match.start()
     if budget <= 0 or match_len > budget:
         return None
-    slack = budget - match_len
-    start = match.start() - slack // 2
-    start = max(0, min(start, len(text) - budget))
-    end = min(len(text), start + budget)
-    if match.end() > end:
-        end = match.end()
-        start = max(0, end - budget)
-    if start > match.start() or end < match.end():
-        return None
-    excerpt = text[start:end]
-    if _has_partial_noisegate_marker(excerpt):
-        line_excerpt = _line_centered_excerpt(text, options, match)
-        if line_excerpt is not None:
-            return line_excerpt
-        return None
-    if not _fits_budget(excerpt, options):
-        return None
-    return excerpt
+    line_excerpt = _line_centered_excerpt(text, options, match)
+    if line_excerpt is not None:
+        return line_excerpt
+    return None
 
 
 def _line_centered_excerpt(
@@ -720,11 +716,8 @@ def _line_centered_excerpt(
         return None
 
     line = lines[match_line]
-    shifted_match_start = match.start() - offsets[match_line][0]
-    shifted_match_end = match.end() - offsets[match_line][0]
     if len(line) > options.max_chars:
-        fake_match = _SpanMatch(shifted_match_start, shifted_match_end)
-        return _match_centered_slice(line, options, fake_match)
+        return None
 
     start_line = end_line = match_line
     best = line
@@ -1014,7 +1007,16 @@ def _append_recovery_notices(
     options: NoisegateOptions | None = None,
     preserve_patterns: tuple[re.Pattern[str], ...] | None = None,
 ) -> str:
-    notices = _recovery_notices(metadata, artifact_dir=artifact_dir)
+    notice_metadata = metadata
+    if (
+        preserve_patterns is not None
+        and _first_pattern_match(text, preserve_patterns) is not None
+        and _has_nonrecoverable_artifact(metadata)
+    ):
+        notice_metadata = dict(metadata)
+        notice_metadata.pop("artifact", None)
+
+    notices = _recovery_notices(notice_metadata, artifact_dir=artifact_dir)
     if not notices:
         return text
     suffix = "\n" + "\n".join(notices)
@@ -1064,7 +1066,7 @@ def _append_recovery_notices(
         notice_only = suffix.lstrip("\n")
         if (
             (preserve_patterns is None or _first_pattern_match(text, preserve_patterns) is None)
-            and "[noisegate artifact:" in notice_only
+            and _has_recoverable_artifact(metadata)
             and _fits_budget(notice_only, options)
         ):
             return notice_only
@@ -1073,6 +1075,16 @@ def _append_recovery_notices(
     if not _fits_budget(candidate, options):
         return text
     return candidate
+
+
+def _has_nonrecoverable_artifact(metadata: dict[str, JsonValue]) -> bool:
+    artifact = metadata.get("artifact")
+    return isinstance(artifact, dict) and artifact.get("stored") is not True
+
+
+def _has_recoverable_artifact(metadata: dict[str, JsonValue]) -> bool:
+    artifact = metadata.get("artifact")
+    return isinstance(artifact, dict) and artifact.get("stored") is True
 
 
 def _recovery_notices(

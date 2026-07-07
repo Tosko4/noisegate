@@ -311,7 +311,7 @@ Environment flags:
 NOISEGATE_DISABLE=1      # turn compaction off
 NOISEGATE_ARTIFACTS=1    # opt in to private raw-output artifacts
 NOISEGATE_ARTIFACT_DIR=/path/to/artifacts
-NOISEGATE_ARTIFACT_SIZE_CAP=1000000
+NOISEGATE_ARTIFACT_SIZE_CAP=1000000  # max stored raw-output bytes per artifact
 ```
 
 `noisegate doctor` reports ignored or fallback environment values, so typos like `NOISEGATE_ARTIFACTS=maybe` do not fail silently.

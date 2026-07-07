@@ -231,6 +231,21 @@ def test_git_contributor_names_ignores_synthetic_merge_commits(monkeypatch, tmp_
     assert calls == [["/usr/bin/git", "log", "--no-merges", "--format=%aN%x00%aE"]]
 
 
+def test_git_contributor_names_wraps_git_log_failure(monkeypatch, tmp_path: Path) -> None:
+    def fake_run(argv, **_kwargs):
+        raise subprocess.CalledProcessError(128, argv, stderr="not a git repository")
+
+    monkeypatch.setattr("scripts.release_tools.shutil.which", lambda _name: "/usr/bin/git")
+    monkeypatch.setattr("scripts.release_tools.subprocess.run", fake_run)
+
+    try:
+        git_contributor_names(tmp_path)
+    except ReleaseError as exc:
+        assert "git log failed while reading contributor names: not a git repository" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected git log failure to be wrapped")
+
+
 def test_release_scripts_are_executable_from_repo_root() -> None:
     root = Path(__file__).resolve().parents[1]
     subprocess.run(

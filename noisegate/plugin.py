@@ -118,6 +118,7 @@ def transform_tool_result(
                         options=options,
                         preserve_patterns=preserve_patterns,
                     )
+                    _mark_artifact_notice_dropped_if_missing(metadata, text)
                     if len(text) >= len(value):
                         continue
                 payload[field] = text
@@ -161,6 +162,23 @@ def transform_tool_result(
         return candidate if len(candidate) < len(result) else None
     except Exception:
         return None
+
+
+def _mark_artifact_notice_dropped_if_missing(
+    metadata: dict[str, JsonValue],
+    text: str,
+) -> None:
+    artifact = metadata.get("artifact")
+    if not isinstance(artifact, dict) or artifact.get("stored") is not True:
+        return
+    artifact_id = artifact.get("id")
+    if isinstance(artifact_id, str) and artifact_id in text:
+        return
+    metadata["artifact"] = {
+        "stored": False,
+        "reason": "recovery_notice_dropped",
+        "size_bytes": artifact.get("size_bytes"),
+    }
 
 
 def _preserve_patterns_for(
