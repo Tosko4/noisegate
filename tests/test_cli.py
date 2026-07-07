@@ -90,6 +90,83 @@ def test_reduce_cli_preserves_unknown_tool_output() -> None:
     assert proc.stdout == raw
 
 
+def test_reduce_cli_metadata_reports_reducer_command_class_and_savings() -> None:
+    raw = numbered("line", 100)
+    proc = run_cli(
+        "reduce",
+        "--command",
+        "make noisy",
+        "--max-chars",
+        "120",
+        "--metadata",
+        input_text=raw,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    metadata = json.loads(proc.stderr)
+    assert metadata["compacted"] is True
+    assert metadata["command_class"] == "generic"
+    assert metadata["reducer"] == "generic_head_tail"
+    assert metadata["saved_chars"] > 0
+    assert metadata["saved_lines"] > 0
+
+
+def test_reduce_cli_metadata_reports_unchanged_reason() -> None:
+    raw = numbered("exact line", 100)
+    proc = run_cli(
+        "reduce",
+        "--tool",
+        "terminal",
+        "--command",
+        "cat exact-output.txt",
+        "--metadata",
+        "--max-chars",
+        "120",
+        input_text=raw,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == raw
+    metadata = json.loads(proc.stderr)
+    assert metadata["compacted"] is False
+    assert metadata["command_class"] == "file_read"
+    assert metadata["reducer"] == "protected_file_read"
+    assert metadata["reason"] == "file_read_passthrough"
+    assert metadata["saved_chars"] == 0
+    assert metadata["saved_lines"] == 0
+
+
+def test_reduce_cli_metadata_stderr_failure_does_not_corrupt_stdout() -> None:
+    dev_full = Path("/dev/full")
+    if not dev_full.exists():
+        return
+    raw = numbered("line", 100)
+    with dev_full.open("wb") as stderr:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "noisegate.cli",
+                "reduce",
+                "--command",
+                "make noisy",
+                "--max-chars",
+                "120",
+                "--metadata",
+            ],
+            input=raw,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            check=False,
+        )
+
+    assert proc.returncode == 0
+    assert "[noisegate: omitted" in proc.stdout
+    assert proc.stdout != raw
+    assert not proc.stdout.endswith(raw)
+
+
 def test_reduce_json_rewrites_result_field() -> None:
     envelope = {
         "tool_name": "terminal",
@@ -122,6 +199,32 @@ def test_reduce_json_rewrites_plain_result_string() -> None:
     assert "line 100" in outer["result"]
 
 
+def test_reduce_json_metadata_reports_plain_result_reducer_details() -> None:
+    envelope = {
+        "tool_name": "terminal",
+        "args": {"command": "pytest"},
+        "result": numbered("line", 100),
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", "--metadata", input_text=json.dumps(envelope))
+
+    assert proc.returncode == 0, proc.stderr
+    metadata = json.loads(proc.stderr)
+    assert metadata["compacted"] is True
+    assert metadata["command_class"] == "pytest"
+    assert metadata["reducer"] == "pytest"
+    assert metadata["source"] == "reduce-json"
+    assert metadata["output_chars"] == len(proc.stdout)
+    assert metadata["field_output_chars"] < metadata["output_chars"]
+    assert metadata["saved_chars"] > 0
+    assert metadata["omitted_chars"] == metadata["saved_chars"]
+    assert metadata["saved_lines"] == 0
+    assert metadata["omitted_lines"] == 0
+    assert metadata["field_saved_chars"] > 0
+    assert metadata["field_omitted_chars"] == metadata["field_saved_chars"]
+    assert metadata["field_omitted_lines"] > 0
+
+
 def test_reduce_json_preserves_plain_result_for_non_noisy_tool() -> None:
     envelope = {
         "tool_name": "web_extract",
@@ -142,6 +245,19 @@ def test_reduce_json_bad_input_fails_open() -> None:
 
     assert proc.returncode == 0
     assert proc.stdout == raw
+
+
+def test_reduce_json_metadata_reports_bad_input_reason() -> None:
+    raw = "{not json"
+
+    proc = run_cli("reduce-json", "--metadata", input_text=raw)
+
+    assert proc.returncode == 0
+    assert proc.stdout == raw
+    metadata = json.loads(proc.stderr)
+    assert metadata["compacted"] is False
+    assert metadata["source"] == "reduce-json"
+    assert metadata["reason"] == "invalid_json"
 
 
 def test_reduce_json_preserves_direct_protected_tool_payload() -> None:
@@ -183,7 +299,9 @@ def test_doctor_cli_reports_health(tmp_path: Path) -> None:
     assert "Noisegate doctor" in proc.stdout
     assert "package: ok" in proc.stdout
     assert "environment: ok" in proc.stdout
+    assert "config: enabled=True mode=auto" in proc.stdout
     assert "artifacts: disabled" in proc.stdout
+    assert "artifact_size_cap: 1000000" in proc.stdout
 
 
 def test_doctor_cli_reports_invalid_environment_values(tmp_path: Path) -> None:
@@ -202,7 +320,9 @@ def test_doctor_cli_reports_invalid_environment_values(tmp_path: Path) -> None:
     assert "NOISEGATE_DISABLE='definitely' is not recognized" in proc.stdout
     assert "NOISEGATE_ARTIFACTS='sometimes' is not recognized" in proc.stdout
     assert "NOISEGATE_ARTIFACT_SIZE_CAP='-1' is invalid" in proc.stdout
+    assert "config: enabled=True mode=auto" in proc.stdout
     assert "artifacts: disabled" in proc.stdout
+    assert "artifact_size_cap: 1000000" in proc.stdout
 
 
 def test_install_hermes_cli_dry_run_reports_plan(tmp_path: Path) -> None:
@@ -368,6 +488,30 @@ def test_wrap_cli_compacts_output_and_preserves_exit_code() -> None:
     assert "[noisegate: omitted" in proc.stdout
     assert "[noisegate: exit_code=3]" in proc.stdout
     assert "warning: noisy" in proc.stdout
+
+
+def test_wrap_cli_metadata_reports_reducer_and_preserves_exit_code() -> None:
+    script = "for index in range(100): print(f'line {index:03d}')\nraise SystemExit(3)\n"
+
+    proc = run_cli(
+        "wrap",
+        "--command",
+        "pytest",
+        "--max-chars",
+        "160",
+        "--debug",
+        "--",
+        sys.executable,
+        "-c",
+        script,
+    )
+
+    assert proc.returncode == 3
+    metadata = json.loads(proc.stderr)
+    assert metadata["command_class"] == "pytest"
+    assert metadata["reducer"] == "pytest"
+    assert metadata["exit_code"] == 3
+    assert metadata["saved_chars"] > 0
 
 
 def test_wrap_cli_raw_bypass_returns_captured_output_unchanged() -> None:
