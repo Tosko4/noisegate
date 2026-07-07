@@ -21,6 +21,12 @@ classifiers = [
 ]
 dependencies = []
 
+[project.urls]
+Homepage = "https://github.com/Tosko4/noisegate#readme"
+Repository = "https://github.com/Tosko4/noisegate"
+Issues = "https://github.com/Tosko4/noisegate/issues"
+Changelog = "https://github.com/Tosko4/noisegate/releases"
+
 [project.scripts]
 noisegate = "noisegate.cli:main"
 

@@ -130,6 +130,7 @@ jobs:
           set -euo pipefail
           RELEASE_TAG="v${RELEASE_REF#v}"
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --notes-file dist/release-notes.md
             gh release upload "$RELEASE_TAG" dist/* --clobber
           else
             gh release create "$RELEASE_TAG" dist/* \

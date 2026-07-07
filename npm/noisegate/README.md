@@ -4,10 +4,18 @@ This npm package is only a thin installer wrapper for the Python package [`noise
 
 Noisegate itself is a Python Hermes Agent plugin and CLI. The Python package is canonical.
 
-## Install Noisegate for Hermes
+## Install or update Noisegate for Hermes
 
 ```bash
 npx -p noisegate-hermes noisegate install-hermes
+```
+
+Use the same command for first install and updates. It finds `hermes` on `PATH`, resolves the Python environment that runs Hermes, installs the matching `noisegate-hermes` Python package there, enables the `noisegate` plugin, and runs `noisegate doctor`.
+
+Preview the exact commands first:
+
+```bash
+npx -p noisegate-hermes noisegate install-hermes --dry-run
 ```
 
 If your npm client does not resolve the single-bin shortcut, use the explicit bin name:
@@ -21,6 +29,8 @@ The wrapper delegates to:
 ```bash
 uvx --from noisegate-hermes==<this npm package version> noisegate install-hermes
 ```
+
+If Hermes is running as a long-lived gateway/service, restart or reload that Hermes process through your normal maintenance flow after installing so the plugin/config change is picked up. Avoid interrupting in-flight agent work.
 
 ## Security posture
 

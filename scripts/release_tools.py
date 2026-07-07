@@ -284,7 +284,9 @@ def release_notes_for_version(root: Path, version: str, *, repo: str | None = No
             "the PRs included since the previous release"
         )
     return "\n\n".join(
-        part for part in (notes, _format_release_pr_section(summary)) if part.strip()
+        part
+        for part in (notes, _format_update_section(), _format_release_pr_section(summary))
+        if part.strip()
     )
 
 
@@ -324,6 +326,41 @@ def release_pull_request_summary(
     )
 
 
+def _format_update_section() -> str:
+    return "\n".join(
+        (
+            "## How to update",
+            "",
+            "For an existing Hermes Agent installation, run:",
+            "",
+            "```bash",
+            "uvx --from noisegate-hermes noisegate install-hermes",
+            "```",
+            "",
+            "Preview the exact commands first:",
+            "",
+            "```bash",
+            "uvx --from noisegate-hermes noisegate install-hermes --dry-run",
+            "```",
+            "",
+            "npm users can use the wrapper instead:",
+            "",
+            "```bash",
+            "npx -p noisegate-hermes noisegate install-hermes",
+            "```",
+            "",
+            "The installer finds `hermes` on `PATH`, resolves the Python environment "
+            "that runs Hermes, installs `noisegate-hermes` there, enables the "
+            "`noisegate` plugin, and runs `noisegate doctor`.",
+            "",
+            "If Hermes is running as a long-lived gateway/service, restart or reload "
+            "that Hermes process through your normal maintenance flow after "
+            "installing so the plugin/config change is picked up. Avoid interrupting "
+            "in-flight agent work.",
+        )
+    )
+
+
 def _format_release_pr_section(summary: ReleasePullRequestSummary) -> str:
     lines = ["## Included pull requests"]
     range_label = (
@@ -349,11 +386,15 @@ def _format_release_pr_section(summary: ReleasePullRequestSummary) -> str:
             continue
         lines.extend(("", f"### {category}"))
         for pr in prs:
-            lines.append(f"- #{pr.number} — {pr.title} ({pr.author_mention}) {pr.url}")
+            lines.append(
+                f"- [#{pr.number}]({pr.url}) {pr.title} — {pr.author_mention}"
+            )
     for category, prs in sorted(grouped.items()):
         lines.extend(("", f"### {category}"))
         for pr in prs:
-            lines.append(f"- #{pr.number} — {pr.title} ({pr.author_mention}) {pr.url}")
+            lines.append(
+                f"- [#{pr.number}]({pr.url}) {pr.title} — {pr.author_mention}"
+            )
 
     lines.extend(("", "## New contributors"))
     if summary.new_contributors:

@@ -254,14 +254,29 @@ def test_release_notes_include_categorized_prs_and_new_contributors(
     summary = release_pull_request_summary(tmp_path, "0.2.0", repo="Tosko4/noisegate")
 
     assert "### Added" in notes
+    assert "## How to update" in notes
+    assert "uvx --from noisegate-hermes noisegate install-hermes" in notes
+    assert "npx -p noisegate-hermes noisegate install-hermes" in notes
     assert "## Included pull requests" in notes
     assert "Release range: `v0.1.0...v0.2.0`." in notes
     assert "### Release / Packaging" in notes
-    assert "#7 — Add npm installer packaging (@Bob)" in notes
+    assert (
+        "[#7](https://github.com/Tosko4/noisegate/pull/7) "
+        "Add npm installer packaging — @Bob"
+    ) in notes
     assert "### Security / Safety" in notes
-    assert "#8 — Harden artifact writes (@Alice)" in notes
+    assert (
+        "[#8](https://github.com/Tosko4/noisegate/pull/8) "
+        "Harden artifact writes — @Alice"
+    ) in notes
     assert "### Documentation" in notes
-    assert "#9 — Docs: clarify install flow (@Charlie)" in notes
+    assert (
+        "[#9](https://github.com/Tosko4/noisegate/pull/9) "
+        "Docs: clarify install flow — @Charlie"
+    ) in notes
+    assert "https://github.com/Tosko4/noisegate/pull/7\n" not in notes
+    assert "https://github.com/Tosko4/noisegate/pull/8\n" not in notes
+    assert "https://github.com/Tosko4/noisegate/pull/9\n" not in notes
     assert "## New contributors" in notes
     assert "@Bob made their first merged Noisegate PR in #7" in notes
     assert "@Charlie made their first merged Noisegate PR in #9" in notes
@@ -292,11 +307,21 @@ def test_npm_oidc_publish_uses_supported_node_version() -> None:
 
 def test_release_pypi_publish_is_retry_safe_after_partial_release() -> None:
     root = Path(__file__).resolve().parents[1]
+    for workflow in ("release.yml", "publish-pypi.yml"):
+        text = (root / ".github" / "workflows" / workflow).read_text(
+            encoding="utf-8"
+        )
+        assert "skip-existing: true" in text
+
+def test_release_workflow_updates_existing_release_notes() -> None:
+    root = Path(__file__).resolve().parents[1]
     text = (root / ".github" / "workflows" / "release.yml").read_text(
         encoding="utf-8"
     )
 
-    assert "skip-existing: true" in text
+    assert 'gh release edit "$RELEASE_TAG" --notes-file dist/release-notes.md' in text
+    assert 'gh release upload "$RELEASE_TAG" dist/* --clobber' in text
+
 
 def test_git_contributor_names_requires_resolved_git(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("scripts.release_tools.shutil.which", lambda _name: None)

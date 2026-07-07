@@ -61,29 +61,25 @@ And it refuses to touch things that should stay exact:
 
 That last bit matters. A compactor that damages retrieved context is worse than no compactor.
 
-## Install for Hermes
+## Install or update for Hermes
 
 Noisegate is distributed as the Python package `noisegate-hermes`. The Hermes plugin must be installed into the same Python environment that runs `hermes`.
 
-The easiest path is the installer command:
+For a normal existing Hermes Agent installation, this is the command:
 
 ```bash
 uvx --from noisegate-hermes noisegate install-hermes
 ```
 
-That command:
+Use the same command for first install and updates. It finds `hermes` on `PATH`, resolves the Python environment that runs Hermes, installs the matching `noisegate-hermes` package there, enables the `noisegate` plugin, and runs `noisegate doctor`.
 
-1. finds the `hermes` launcher on `PATH`;
-2. resolves the Hermes Python interpreter from either a Python console-script shebang or the official Hermes bash shim;
-3. installs `noisegate-hermes` into that interpreter environment;
-4. enables the `noisegate` Hermes entry-point plugin through Hermes config helpers;
-5. runs `noisegate doctor` inside the Hermes Python environment.
-
-Preview the exact commands without changing anything:
+Preview the exact commands first:
 
 ```bash
 uvx --from noisegate-hermes noisegate install-hermes --dry-run
 ```
+
+If Hermes is running as a long-lived gateway/service, restart or reload that Hermes process through your normal maintenance flow after installing so the plugin/config change is picked up. Avoid interrupting in-flight agent work.
 
 From a checkout, install that exact checkout into Hermes:
 
@@ -91,7 +87,31 @@ From a checkout, install that exact checkout into Hermes:
 uv run noisegate install-hermes --package .
 ```
 
-Manual fallback for older installs where `command -v hermes` is a Python console script:
+Noisegate registers two Hermes hooks:
+
+```text
+transform_terminal_output
+transform_tool_result
+```
+
+### npm installer wrapper
+
+The npm package `noisegate-hermes` is only a thin convenience installer. It is not the canonical implementation and has no `postinstall` script. It delegates to the Python package:
+
+```bash
+npx -p noisegate-hermes noisegate install-hermes
+```
+
+If your npm client does not resolve the single-bin shortcut, use:
+
+```bash
+npx -p noisegate-hermes noisegate-hermes-installer install-hermes
+```
+
+<details>
+<summary>Manual fallback for unusual Hermes launchers</summary>
+
+Prefer `noisegate install-hermes`. Use this only when you need to inspect or reproduce the low-level install flow manually.
 
 ```bash
 HERMES_PYTHON="$(head -1 "$(command -v hermes)" | sed 's/^#!//')"
@@ -120,28 +140,7 @@ PY
 "$HERMES_PYTHON" -m noisegate.cli doctor
 ```
 
-Noisegate registers two Hermes hooks:
-
-```text
-transform_terminal_output
-transform_tool_result
-```
-
-### npm installer wrapper
-
-The npm package `noisegate-hermes` is only a thin convenience installer. It is not the canonical implementation. It delegates to the Python package:
-
-```bash
-npx -p noisegate-hermes noisegate install-hermes
-```
-
-If your npm client does not resolve the single-bin shortcut, use:
-
-```bash
-npx -p noisegate-hermes noisegate-hermes-installer install-hermes
-```
-
-The npm package has no `postinstall` script and does not bundle the Python implementation.
+</details>
 
 ### Publishing and package security
 
