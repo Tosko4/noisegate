@@ -152,24 +152,6 @@ def test_check_contributors_file_reports_missing_names(tmp_path: Path) -> None:
     assert missing == ["Charlie"]
 
 
-def test_git_contributor_names_ignores_merge_commits(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    captured: dict[str, object] = {}
-
-    def fake_run(argv, **kwargs):
-        captured["argv"] = argv
-        captured["cwd"] = kwargs.get("cwd")
-        return subprocess.CompletedProcess(argv, 0, stdout="Tosko4\n", stderr="")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    assert git_contributor_names(tmp_path) == ["Tosko4"]
-    assert captured["argv"] == ["git", "log", "--no-merges", "--format=%aN"]
-    assert captured["cwd"] == tmp_path
-
-
 def test_sdist_includes_npm_release_metadata() -> None:
     root = Path(__file__).resolve().parents[1]
     pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
@@ -204,12 +186,21 @@ def test_git_contributor_names_ignores_merge_commits(monkeypatch: Any, tmp_path:
 
     def fake_run(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         seen_args.extend(args)
-        return subprocess.CompletedProcess(args, 0, stdout="Alice\nBob\nAlice\n")
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            stdout=(
+                "Alice\x00123+Alice@users.noreply.github.com\n"
+                "Display Name\x00Bob@users.noreply.github.com\n"
+                "Alice\x00123+Alice@users.noreply.github.com\n"
+            ),
+        )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert git_contributor_names(tmp_path) == ["Alice", "Bob"]
     assert "--no-merges" in seen_args
+    assert "--format=%aN%x00%aE" in seen_args
 
 
 def test_git_contributor_names_reports_git_failures(monkeypatch: Any, tmp_path: Path) -> None:

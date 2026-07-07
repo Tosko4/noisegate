@@ -20,6 +20,10 @@ CHANGELOG_HEADING_RE = re.compile(
     r"(?m)^## \[(?P<version>[^\]]+)\](?: - (?P<date>\d{4}-\d{2}-\d{2}))?\s*$"
 )
 CONTRIBUTOR_BULLET_RE = re.compile(r"(?m)^-\s+(?P<name>[^<\n]+?)(?:\s+<[^>]+>)?\s*$")
+GITHUB_NOREPLY_RE = re.compile(
+    r"^(?:\d+\+)?(?P<login>[^@]+)@users\.noreply\.github\.com$",
+    re.IGNORECASE,
+)
 
 VERSION_FILES = (
     "pyproject.toml",
@@ -168,7 +172,7 @@ def git_contributor_names(root: Path) -> list[str]:
         )
     try:
         proc = subprocess.run(
-            ["git", "log", "--no-merges", "--format=%aN"],
+            ["git", "log", "--no-merges", "--format=%aN%x00%aE"],
             cwd=root,
             text=True,
             capture_output=True,
@@ -179,7 +183,22 @@ def git_contributor_names(root: Path) -> list[str]:
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or exc.stdout or "").strip() or f"exit code {exc.returncode}"
         raise ReleaseError(f"git log failed while reading contributor names: {detail}") from exc
-    return sorted({line.strip() for line in proc.stdout.splitlines() if line.strip()})
+    return sorted(
+        {
+            _normalized_contributor_name(line)
+            for line in proc.stdout.splitlines()
+            if _normalized_contributor_name(line)
+        }
+    )
+
+
+def _normalized_contributor_name(git_log_line: str) -> str:
+    name, separator, email = git_log_line.strip().partition("\x00")
+    if separator:
+        match = GITHUB_NOREPLY_RE.match(email.strip())
+        if match:
+            return match.group("login")
+    return name.strip()
 
 
 def contributors_file_names(root: Path) -> set[str]:
