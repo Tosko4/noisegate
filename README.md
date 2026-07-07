@@ -263,6 +263,8 @@ Expected result:
 
 Noisegate is intentionally conservative.
 
+Compacted output is kept within the configured `max_chars` and `max_lines` caps. If a readable omission marker plus preserved content cannot fit, Noisegate leaves the original output unchanged instead of emitting marker fragments or dropping important failure text.
+
 For Hermes hook traffic, it compacts only this explicit allowlist:
 
 ```text
@@ -309,7 +311,7 @@ Environment flags:
 NOISEGATE_DISABLE=1      # turn compaction off
 NOISEGATE_ARTIFACTS=1    # opt in to private raw-output artifacts
 NOISEGATE_ARTIFACT_DIR=/path/to/artifacts
-NOISEGATE_ARTIFACT_SIZE_CAP=1000000
+NOISEGATE_ARTIFACT_SIZE_CAP=1000000  # max stored raw-output bytes per artifact
 ```
 
 `noisegate doctor` reports ignored or fallback environment values, so typos like `NOISEGATE_ARTIFACTS=maybe` do not fail silently.
@@ -342,7 +344,7 @@ noisegate artifacts stats --artifact-dir /tmp/noisegate-artifacts
 noisegate artifacts verify --artifact-dir /tmp/noisegate-artifacts
 ```
 
-`verify` recomputes hashes and returns a non-zero exit code if an artifact was tampered with or has an invalid private-store path.
+`verify` recomputes hashes and returns a non-zero exit code if an artifact was tampered with, has an invalid private-store path, or if a live temp artifact file is still present. Stale temp files created by interrupted writes are removed during verification/new writes without printing their raw contents.
 
 ## Hermes-LCM and memory layers
 

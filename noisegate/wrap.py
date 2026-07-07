@@ -4,7 +4,7 @@ import os
 import selectors
 import shlex
 import signal
-import subprocess
+import subprocess  # nosec B404
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -138,7 +138,8 @@ def _capture_command(
     *,
     max_capture_bytes: int,
 ) -> tuple[_CapturedStream, _CapturedStream, str, int]:
-    process = subprocess.Popen(
+    # argv is explicit user CLI input; shell remains disabled.
+    process = subprocess.Popen(  # nosec B603
         argv,
         stdin=None,
         stdout=subprocess.PIPE,

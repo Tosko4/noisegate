@@ -3,7 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import subprocess
+import shutil
+import subprocess  # nosec B404
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -170,19 +171,21 @@ def git_contributor_names(root: Path) -> list[str]:
         raise ReleaseError(
             f"repository root does not exist while reading contributor names: {root}"
         )
+    git = _git_executable()
+    # git is resolved to an executable path; shell remains disabled.
     try:
-        proc = subprocess.run(
-            ["git", "log", "--no-merges", "--format=%aN%x00%aE"],
+        proc = subprocess.run(  # nosec B603
+            [git, "log", "--no-merges", "--format=%aN%x00%aE"],
             cwd=root,
             text=True,
             capture_output=True,
             check=True,
         )
-    except FileNotFoundError as exc:
-        raise ReleaseError("git executable was not found while reading contributor names") from exc
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or exc.stdout or "").strip() or f"exit code {exc.returncode}"
         raise ReleaseError(f"git log failed while reading contributor names: {detail}") from exc
+    except OSError as exc:
+        raise ReleaseError(f"git log failed while reading contributor names: {exc}") from exc
     return sorted(
         {
             _normalized_contributor_name(line)
@@ -195,7 +198,10 @@ def git_contributor_names(root: Path) -> list[str]:
 def _normalized_contributor_name(git_log_line: str) -> str:
     name, separator, email = git_log_line.strip().partition("\x00")
     if separator:
-        match = GITHUB_NOREPLY_RE.match(email.strip())
+        email = email.strip()
+        if email.lower() == "codex@openai.com":
+            return ""
+        match = GITHUB_NOREPLY_RE.match(email)
         if match:
             return match.group("login")
     return name.strip()
@@ -313,6 +319,13 @@ def _replace_file(path: Path, pattern: re.Pattern[str], replacement: str, label:
     if count != 1:
         raise ReleaseError(f"Could not update {label}")
     path.write_text(new, encoding="utf-8")
+
+
+def _git_executable() -> str:
+    git = shutil.which("git")
+    if git is None:
+        raise ReleaseError("git executable was not found on PATH")
+    return str(Path(git).resolve())
 
 
 def repo_root_from_args(path: str | None) -> Path:

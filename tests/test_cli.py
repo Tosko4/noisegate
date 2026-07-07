@@ -236,7 +236,7 @@ def test_cat_cli_reads_artifact(tmp_path: Path) -> None:
                 "tool_name": "terminal",
                 "args": {"command": "pytest"},
                 "result": json.dumps({"stdout": numbered("line", 100), "exit": 0}),
-                "noisegate": {"max_chars": 120},
+                "noisegate": {"max_chars": 240},
             }
         ),
         env=env,
@@ -260,7 +260,7 @@ def test_reduce_cli_store_artifact_prints_recovery_notice(tmp_path: Path) -> Non
         "--command",
         "pytest",
         "--max-chars",
-        "120",
+        "220",
         "--store-artifact",
         "--artifact-dir",
         str(artifact_dir),
@@ -270,7 +270,7 @@ def test_reduce_cli_store_artifact_prints_recovery_notice(tmp_path: Path) -> Non
     assert proc.returncode == 0, proc.stderr
     assert "[noisegate artifact: id=ng_" in proc.stdout
     assert "sha256=" in proc.stdout
-    assert len(proc.stdout) <= 120
+    assert len(proc.stdout) <= 220
 
 
 def test_reduce_cli_does_not_store_artifact_when_recovery_notice_cannot_fit(tmp_path: Path) -> None:
@@ -290,6 +290,21 @@ def test_reduce_cli_does_not_store_artifact_when_recovery_notice_cannot_fit(tmp_
     assert proc.returncode == 0, proc.stderr
     assert "id=ng_" not in proc.stdout
     assert not artifact_dir.exists() or list(artifact_dir.iterdir()) == []
+
+
+def test_artifacts_verify_reports_temp_files_without_raw_content(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir(mode=0o700)
+    temp_path = artifact_dir / f".ng_{'a' * 24}.leftover.tmp"
+    temp_path.write_text("raw terminal output", encoding="utf-8")
+    os.chmod(temp_path, 0o600)
+
+    proc = run_cli("artifacts", "verify", "--artifact-dir", str(artifact_dir))
+
+    assert proc.returncode == 2
+    assert "temp_file" in proc.stdout
+    assert "raw terminal output" not in proc.stdout
+    assert "raw terminal output" not in proc.stderr
 
 
 def test_wrap_cli_compacts_output_and_preserves_exit_code() -> None:
@@ -427,7 +442,7 @@ def test_wrap_cli_store_artifact_prints_recovery_notice(tmp_path: Path) -> None:
         "--command",
         "pytest",
         "--max-chars",
-        "160",
+        "240",
         "--store-artifact",
         "--artifact-dir",
         str(artifact_dir),
@@ -594,12 +609,25 @@ def test_wrap_cli_kills_sigterm_ignoring_descendant_on_interrupt(tmp_path: Path)
 def _assert_process_exited(pid: int) -> None:
     deadline = time.monotonic() + 1
     while time.monotonic() < deadline:
+        if _process_is_zombie(pid):
+            return
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
             return
         time.sleep(0.02)
     raise AssertionError(f"process still alive: {pid}")
+
+
+def _process_is_zombie(pid: int) -> bool:
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        return stat_text.rsplit(")", 1)[1].lstrip().startswith("Z ")
+    except IndexError:
+        return False
 
 
 def sh_quote(value: str) -> str:
@@ -613,7 +641,7 @@ def test_cat_cli_accepts_custom_artifact_dir(tmp_path: Path) -> None:
         "--command",
         "pytest",
         "--max-chars",
-        "120",
+        "220",
         "--store-artifact",
         "--artifact-dir",
         str(artifact_dir),
@@ -632,7 +660,7 @@ def test_cat_cli_accepts_custom_artifact_dir(tmp_path: Path) -> None:
 
 def test_cat_cli_rejects_non_regular_artifact_nodes_without_hanging(tmp_path: Path) -> None:
     artifact_dir = tmp_path / "artifacts"
-    artifact_dir.mkdir()
+    artifact_dir.mkdir(mode=0o700)
     (artifact_dir / "ng_000000000000000000000000.txt").mkdir()
 
     cat_proc = run_cli("cat", "--artifact-dir", str(artifact_dir), "ng_000000000000000000000000")
@@ -648,7 +676,7 @@ def test_artifacts_cli_lists_and_summarizes_private_store(tmp_path: Path) -> Non
         "--command",
         "pytest",
         "--max-chars",
-        "160",
+        "240",
         "--store-artifact",
         "--artifact-dir",
         str(artifact_dir),
@@ -677,7 +705,7 @@ def test_artifacts_cli_verify_detects_tampering(tmp_path: Path) -> None:
         "--command",
         "pytest",
         "--max-chars",
-        "160",
+        "240",
         "--store-artifact",
         "--artifact-dir",
         str(artifact_dir),
@@ -698,7 +726,7 @@ def test_artifacts_cli_verify_detects_tampering(tmp_path: Path) -> None:
 
 def test_artifacts_cli_verify_rejects_non_regular_nodes_without_hanging(tmp_path: Path) -> None:
     artifact_dir = tmp_path / "artifacts"
-    artifact_dir.mkdir()
+    artifact_dir.mkdir(mode=0o700)
     (artifact_dir / "ng_000000000000000000000000.txt").mkdir()
 
     verify_proc = run_cli("artifacts", "verify", "--artifact-dir", str(artifact_dir))
@@ -709,7 +737,7 @@ def test_artifacts_cli_verify_rejects_non_regular_nodes_without_hanging(tmp_path
 
 def test_artifacts_cli_verify_rejects_oversized_nodes_without_reading(tmp_path: Path) -> None:
     artifact_dir = tmp_path / "artifacts"
-    artifact_dir.mkdir()
+    artifact_dir.mkdir(mode=0o700)
     (artifact_dir / "ng_000000000000000000000000.txt").write_text("x" * 1_000_001)
 
     verify_proc = run_cli("artifacts", "verify", "--artifact-dir", str(artifact_dir))

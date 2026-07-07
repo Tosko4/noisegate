@@ -5,12 +5,17 @@ import hashlib
 import os
 import re
 import stat
+import tempfile
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 DEFAULT_SIZE_CAP = 1_000_000
 ARTIFACT_ID_RE = re.compile(r"ng_[a-f0-9]{24,64}")
+TEMP_ARTIFACT_RE = re.compile(r"\.ng_[a-f0-9]{24,64}\.[^.]+\.tmp")
+TEMP_ARTIFACT_STALE_SECONDS = 60 * 60
+
 
 
 class ArtifactError(RuntimeError):
@@ -86,31 +91,53 @@ class ArtifactStore:
             raise ArtifactTooLarge(len(data), self.size_cap)
 
         root = self._ensure_root()
+        self._cleanup_stale_temp_files(root)
         digest = hashlib.sha256(data).hexdigest()
         artifact_id = f"ng_{digest[:24]}"
         path = self._path_for(artifact_id, root=root)
 
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-
         try:
-            fd = os.open(path, flags, 0o600)
+            stat_result = path.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise ArtifactSecurityError(type(exc).__name__) from exc
+        else:
+            if not stat.S_ISREG(stat_result.st_mode):
+                raise ArtifactSecurityError("artifact path must be a regular file")
+            existing = self._read_bytes(artifact_id, root=root)
+            if hashlib.sha256(existing).hexdigest() != digest:
+                raise ArtifactSecurityError(
+                    "artifact id collision with different content"
+                ) from None
+            return StoredArtifact(artifact_id, digest, len(data))
+
+        temp_path: Path | None = None
+        try:
+            fd, raw_temp_path = tempfile.mkstemp(
+                prefix=f".{artifact_id}.",
+                suffix=".tmp",
+                dir=root,
+            )
+            temp_path = Path(raw_temp_path)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            os.chmod(temp_path, 0o600)
+            os.link(temp_path, path)
         except FileExistsError:
             existing = self.read(artifact_id)
             if hashlib.sha256(existing.encode("utf-8")).hexdigest() != digest:
                 raise ArtifactSecurityError(
                     "artifact id collision with different content"
                 ) from None
-            return StoredArtifact(artifact_id, digest, len(data))
         except OSError as exc:
             if exc.errno == errno.ELOOP:
                 raise ArtifactSecurityError("artifact path resolves through a symlink") from exc
             raise
-
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-        os.chmod(path, 0o600)
+        finally:
+            if temp_path is not None:
+                with suppress(FileNotFoundError):
+                    temp_path.unlink()
         return StoredArtifact(artifact_id, digest, len(data))
 
     def read(self, artifact_id: str) -> str:
@@ -153,6 +180,8 @@ class ArtifactStore:
         checks: list[ArtifactCheck] = []
         for path in sorted(root.iterdir()):
             if path.name.startswith("."):
+                if TEMP_ARTIFACT_RE.fullmatch(path.name):
+                    checks.append(self._check_temp_artifact(path))
                 continue
             if path.suffix != ".txt" or not path.name.startswith("ng_"):
                 continue
@@ -243,13 +272,56 @@ class ArtifactStore:
             )
         return checks
 
+    def _check_temp_artifact(self, path: Path) -> ArtifactCheck:
+        try:
+            stat_result = path.lstat()
+        except OSError as exc:
+            return ArtifactCheck(path.name, False, type(exc).__name__, str(path))
+        if path.is_symlink():
+            return ArtifactCheck(path.name, False, "temp_symlink", str(path))
+        if not stat.S_ISREG(stat_result.st_mode):
+            return ArtifactCheck(path.name, False, "temp_non_regular", str(path))
+        if stat_result.st_size > self.size_cap:
+            return ArtifactCheck(path.name, False, "temp_too_large", str(path))
+        if self._is_stale_temp(stat_result):
+            with suppress(FileNotFoundError):
+                path.unlink()
+            return ArtifactCheck(path.name, True, "stale_temp_removed", str(path))
+        return ArtifactCheck(path.name, False, "temp_file", str(path))
+
+    def _cleanup_stale_temp_files(self, root: Path) -> None:
+        for path in root.iterdir():
+            if not TEMP_ARTIFACT_RE.fullmatch(path.name):
+                continue
+            try:
+                stat_result = path.lstat()
+            except OSError:
+                continue
+            if path.is_symlink() or not stat.S_ISREG(stat_result.st_mode):
+                continue
+            if self._is_stale_temp(stat_result):
+                with suppress(FileNotFoundError):
+                    path.unlink()
+
+    def _is_stale_temp(self, stat_result: os.stat_result) -> bool:
+        now = datetime.now(UTC).timestamp()
+        return now - stat_result.st_mtime >= TEMP_ARTIFACT_STALE_SECONDS
+
+
     def _ensure_root(self) -> Path:
         if self.root.is_symlink():
             raise ArtifactSecurityError("artifact root must not be a symlink")
-        if self.root.exists() and not self.root.is_dir():
+        existed = self.root.exists()
+        if existed and not self.root.is_dir():
             raise ArtifactSecurityError("artifact root must be a directory")
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(self.root, 0o700)
+        if existed:
+            mode = stat.S_IMODE(self.root.stat().st_mode)
+            if mode & 0o077:
+                raise ArtifactSecurityError("artifact root permissions must be owner-only")
+        else:
+            # Private raw-output artifact directory: owner-only access is intentional.
+            os.chmod(self.root, 0o700)  # nosemgrep
         return self.root.resolve(strict=True)
 
     def _path_for(self, artifact_id: str, *, root: Path | None = None) -> Path:

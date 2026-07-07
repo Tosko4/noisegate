@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from noisegate.engine import NoisegateOptions, reduce_text
+import re
+
+import pytest
+
+import noisegate.engine as engine
+from noisegate.engine import NoisegateOptions, _first_pattern_match, reduce_text
 
 
 def numbered(prefix: str, count: int) -> str:
@@ -61,13 +66,74 @@ def test_named_noisy_tools_can_still_reduce() -> None:
         assert result.changed is True
 
 
-def test_char_budget_below_marker_floor_is_honored() -> None:
+def test_tiny_char_budget_fails_open_instead_of_emitting_garbage() -> None:
     raw = "A" * 130
 
-    result = reduce_text(raw, options=options(max_chars=10))
+    for max_chars in (0, 1, 2, 10, 30):
+        result = reduce_text(raw, options=options(max_chars=max_chars))
+
+        assert result.changed is False
+        assert result.text == raw
+        assert result.metadata["reason"] == "invalid_budget"
+
+
+def test_char_budget_reduces_only_when_notice_and_content_fit() -> None:
+    raw = "A" * 130
+
+    result = reduce_text(raw, options=options(max_chars=40))
 
     assert result.changed is True
-    assert len(result.text) <= 10
+    assert len(result.text) <= 40
+    assert result.text.startswith("A")
+    assert result.text.endswith("A")
+    assert "[noisegate: omitted" in result.text
+
+
+def test_char_budget_accepts_tight_budget_that_can_fit_notice_and_content() -> None:
+    raw = "A" * 100
+
+    result = reduce_text(raw, options=options(max_chars=33))
+
+    assert result.changed is True
+    assert result.text == "A\n[noisegate: omitted 98 chars]\nA"
+    assert len(result.text) == 33
+
+
+def test_line_reducer_can_shrink_marker_before_tight_char_budget() -> None:
+    raw = "\n".join(f"l{index:02d}" for index in range(100))
+
+    result = reduce_text(
+        raw,
+        options=options(max_chars=34, max_lines=10, head_lines=1, tail_lines=1),
+    )
+
+    assert result.changed is True
+    assert result.text == "l\n[noisegate: omitted 34 chars]\n99"
+    assert len(result.text) == 34
+
+
+def test_tiny_line_budget_fails_open_instead_of_dropping_marker() -> None:
+    cases = (
+        numbered("line", 10),
+        "A" * 130,
+        ("A" * 80) + "\n" + ("B" * 80),
+    )
+
+    for raw in cases:
+        for max_lines in (1, 2):
+            result = reduce_text(
+                raw,
+                options=options(
+                    max_chars=40,
+                    max_lines=max_lines,
+                    head_lines=1,
+                    tail_lines=1,
+                ),
+            )
+
+            assert result.changed is False
+            assert result.text == raw
+            assert result.metadata["reason"] == "invalid_budget"
 
 
 def test_recovery_notices_do_not_exceed_budget_or_grow_output() -> None:
@@ -122,6 +188,38 @@ def test_important_line_char_cap_keeps_middle_failure() -> None:
     assert len(result.text) <= 500
     assert "test_middle.py::test_breaks" in result.text
     assert "AssertionError: boom" in result.text
+
+
+def test_first_pattern_match_short_circuits_after_first_matching_pattern() -> None:
+    match = _first_pattern_match("FIRST then SECOND", (re.compile("FIRST"), re.compile("SECOND")))
+
+    assert match is not None
+    assert match.group(0) == "FIRST"
+
+
+def test_important_line_reducer_handles_high_volume_repeated_failures() -> None:
+    raw = "\n".join(
+        f"FAILED tests/test_load_{index}.py::test_case - AssertionError: {'x' * 80}"
+        for index in range(20_000)
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        options=options(
+            max_chars=1_200,
+            max_lines=80,
+            head_lines=8,
+            tail_lines=8,
+            max_important_lines=20_000,
+        ),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 1_200
+    assert result.metadata["reducer"] == "pytest"
+    assert "FAILED tests/test_load_" in result.text
+    assert "[noisegate: omitted" in result.text
 
 
 def test_terminal_file_read_commands_are_protected_by_default() -> None:
@@ -333,6 +431,17 @@ def test_disable_env_leaves_text_unchanged(monkeypatch) -> None:
     assert result.metadata["reducer"] == "disabled"
 
 
+def test_bypass_env_leaves_text_unchanged(monkeypatch) -> None:
+    monkeypatch.setenv("NOISEGATE_BYPASS", "1")
+    raw = numbered("line", 50)
+
+    result = reduce_text(raw, command="pytest", options=NoisegateOptions.from_env())
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reducer"] == "disabled"
+
+
 def test_env_flag_parser_rejects_falsey_disable(monkeypatch) -> None:
     monkeypatch.setenv("NOISEGATE_DISABLE", "0")
     raw = numbered("line", 50)
@@ -340,6 +449,29 @@ def test_env_flag_parser_rejects_falsey_disable(monkeypatch) -> None:
     result = reduce_text(raw, command="pytest", options=NoisegateOptions.from_env(max_chars=160))
 
     assert result.changed is True
+
+
+def test_artifact_size_cap_env_rejects_negative_and_invalid_values(monkeypatch) -> None:
+    monkeypatch.setenv("NOISEGATE_ARTIFACT_SIZE_CAP", "-1")
+    assert NoisegateOptions.from_env().artifact_size_cap == 1_000_000
+
+    monkeypatch.setenv("NOISEGATE_ARTIFACT_SIZE_CAP", "not-an-int")
+    assert NoisegateOptions.from_env().artifact_size_cap == 1_000_000
+
+    monkeypatch.setenv("NOISEGATE_ARTIFACT_SIZE_CAP", "123")
+    assert NoisegateOptions.from_env().artifact_size_cap == 123
+
+
+def test_env_diagnostics_warns_on_invalid_raw_and_bypass_values() -> None:
+    diagnostics = engine.env_diagnostics(
+        {
+            "NOISEGATE_RAW": "maybe",
+            "NOISEGATE_BYPASS": "not-sure",
+        }
+    )
+
+    assert any("NOISEGATE_RAW='maybe' is not recognized" in item for item in diagnostics)
+    assert any("NOISEGATE_BYPASS='not-sure' is not recognized" in item for item in diagnostics)
 
 
 def test_reducers_enforce_max_chars_after_line_selection() -> None:
@@ -374,3 +506,516 @@ def test_reducers_enforce_max_lines_when_output_is_short_but_tall() -> None:
     assert result.metadata["reducer"] == "generic_head_tail"
     assert result.text.count("\n") + 1 <= 10
     assert "[noisegate: omitted" in result.text
+
+
+def test_line_reducer_fails_open_when_marker_digits_make_result_over_char_budget() -> None:
+    raw = "\n".join(f"l{index:02d}" for index in range(20))
+
+    result = reduce_text(
+        raw,
+        options=options(max_chars=32, max_lines=10, head_lines=2, tail_lines=2),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+
+
+def test_important_pattern_tight_budget_fails_open_when_match_line_cannot_fit() -> None:
+    raw = "\n".join(
+        [
+            "setup noise " + ("x" * 80),
+            "more setup noise " + ("y" * 80),
+            "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+            "post noise " + ("z" * 80),
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        options=options(max_chars=40, max_lines=10, head_lines=1, tail_lines=1),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reason"] == "no_gain"
+
+
+def test_important_pattern_focus_does_not_split_full_match() -> None:
+    raw = "\n".join(
+        [
+            "setup noise " + ("x" * 200),
+            "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+            "post noise " + ("z" * 200),
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        options=options(max_chars=130, max_lines=10, head_lines=1, tail_lines=1),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 130
+    assert "FAILED" in result.text
+    assert "FAILE\n" not in result.text
+
+
+def test_centered_failure_excerpt_keeps_omission_markers_when_they_fit() -> None:
+    raw = "\n".join(
+        [
+            "setup noise " + ("x" * 80),
+            "FAILED short_case",
+            "post noise " + ("z" * 80),
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        options=options(max_chars=100, max_lines=10, head_lines=1, tail_lines=1),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 100
+    assert "FAILED short_case" in result.text
+    assert "[noisegate: omitted" in result.text
+
+
+def test_recovery_notices_fail_open_when_important_line_cannot_fit() -> None:
+    raw = "\n".join(
+        [
+            "setup noise " + ("x" * 80),
+            "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+            "post noise " + ("z" * 80),
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=options(max_chars=40, max_lines=10, head_lines=1, tail_lines=1),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reason"] == "no_gain"
+
+
+def test_artifact_enabled_failure_line_that_cannot_fit_fails_open() -> None:
+    raw = "\n".join(
+        [
+            "setup " + ("x" * 80),
+            "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+            "post " + ("z" * 80),
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=options(
+            max_chars=62,
+            max_lines=10,
+            head_lines=1,
+            tail_lines=1,
+            artifact_enabled=True,
+        ),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reason"] == "no_gain"
+
+
+def test_important_line_reducer_tight_line_cap_preserves_middle_failure() -> None:
+    raw = "\n".join(
+        [
+            "setup 1",
+            "setup 2",
+            "setup 3",
+            "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+            "E       AssertionError: boom",
+            "teardown 1",
+            "teardown 2",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        options=options(
+            max_chars=10_000,
+            max_lines=4,
+            head_lines=2,
+            tail_lines=2,
+            important_context_lines=2,
+        ),
+    )
+
+    assert result.changed is True
+    assert len(result.text.splitlines()) <= 4
+    assert "FAILED" in result.text or "AssertionError" in result.text
+
+
+def test_final_budget_enforcement_preserves_middle_failure_under_line_cap() -> None:
+    lines = [f"setup {index}" for index in range(20)]
+    lines += [
+        "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+        "E       AssertionError: boom",
+    ]
+    lines += [f"teardown {index}" for index in range(20)]
+    raw = "\n".join(lines)
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        options=options(
+            max_chars=10_000,
+            max_lines=5,
+            head_lines=3,
+            tail_lines=3,
+            important_context_lines=2,
+        ),
+    )
+
+    assert result.changed is True
+    assert len(result.text.splitlines()) <= 5
+    assert "FAILED" in result.text or "AssertionError" in result.text
+
+
+def test_recovery_notices_do_not_emit_partial_important_markers() -> None:
+    lines = [f"setup {index} " + ("x" * 10) for index in range(20)]
+    lines += [
+        "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+        "E       AssertionError: boom",
+    ]
+    lines += [f"teardown {index} " + ("z" * 10) for index in range(20)]
+    raw = "\n".join(lines)
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=options(
+            max_chars=180,
+            max_lines=20,
+            head_lines=3,
+            tail_lines=3,
+            important_context_lines=2,
+        ),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 180
+    assert len(result.text.splitlines()) <= 20
+    assert "FAILED" in result.text or "AssertionError" in result.text
+    assert "\nomitted after important output]" not in result.text
+
+
+def test_tight_recovery_notice_is_dropped_instead_of_failure_line() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index} " + ("x" * 20) for index in range(20)],
+            "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+            *[f"teardown {index} " + ("z" * 20) for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=options(
+            max_chars=80,
+            max_lines=3,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=1,
+        ),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reason"] == "no_gain"
+
+
+def test_tight_important_excerpt_does_not_slice_omission_marker() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index} " + ("x" * 20) for index in range(20)],
+            "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+            *[f"teardown {index} " + ("z" * 20) for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=options(
+            max_chars=35,
+            max_lines=3,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=1,
+        ),
+    )
+
+    assert result.changed is False or len(result.text) <= 35
+    assert "ted 20 lines]" not in result.text
+    assert "itted 20 lines]" not in result.text
+    assert "mitted 20 lines]" not in result.text
+    assert "tted 20 lines]" not in result.text
+    if result.changed:
+        assert "FAILED" in result.text
+
+
+def test_tight_important_excerpt_does_not_slice_marker_suffix_lines() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index} " + ("x" * 20) for index in range(20)],
+            "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+            *[f"teardown {index} " + ("z" * 20) for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=options(
+            max_chars=80,
+            max_lines=4,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=1,
+        ),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reason"] == "no_gain"
+
+
+def test_tight_important_excerpt_does_not_slice_numeric_marker_suffixes() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index} " + ("x" * 20) for index in range(30)],
+            "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+            *[f"teardown {index} " + ("z" * 20) for index in range(30)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=options(
+            max_chars=84,
+            max_lines=5,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=1,
+        ),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reason"] == "no_gain"
+
+
+def test_node_reducer_tight_budget_fails_open_when_node_error_line_cannot_fit() -> None:
+    raw = "\n".join(
+        [
+            "setup " + ("x" * 100),
+            "npm ERR! lifecycle script crashed " + ("z" * 100),
+            "tail " + ("q" * 100),
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="npm test",
+        exit_code=1,
+        options=options(max_chars=80, max_lines=10, head_lines=1, tail_lines=1),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reason"] == "no_gain"
+
+
+def test_direct_node_command_preserves_error_line() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(20)],
+            "Error: direct node failure",
+            "    at test.js:12:3",
+            *[f"tail {index}" for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="node test.js",
+        exit_code=1,
+        options=options(max_chars=120, max_lines=6, head_lines=1, tail_lines=1),
+    )
+
+    assert result.metadata["command_class"] == "node"
+    if result.changed:
+        assert "Error: direct node failure" in result.text
+        assert "[noisegate: omitted" in result.text
+
+
+def test_vitest_command_preserves_error_line() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(20)],
+            "Error: vitest failure",
+            "    at src/example.test.ts:4:1",
+            *[f"tail {index}" for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="npx vitest run",
+        exit_code=1,
+        options=options(max_chars=120, max_lines=6, head_lines=1, tail_lines=1),
+    )
+
+    assert result.metadata["command_class"] == "node"
+    if result.changed:
+        assert "Error: vitest failure" in result.text
+        assert "[noisegate: omitted" in result.text
+
+
+def test_nonrecoverable_artifact_notice_only_does_not_replace_generic_output() -> None:
+    raw = "\n".join(f"line {index:03d} " + ("x" * 40) for index in range(30))
+
+    result = reduce_text(
+        raw,
+        command="some command",
+        options=options(
+            max_chars=80,
+            max_lines=10,
+            head_lines=1,
+            tail_lines=1,
+            artifact_enabled=True,
+        ),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 80
+    assert "line" in result.text
+    assert result.text != "[noisegate artifact: not stored; reason=recovery_notice_too_long]"
+    assert result.metadata["artifact"] == {
+        "stored": False,
+        "reason": "recovery_notice_too_long",
+        "size_bytes": len(raw.encode()),
+    }
+
+
+def test_nonrecoverable_artifact_notice_does_not_fragment_preserved_failure() -> None:
+    raw = "\n".join(
+        [
+            "setup " + ("x" * 80),
+            "FAILED tests/test_x.py::test_y - AssertionError: boom",
+            "tail " + ("z" * 80),
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=options(
+            max_chars=110,
+            max_lines=10,
+            head_lines=1,
+            tail_lines=1,
+            artifact_enabled=True,
+        ),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reason"] == "no_gain"
+
+
+def test_artifact_notice_only_does_not_replace_preserved_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store_calls: list[str] = []
+
+    def fake_store(text: str, options: NoisegateOptions) -> dict[str, object]:
+        store_calls.append(text)
+        return {
+            "stored": True,
+            "id": "ng_" + ("a" * 24),
+            "sha256": "b" * 64,
+            "size_bytes": len(text.encode()),
+        }
+
+    monkeypatch.setattr(engine, "_store_artifact", fake_store)
+    raw = "\n".join(
+        [
+            "setup noise " + ("x" * 80),
+            "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+            "post noise " + ("z" * 80),
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        options=options(
+            max_chars=110,
+            max_lines=10,
+            head_lines=1,
+            tail_lines=1,
+            artifact_enabled=True,
+        ),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reason"] == "no_gain"
+    assert store_calls == []
+
+
+def test_changed_outputs_always_fit_configured_budgets() -> None:
+    cases = [
+        numbered("line", 30),
+        "\n".join("A" * 80 for _ in range(8)),
+        "\n".join(
+            [
+                "setup " + ("x" * 80),
+                "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+                "post " + ("z" * 80),
+            ]
+        ),
+    ]
+
+    for raw in cases:
+        for max_chars in (32, 40, 80, 120):
+            for max_lines in (3, 5, 10):
+                result = reduce_text(
+                    raw,
+                    command="pytest -q",
+                    exit_code=1,
+                    options=options(
+                        max_chars=max_chars,
+                        max_lines=max_lines,
+                        head_lines=1,
+                        tail_lines=1,
+                    ),
+                )
+                if result.changed:
+                    assert len(result.text) <= max_chars
+                    assert len(result.text.splitlines()) <= max_lines

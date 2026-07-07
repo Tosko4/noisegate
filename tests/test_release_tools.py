@@ -172,6 +172,100 @@ def test_standalone_publish_workflows_checkout_requested_tag() -> None:
         assert expected_ref in text
 
 
+def test_git_contributor_names_requires_resolved_git(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("scripts.release_tools.shutil.which", lambda _name: None)
+
+    try:
+        git_contributor_names(tmp_path)
+    except ReleaseError as exc:
+        assert "git executable was not found" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected missing git executable to fail")
+
+
+def test_git_contributor_names_requires_absolute_resolved_git(
+    monkeypatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[list[str], Path]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs["cwd"]))
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout="Tosko4\x001234+Tosko4@users.noreply.github.com\n",
+            stderr="",
+        )
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "repo").mkdir()
+    monkeypatch.setattr("scripts.release_tools.shutil.which", lambda _name: "tools/git")
+    monkeypatch.setattr("scripts.release_tools.subprocess.run", fake_run)
+
+    assert git_contributor_names(tmp_path / "repo") == ["Tosko4"]
+    expected_git = str((tmp_path / "tools" / "git").resolve())
+    assert calls == [
+        (
+            [expected_git, "log", "--no-merges", "--format=%aN%x00%aE"],
+            tmp_path / "repo",
+        )
+    ]
+
+
+def test_git_contributor_names_ignores_synthetic_merge_commits(monkeypatch, tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout="Tosko4\x001234+Tosko4@users.noreply.github.com\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("scripts.release_tools.shutil.which", lambda _name: "/usr/bin/git")
+    monkeypatch.setattr("scripts.release_tools.subprocess.run", fake_run)
+
+    assert git_contributor_names(tmp_path) == ["Tosko4"]
+    assert calls == [["/usr/bin/git", "log", "--no-merges", "--format=%aN%x00%aE"]]
+
+
+def test_git_contributor_names_ignores_codex_automation_author(
+    monkeypatch, tmp_path: Path
+) -> None:
+    def fake_run(argv, **_kwargs):
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=(
+                "Tosko4\x001294707+Tosko4@users.noreply.github.com\n"
+                "Codex\x00codex@openai.com\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("scripts.release_tools.shutil.which", lambda _name: "/usr/bin/git")
+    monkeypatch.setattr("scripts.release_tools.subprocess.run", fake_run)
+
+    assert git_contributor_names(tmp_path) == ["Tosko4"]
+
+
+def test_git_contributor_names_wraps_git_log_failure(monkeypatch, tmp_path: Path) -> None:
+    def fake_run(argv, **_kwargs):
+        raise subprocess.CalledProcessError(128, argv, stderr="not a git repository")
+
+    monkeypatch.setattr("scripts.release_tools.shutil.which", lambda _name: "/usr/bin/git")
+    monkeypatch.setattr("scripts.release_tools.subprocess.run", fake_run)
+
+    try:
+        git_contributor_names(tmp_path)
+    except ReleaseError as exc:
+        assert "git log failed while reading contributor names: not a git repository" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected git log failure to be wrapped")
+
+
 def test_release_scripts_are_executable_from_repo_root() -> None:
     root = Path(__file__).resolve().parents[1]
     subprocess.run(

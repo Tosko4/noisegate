@@ -13,8 +13,15 @@ All notable changes to Noisegate are documented here. Release notes are generate
 - npm trusted-publishing/provenance workflow foundation for the installer wrapper.
 
 ### Changed
-- Contributor checks now ignore merge commits and wrap `git log` failures with a clearer troubleshooting message.
+- Contributor checks now ignore merge commits, normalize GitHub noreply author emails, resolve the `git` executable before release contributor checks, and wrap `git log` failures with clearer troubleshooting messages.
 - README now presents PyPI as the canonical distribution path and documents the npm wrapper as installer-only.
+
+### Security
+- Pin GitHub Actions dependencies to reviewed commit SHAs to reduce mutable-tag supply-chain risk.
+
+### Fixed
+- Fail open for unusably tiny compaction budgets instead of emitting marker-only output that can obscure the original command result.
+- Handle concurrent same-content artifact writes without false collision errors.
 
 ## [0.1.0] - 2026-07-06
 
