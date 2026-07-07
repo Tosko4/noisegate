@@ -4,6 +4,8 @@ All notable changes to Noisegate are documented here. Release notes are generate
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-07
+
 ### Added
 - `noisegate doctor` now reports invalid Noisegate environment values instead of silently falling back.
 - CI now validates GitHub Actions workflow syntax and uses explicit job timeouts.
