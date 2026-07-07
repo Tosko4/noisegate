@@ -4,6 +4,9 @@ All notable changes to Noisegate are documented here. Release notes are generate
 
 ## [Unreleased]
 
+### Changed
+- Release notes generation now includes merged PRs by category, PR authors, release ranges, and first-time contributors since the previous release.
+
 ## [0.1.1] - 2026-07-07
 
 ### Added

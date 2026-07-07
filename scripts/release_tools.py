@@ -46,6 +46,29 @@ class ReleaseState:
     files: dict[str, str]
 
 
+@dataclass(frozen=True)
+class ReleasePullRequest:
+    number: int
+    title: str
+    author: str
+    merged_at: str
+    merge_commit: str
+    url: str
+    body: str
+
+    @property
+    def author_mention(self) -> str:
+        return self.author if self.author.startswith("@") else f"@{self.author}"
+
+
+@dataclass(frozen=True)
+class ReleasePullRequestSummary:
+    previous_tag: str | None
+    tag: str
+    included: list[ReleasePullRequest]
+    new_contributors: list[ReleasePullRequest]
+
+
 def normalize_version(value: str) -> str:
     value = value.strip()
     if value.startswith("v"):
@@ -234,10 +257,240 @@ def check_contributors_file(root: Path, contributor_names: set[str] | None = Non
     return missing
 
 
-def write_release_notes(root: Path, version: str, output: Path) -> None:
-    notes = changelog_notes_for_version(root, version)
+def write_release_notes(
+    root: Path,
+    version: str,
+    output: Path,
+    *,
+    repo: str | None = None,
+) -> None:
+    notes = release_notes_for_version(root, version, repo=repo)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(notes + "\n", encoding="utf-8")
+
+
+def release_notes_for_version(root: Path, version: str, *, repo: str | None = None) -> str:
+    notes = changelog_notes_for_version(root, version).strip()
+    try:
+        summary = release_pull_request_summary(root, version, repo=repo)
+    except ReleaseError as exc:
+        raise ReleaseError(
+            "Could not build PR-aware release notes; ensure gh is authenticated and "
+            f"release tags are available: {exc}"
+        ) from exc
+    if not summary.included:
+        raise ReleaseError(
+            f"No merged pull requests found for {summary.tag}; release notes must list "
+            "the PRs included since the previous release"
+        )
+    return "\n\n".join(
+        part for part in (notes, _format_release_pr_section(summary)) if part.strip()
+    )
+
+
+def release_pull_request_summary(
+    root: Path,
+    version: str,
+    *,
+    repo: str | None = None,
+) -> ReleasePullRequestSummary:
+    root = Path(root)
+    tag = f"v{normalize_version(version)}"
+    previous_tag = _previous_release_tag(root, tag)
+    rev_range = f"{previous_tag}..{tag}" if previous_tag else tag
+    commits = set(_git_output(root, ["rev-list", rev_range]).splitlines())
+    if not commits:
+        raise ReleaseError(f"No commits found for release range {rev_range}")
+
+    merged_prs = _merged_pull_requests(root, repo=repo)
+    included = [pr for pr in merged_prs if pr.merge_commit in commits]
+    included.sort(key=lambda pr: pr.merged_at)
+
+    first_pr_by_author: dict[str, ReleasePullRequest] = {}
+    for pr in sorted(merged_prs, key=lambda item: item.merged_at):
+        first_pr_by_author.setdefault(pr.author.lower(), pr)
+    new_contributors = [
+        pr
+        for pr in included
+        if first_pr_by_author.get(pr.author.lower()) == pr
+        and not pr.author.endswith("[bot]")
+    ]
+
+    return ReleasePullRequestSummary(
+        previous_tag=previous_tag,
+        tag=tag,
+        included=included,
+        new_contributors=new_contributors,
+    )
+
+
+def _format_release_pr_section(summary: ReleasePullRequestSummary) -> str:
+    lines = ["## Included pull requests"]
+    range_label = (
+        f"{summary.previous_tag}...{summary.tag}" if summary.previous_tag else summary.tag
+    )
+    lines.append(f"Release range: `{range_label}`.")
+    grouped: dict[str, list[ReleasePullRequest]] = {}
+    for pr in summary.included:
+        grouped.setdefault(_release_pr_category(pr), []).append(pr)
+
+    category_order = (
+        "Security / Safety",
+        "Release / Packaging",
+        "Added",
+        "Changed",
+        "Fixed",
+        "Documentation",
+        "Internal / CI",
+    )
+    for category in category_order:
+        prs = grouped.pop(category, [])
+        if not prs:
+            continue
+        lines.extend(("", f"### {category}"))
+        for pr in prs:
+            lines.append(f"- #{pr.number} — {pr.title} ({pr.author_mention}) {pr.url}")
+    for category, prs in sorted(grouped.items()):
+        lines.extend(("", f"### {category}"))
+        for pr in prs:
+            lines.append(f"- #{pr.number} — {pr.title} ({pr.author_mention}) {pr.url}")
+
+    lines.extend(("", "## New contributors"))
+    if summary.new_contributors:
+        for pr in summary.new_contributors:
+            lines.append(
+                f"- {pr.author_mention} made their first merged Noisegate PR in "
+                f"#{pr.number} — {pr.title}."
+            )
+    else:
+        lines.append("- No new contributors in this release range.")
+    return "\n".join(lines)
+
+
+def _release_pr_category(pr: ReleasePullRequest) -> str:
+    title = pr.title.lower()
+    body = pr.body.lower()
+    release_words = (
+        "release",
+        "publish",
+        "pypi",
+        "npm",
+        "package",
+        "installer",
+        "distribution",
+        "trusted publishing",
+        "provenance",
+    )
+    safety_words = ("security", "safety", "harden", "protect")
+
+    if any(word in title for word in safety_words):
+        return "Security / Safety"
+    if any(word in title for word in release_words):
+        return "Release / Packaging"
+    if any(word in title for word in ("ci", "workflow", "actionlint", "contributors")):
+        return "Internal / CI"
+    if any(word in title for word in ("readme", "docs", "documentation")):
+        return "Documentation"
+    if any(word in title for word in ("fix", "bug", "fail", "collision")):
+        return "Fixed"
+    if any(word in title for word in ("add", "new", "introduce")):
+        return "Added"
+    if any(word in body for word in release_words):
+        return "Release / Packaging"
+    if any(word in body for word in safety_words):
+        return "Security / Safety"
+    if any(word in body for word in ("ci", "workflow", "actionlint", "contributors")):
+        return "Internal / CI"
+    if any(word in body for word in ("readme", "docs", "documentation")):
+        return "Documentation"
+    if any(word in body for word in ("fix", "bug", "fail", "collision")):
+        return "Fixed"
+    return "Changed"
+
+
+def _previous_release_tag(root: Path, tag: str) -> str | None:
+    try:
+        return _git_output(root, ["describe", "--tags", "--abbrev=0", f"{tag}^"]).strip()
+    except ReleaseError:
+        return None
+
+
+def _merged_pull_requests(root: Path, *, repo: str | None = None) -> list[ReleasePullRequest]:
+    argv = [
+        "pr",
+        "list",
+        "--state",
+        "merged",
+        "--limit",
+        "200",
+        "--json",
+        "number,title,author,mergedAt,mergeCommit,url,body",
+    ]
+    if repo:
+        argv.extend(("--repo", repo))
+    gh = _gh_executable()
+    try:
+        proc = subprocess.run(  # nosec B603
+            [gh, *argv],
+            cwd=root,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip() or f"exit code {exc.returncode}"
+        raise ReleaseError(f"gh pr list failed while reading merged PRs: {detail}") from exc
+    except OSError as exc:
+        raise ReleaseError(f"gh pr list failed while reading merged PRs: {exc}") from exc
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise ReleaseError(f"gh pr list returned invalid JSON: {exc}") from exc
+    prs: list[ReleasePullRequest] = []
+    for item in data:
+        author = item.get("author") or {}
+        merge_commit = item.get("mergeCommit") or {}
+        login = author.get("login")
+        oid = merge_commit.get("oid")
+        if not login or not oid:
+            continue
+        prs.append(
+            ReleasePullRequest(
+                number=int(item["number"]),
+                title=str(item["title"]),
+                author=str(login),
+                merged_at=str(item["mergedAt"]),
+                merge_commit=str(oid),
+                url=str(item["url"]),
+                body=str(item.get("body") or ""),
+            )
+        )
+    return prs
+
+
+def _git_output(root: Path, argv: list[str]) -> str:
+    git = _git_executable()
+    try:
+        proc = subprocess.run(  # nosec B603
+            [git, *argv],
+            cwd=root,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip() or f"exit code {exc.returncode}"
+        raise ReleaseError(f"git {' '.join(argv)} failed: {detail}") from exc
+    except OSError as exc:
+        raise ReleaseError(f"git {' '.join(argv)} failed: {exc}") from exc
+    return proc.stdout.strip()
+
+
+def _gh_executable() -> str:
+    gh = shutil.which("gh")
+    if gh is None:
+        raise ReleaseError("gh executable was not found on PATH")
+    return str(Path(gh).resolve())
 
 
 def _promote_unreleased_changelog(root: Path, version: str, release_date: str) -> str:

@@ -381,8 +381,10 @@ Release helpers:
 ```bash
 uv run python scripts/prepare_release.py 0.2.0
 uv run python scripts/check_release.py --tag v0.2.0
-uv run python scripts/build_release_notes.py v0.2.0 --output dist/release-notes.md
+uv run python scripts/build_release_notes.py v0.2.0 --repo Tosko4/noisegate --output dist/release-notes.md
 ```
+
+`build_release_notes.py` combines the versioned changelog section with GitHub PR metadata for the tag range. Release notes must include categorized PRs, each PR's OP/author handle, and first-time contributors whose first merged PR landed since the previous release.
 
 Release metadata must stay aligned across:
 
