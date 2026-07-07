@@ -52,6 +52,7 @@ include = [
   "/LICENSE",
   "/README.md",
   "/pyproject.toml",
+  "/npm",
   "/scripts",
   "/tests",
   "/noisegate",

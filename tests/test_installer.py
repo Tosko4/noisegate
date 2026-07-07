@@ -6,7 +6,6 @@ import pytest
 
 from noisegate import installer as installer_module
 from noisegate.installer import (
-    DEFAULT_PACKAGE_SPEC,
     InstallHermesError,
     build_install_hermes_plan,
 )
@@ -42,26 +41,33 @@ def test_build_install_hermes_plan_uses_hermes_python_shebang(tmp_path: Path) ->
     ]
 
 
-def test_build_install_hermes_plan_supports_env_shebang(tmp_path: Path) -> None:
+def test_build_install_hermes_plan_rejects_env_python_shebang(tmp_path: Path) -> None:
     hermes = tmp_path / "hermes"
     hermes.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
 
-    plan = build_install_hermes_plan(hermes=str(hermes), installer="pip")
-
-    assert plan.hermes_python == "python3"
-    assert plan.package_spec == DEFAULT_PACKAGE_SPEC
-    assert plan.install_command == ["python3", "-m", "pip", "install", DEFAULT_PACKAGE_SPEC]
+    with pytest.raises(InstallHermesError, match="non-absolute Python interpreter"):
+        build_install_hermes_plan(hermes=str(hermes), installer="pip")
 
 
-def test_build_install_hermes_plan_supports_env_shebang_with_split_args(
+def test_build_install_hermes_plan_rejects_env_shebang_with_split_args(
     tmp_path: Path,
 ) -> None:
     hermes = tmp_path / "hermes"
     hermes.write_text("#!/usr/bin/env -S python3 -s\n", encoding="utf-8")
 
+    with pytest.raises(InstallHermesError, match="non-absolute Python interpreter"):
+        build_install_hermes_plan(hermes=str(hermes), installer="pip")
+
+
+def test_build_install_hermes_plan_supports_env_shebang_with_absolute_python(
+    tmp_path: Path,
+) -> None:
+    hermes = tmp_path / "hermes"
+    hermes.write_text("#!/usr/bin/env -S /opt/hermes/.venv/bin/python3 -s\n", encoding="utf-8")
+
     plan = build_install_hermes_plan(hermes=str(hermes), installer="pip")
 
-    assert plan.hermes_python == "python3"
+    assert plan.hermes_python == "/opt/hermes/.venv/bin/python3"
 
 
 def test_build_install_hermes_plan_supports_bash_shim_to_console_script(
@@ -99,6 +105,70 @@ def test_build_install_hermes_plan_supports_bash_shim_to_python(
     plan = build_install_hermes_plan(hermes=str(hermes), installer="pip")
 
     assert plan.hermes_python == "/opt/hermes/.venv/bin/python3"
+
+
+def test_build_install_hermes_plan_rejects_absolute_system_python_shebang(
+    tmp_path: Path,
+) -> None:
+    hermes = tmp_path / "hermes"
+    hermes.write_text("#!/usr/bin/python3\n", encoding="utf-8")
+
+    with pytest.raises(InstallHermesError, match="outside a virtual environment"):
+        build_install_hermes_plan(hermes=str(hermes), installer="uv")
+
+
+def test_build_install_hermes_plan_rejects_env_absolute_system_python_shebang(
+    tmp_path: Path,
+) -> None:
+    hermes = tmp_path / "hermes"
+    hermes.write_text("#!/usr/bin/env -S /usr/bin/python3 -s\n", encoding="utf-8")
+
+    with pytest.raises(InstallHermesError, match="outside a virtual environment"):
+        build_install_hermes_plan(hermes=str(hermes), installer="uv")
+
+
+def test_build_install_hermes_plan_accepts_existing_custom_named_venv(
+    tmp_path: Path,
+) -> None:
+    prefix = tmp_path / "hermes-runtime"
+    python = prefix / "bin" / "python3"
+    python.parent.mkdir(parents=True)
+    (prefix / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    hermes = tmp_path / "hermes"
+    hermes.write_text(f"#!{python}\n", encoding="utf-8")
+
+    plan = build_install_hermes_plan(hermes=str(hermes), installer="pip")
+
+    assert plan.hermes_python == str(python)
+
+
+def test_build_install_hermes_plan_supports_bash_env_shim_to_python(
+    tmp_path: Path,
+) -> None:
+    hermes = tmp_path / "hermes"
+    hermes.write_text(
+        "#!/usr/bin/env bash\n"
+        "exec /usr/bin/env -S /opt/hermes/.venv/bin/python3 -m hermes_cli.main \"$@\"\n",
+        encoding="utf-8",
+    )
+
+    plan = build_install_hermes_plan(hermes=str(hermes), installer="pip")
+
+    assert plan.hermes_python == "/opt/hermes/.venv/bin/python3"
+
+
+def test_build_install_hermes_plan_rejects_bash_env_shim_to_bare_python(
+    tmp_path: Path,
+) -> None:
+    hermes = tmp_path / "hermes"
+    hermes.write_text(
+        "#!/usr/bin/env bash\n"
+        "exec /usr/bin/env python3 -m hermes_cli.main \"$@\"\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(InstallHermesError, match="non-absolute Python interpreter"):
+        build_install_hermes_plan(hermes=str(hermes), installer="pip")
 
 
 def test_build_install_hermes_plan_rejects_non_python_shebang(tmp_path: Path) -> None:

@@ -99,6 +99,11 @@ case "$(basename "$HERMES_PYTHON")" in
   python*|pypy*) ;;
   *) echo "Hermes launcher is not a Python console script; use noisegate install-hermes" >&2; exit 1 ;;
 esac
+HERMES_PREFIX="$(dirname "$(dirname "$HERMES_PYTHON")")"
+if [ ! -f "$HERMES_PREFIX/pyvenv.cfg" ]; then
+  echo "Hermes Python is not inside a virtual environment; use noisegate install-hermes" >&2
+  exit 1
+fi
 uv pip install --python "$HERMES_PYTHON" noisegate-hermes
 "$HERMES_PYTHON" - <<'PY'
 from hermes_cli.config import load_config, save_config

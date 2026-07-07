@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import tomllib
 from pathlib import Path
 
 from scripts.release_tools import (
@@ -166,6 +167,14 @@ def test_git_contributor_names_ignores_merge_commits(
     assert git_contributor_names(tmp_path) == ["Tosko4"]
     assert captured["argv"] == ["git", "log", "--no-merges", "--format=%aN"]
     assert captured["cwd"] == tmp_path
+
+
+def test_sdist_includes_npm_release_metadata() -> None:
+    root = Path(__file__).resolve().parents[1]
+    pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    include = pyproject["tool"]["hatch"]["build"]["targets"]["sdist"]["include"]
+
+    assert "/npm" in include
 
 
 def test_release_scripts_are_executable_from_repo_root() -> None:

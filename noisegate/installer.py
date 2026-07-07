@@ -124,7 +124,7 @@ def _python_from_launcher(executable: Path, *, seen: set[Path] | None = None) ->
         raise InstallHermesError(f"Hermes launcher has an empty shebang: {executable}")
     command = _python_command_from_shebang_parts(parts)
     if _looks_like_python(command):
-        return command
+        return _validated_python_command(command)
     if _looks_like_shell(command):
         return _python_from_shell_launcher(executable, text, seen=seen)
     raise InstallHermesError(
@@ -146,8 +146,10 @@ def _python_from_shell_launcher(executable: Path, text: str, *, seen: set[Path])
             if token == "$@" or token.startswith("-"):
                 continue
             expanded = _expand_shell_vars(token, assignments)
+            if _looks_like_env(expanded) or _looks_like_shell_assignment(expanded):
+                continue
             if _looks_like_python(expanded):
-                return expanded
+                return _validated_python_command(expanded)
             target = _candidate_launcher_path(expanded, executable.parent)
             if target is not None and target.exists():
                 return _python_from_launcher(target, seen=seen)
@@ -196,6 +198,37 @@ def _python_command_from_shebang_parts(parts: list[str]) -> str:
 
 def _looks_like_shell(command: str) -> bool:
     return Path(command).name.lower() in SHELL_LAUNCHER_NAMES
+
+
+def _looks_like_env(command: str) -> bool:
+    return Path(command).name.lower() == "env"
+
+
+def _looks_like_shell_assignment(value: str) -> bool:
+    return bool(SHELL_ASSIGNMENT_RE.match(value))
+
+
+def _validated_python_command(command: str) -> str:
+    path = Path(command)
+    if not path.is_absolute():
+        raise InstallHermesError(
+            "Hermes launcher uses a non-absolute Python interpreter; "
+            "use a Hermes launcher with an absolute venv Python shebang"
+        )
+    if not _looks_like_venv_python(path):
+        raise InstallHermesError(
+            "Hermes launcher uses a Python interpreter outside a virtual environment; "
+            "use a Hermes launcher with an absolute venv Python shebang"
+        )
+    return command
+
+
+def _looks_like_venv_python(path: Path) -> bool:
+    candidates = [path.parent.parent, *path.parents]
+    if any((candidate / "pyvenv.cfg").exists() for candidate in candidates):
+        return True
+    venv_names = {".venv", "venv", "virtualenv"}
+    return path.parent.name in {"bin", "Scripts"} and path.parent.parent.name in venv_names
 
 
 def _looks_like_python(command: str) -> bool:
