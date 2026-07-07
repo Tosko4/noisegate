@@ -46,6 +46,7 @@ packages = ["noisegate"]
 
 [tool.hatch.build.targets.sdist]
 include = [
+  "/assets",
   "/CHANGELOG.md",
   "/CONTRIBUTORS.md",
   "/LICENSE",

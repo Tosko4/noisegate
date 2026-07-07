@@ -171,6 +171,39 @@ def test_doctor_cli_reports_health(tmp_path: Path) -> None:
     assert "artifacts: disabled" in proc.stdout
 
 
+def test_install_hermes_cli_dry_run_reports_plan(tmp_path: Path) -> None:
+    hermes = tmp_path / "hermes"
+    hermes.write_text("#!/opt/hermes/.venv/bin/python\n", encoding="utf-8")
+
+    proc = run_cli(
+        "install-hermes",
+        "--dry-run",
+        "--hermes",
+        str(hermes),
+        "--package",
+        "/tmp/noisegate-wheel.whl",
+        "--installer",
+        "uv",
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "Noisegate Hermes install plan" in proc.stdout
+    assert f"hermes: {hermes}" in proc.stdout
+    assert "hermes_python: /opt/hermes/.venv/bin/python" in proc.stdout
+    expected = "pip install --python /opt/hermes/.venv/bin/python /tmp/noisegate-wheel.whl"
+    assert expected in proc.stdout
+
+
+def test_install_hermes_cli_rejects_invalid_launcher(tmp_path: Path) -> None:
+    hermes = tmp_path / "hermes"
+    hermes.write_text("not a shebang\n", encoding="utf-8")
+
+    proc = run_cli("install-hermes", "--dry-run", "--hermes", str(hermes))
+
+    assert proc.returncode == 2
+    assert "no Python shebang" in proc.stderr
+
+
 def test_cat_cli_reads_artifact(tmp_path: Path) -> None:
     env = {
         "NOISEGATE_ARTIFACTS": "1",

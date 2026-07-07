@@ -7,6 +7,7 @@ from scripts.release_tools import (
     ReleaseError,
     changelog_notes_for_version,
     check_contributors_file,
+    git_contributor_names,
     prepare_release,
     read_versions,
     validate_release_state,
@@ -35,6 +36,26 @@ def write_project(root: Path, version: str = "0.1.0") -> None:
         'name = "noisegate-hermes"\n'
         f'version = "{version}"\n'
         'source = { editable = "." }\n',
+        encoding="utf-8",
+    )
+    npm_root = root / "npm" / "noisegate"
+    npm_root.mkdir(parents=True)
+    (npm_root / "package.json").write_text(
+        '{\n  "name": "noisegate",\n  "version": "' + version + '"\n}\n',
+        encoding="utf-8",
+    )
+    (npm_root / "package-lock.json").write_text(
+        "{\n"
+        '  "name": "noisegate",\n'
+        f'  "version": "{version}",\n'
+        '  "lockfileVersion": 3,\n'
+        '  "packages": {\n'
+        '    "": {\n'
+        '      "name": "noisegate",\n'
+        f'      "version": "{version}"\n'
+        "    }\n"
+        "  }\n"
+        "}\n",
         encoding="utf-8",
     )
     (root / "CHANGELOG.md").write_text(
@@ -78,8 +99,16 @@ def test_prepare_release_updates_all_version_files_and_changelog(tmp_path: Path)
         "noisegate/_version.py": "0.2.0",
         "noisegate/plugin.yaml": "0.2.0",
         "uv.lock": "0.2.0",
+        "npm/noisegate/package.json": "0.2.0",
+        "npm/noisegate/package-lock.json": "0.2.0",
     }
     changelog = (tmp_path / "CHANGELOG.md").read_text(encoding="utf-8")
+    npm_package = (tmp_path / "npm" / "noisegate" / "package.json").read_text(encoding="utf-8")
+    npm_lock = (tmp_path / "npm" / "noisegate" / "package-lock.json").read_text(
+        encoding="utf-8"
+    )
+    assert '"version": "0.2.0"' in npm_package
+    assert npm_lock.count('"version": "0.2.0"') == 2
     assert "## [0.2.0] - 2026-07-06" in changelog
     assert "## [Unreleased]" in changelog
     assert changelog_notes_for_version(tmp_path, "0.2.0").startswith("### Added")
@@ -119,6 +148,24 @@ def test_check_contributors_file_reports_missing_names(tmp_path: Path) -> None:
     missing = check_contributors_file(tmp_path, contributor_names={"Alice", "Charlie"})
 
     assert missing == ["Charlie"]
+
+
+def test_git_contributor_names_ignores_merge_commits(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["cwd"] = kwargs.get("cwd")
+        return subprocess.CompletedProcess(argv, 0, stdout="Tosko4\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert git_contributor_names(tmp_path) == ["Tosko4"]
+    assert captured["argv"] == ["git", "log", "--no-merges", "--format=%aN"]
+    assert captured["cwd"] == tmp_path
 
 
 def test_release_scripts_are_executable_from_repo_root() -> None:
