@@ -546,15 +546,29 @@ def _line_budgeted_important_excerpt(
 
 def _failure_detail_rank(line: str) -> int:
     """Prefer diagnostic detail over progress/status lines when budgets are tight."""
-    if re.search(r"assertionerror|traceback|exception", line, re.IGNORECASE):
+    if _is_diagnostic_detail_line(line):
         return 0
-    if re.search(r"^\s*E\s+", line):
-        return 0
+    if re.search(r"\bFAILED\b.*tests?/.*::", line, re.IGNORECASE):
+        return 1
+    if re.search(r"^(failed|error)\s+", line, re.IGNORECASE):
+        return 1
     if re.search(r"={2,}.*(failures|errors|short test summary)", line, re.IGNORECASE):
-        return 1
+        return 2
     if re.search(r"\d+\s+failed", line, re.IGNORECASE):
-        return 1
-    return 2
+        return 3
+    return 4
+
+
+def _is_diagnostic_detail_line(line: str) -> bool:
+    if re.search(r"^\s*E\s+", line):
+        return True
+    return bool(
+        re.search(
+            r"\b(traceback|assertionerror|[a-z0-9_]*error|exception)\b(?::|\s|$)",
+            line,
+            re.IGNORECASE,
+        )
+    )
 
 
 def _trim_indices_around_priority(
@@ -650,7 +664,7 @@ def _char_head_tail_preserving_patterns(
 ) -> str | None:
     if len(text) <= options.max_chars:
         return None
-    match = _first_pattern_match(text, patterns)
+    match = _best_pattern_line_match(text, patterns)
     if match is None:
         return _char_head_tail(text, options)
     line_excerpt = _line_centered_excerpt(text, options, match)
@@ -677,7 +691,7 @@ def _match_centered_excerpt(
 def _line_centered_excerpt(
     text: str,
     options: NoisegateOptions,
-    match: re.Match[str],
+    match: re.Match[str] | _SpanMatch,
 ) -> str | None:
     if "\n" not in text:
         return None
@@ -844,6 +858,33 @@ def _first_pattern_match(
         if match is not None:
             return match
     return None
+
+
+def _best_pattern_line_match(
+    text: str,
+    patterns: tuple[re.Pattern[str], ...],
+) -> _SpanMatch | None:
+    best: tuple[int, int, int, int, int] | None = None
+    offset = 0
+    for line_index, line in enumerate(text.splitlines(keepends=True)):
+        stripped_line = line.rstrip("\r\n")
+        for pattern_index, pattern in enumerate(patterns):
+            match = pattern.search(stripped_line)
+            if match is None:
+                continue
+            candidate = (
+                _failure_detail_rank(stripped_line),
+                line_index,
+                pattern_index,
+                offset + match.start(),
+                offset + match.end(),
+            )
+            if best is None or candidate < best:
+                best = candidate
+        offset += len(line)
+    if best is None:
+        return None
+    return _SpanMatch(best[3], best[4])
 
 
 def _char_head_tail(text: str, options: NoisegateOptions) -> str | None:

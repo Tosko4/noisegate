@@ -254,6 +254,61 @@ def test_char_budget_prefers_pytest_assertion_detail_over_progress_line() -> Non
     assert "DOGFOOD_SIGNAL_SURVIVED" in result.text
 
 
+def test_char_budget_ignores_passing_test_name_with_exception_substring() -> None:
+    lines = [
+        "tests/test_widget.py::test_exception_name PASSED " + ("p" * 40)
+        for _ in range(8)
+    ]
+    lines.extend(
+        [
+            "tests/test_widget.py::test_boom FAILED [100%]",
+            "E       RuntimeError: boom",
+        ]
+    )
+    raw = "\n".join(lines)
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(max_chars=180, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 180
+    assert "RuntimeError: boom" in result.text
+    assert "test_exception_name PASSED" not in result.text
+
+
+def test_line_budget_prefers_pytest_exception_summary_over_count_summary() -> None:
+    raw = "\n".join(
+        [
+            *[f"tests/test_widget.py::test_ok_{index} PASSED" for index in range(30)],
+            "FAILED tests/test_widget.py::test_widget - TypeError: unsupported operand type",
+            *[f"noise {index}" for index in range(30)],
+            "========================= 1 failed in 0.12s =========================",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            max_important_lines=10,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "TypeError: unsupported operand type" in result.text
+    assert "1 failed in 0.12s" not in result.text
+
+
 def test_first_pattern_match_short_circuits_after_first_matching_pattern() -> None:
     match = _first_pattern_match("FIRST then SECOND", (re.compile("FIRST"), re.compile("SECOND")))
 
@@ -911,6 +966,35 @@ def test_node_reducer_tight_budget_fails_open_when_node_error_line_cannot_fit() 
     assert result.changed is False
     assert result.text == raw
     assert result.metadata["reason"] == "no_gain"
+
+
+def test_node_line_budget_prefers_error_detail_over_count_summary() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(30)],
+            "Error: Cannot find module './missing'",
+            *[f"build noise {index}" for index in range(30)],
+            "3 failed",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="npm test",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            max_important_lines=10,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "Cannot find module './missing'" in result.text
+    assert "3 failed" not in result.text
 
 
 def test_direct_node_command_preserves_error_line() -> None:
