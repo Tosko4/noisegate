@@ -184,6 +184,22 @@ def test_manual_release_workflow_respects_protected_main() -> None:
     assert "git push origin \"$TAG\"" in text
 
 
+
+def test_npm_oidc_publish_uses_supported_node_version() -> None:
+    root = Path(__file__).resolve().parents[1]
+    for workflow in ("release.yml", "publish-npm.yml"):
+        text = (root / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
+        assert "node-version: '24'" in text
+
+
+def test_release_pypi_publish_is_retry_safe_after_partial_release() -> None:
+    root = Path(__file__).resolve().parents[1]
+    text = (root / ".github" / "workflows" / "release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "skip-existing: true" in text
+
 def test_git_contributor_names_requires_resolved_git(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("scripts.release_tools.shutil.which", lambda _name: None)
 
