@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import tomllib
@@ -25,6 +26,8 @@ VERSION_FILES = (
     "noisegate/_version.py",
     "noisegate/plugin.yaml",
     "uv.lock",
+    "npm/noisegate/package.json",
+    "npm/noisegate/package-lock.json",
 )
 
 
@@ -61,12 +64,16 @@ def read_versions(root: Path) -> dict[str, str]:
     plugin_text = (root / "noisegate" / "plugin.yaml").read_text(encoding="utf-8")
     plugin_version = _match_required(PLUGIN_VERSION_RE, plugin_text, "noisegate/plugin.yaml")
     uv_lock_version = _uv_lock_project_version(root)
+    npm_package_version = _json_file_version(root / "npm" / "noisegate" / "package.json")
+    npm_lock_version = _json_file_version(root / "npm" / "noisegate" / "package-lock.json")
 
     return {
         "pyproject.toml": normalize_version(project_version),
         "noisegate/_version.py": normalize_version(version_py),
         "noisegate/plugin.yaml": normalize_version(plugin_version),
         "uv.lock": normalize_version(uv_lock_version),
+        "npm/noisegate/package.json": normalize_version(npm_package_version),
+        "npm/noisegate/package-lock.json": normalize_version(npm_lock_version),
     }
 
 
@@ -126,6 +133,8 @@ def set_versions(root: Path, version: str) -> None:
         rf'\g<1>{version}\2',
         "uv.lock noisegate-hermes version",
     )
+    _set_json_file_version(root / "npm" / "noisegate" / "package.json", version)
+    _set_json_file_version(root / "npm" / "noisegate" / "package-lock.json", version)
 
 
 def prepare_release(root: Path, version: str, *, release_date: str) -> str:
@@ -256,6 +265,27 @@ def _uv_lock_project_version(root: Path) -> str:
         if package.get("name") == "noisegate-hermes":
             return str(package.get("version", ""))
     raise ReleaseError("uv.lock has no noisegate-hermes package entry")
+
+
+def _json_file_version(path: Path) -> str:
+    if not path.exists():
+        raise ReleaseError(f"{path.as_posix()} is missing")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    version = data.get("version")
+    if not isinstance(version, str):
+        raise ReleaseError(f"{path.as_posix()} has no string version")
+    return version
+
+
+def _set_json_file_version(path: Path, version: str) -> None:
+    if not path.exists():
+        raise ReleaseError(f"{path.as_posix()} is missing")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["version"] = version
+    packages = data.get("packages")
+    if isinstance(packages, dict) and isinstance(packages.get(""), dict):
+        packages[""]["version"] = version
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def _replace_file(path: Path, pattern: re.Pattern[str], replacement: str, label: str) -> None:

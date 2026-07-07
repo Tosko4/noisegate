@@ -63,52 +63,99 @@ That last bit matters. A compactor that damages retrieved context is worse than 
 
 ## Install for Hermes
 
-Install Noisegate into the same Python environment that runs `hermes`.
+Noisegate is distributed as the Python package `noisegate-hermes`. The Hermes plugin must be installed into the same Python environment that runs `hermes`.
 
-From this checkout:
+The easiest path is the installer command:
+
+```bash
+uvx --from noisegate-hermes noisegate install-hermes
+```
+
+That command:
+
+1. finds the `hermes` launcher on `PATH`;
+2. resolves the Hermes Python interpreter from either a Python console-script shebang or the official Hermes bash shim;
+3. installs `noisegate-hermes` into that interpreter environment;
+4. enables the `noisegate` Hermes entry-point plugin through Hermes config helpers;
+5. runs `noisegate doctor` inside the Hermes Python environment.
+
+Preview the exact commands without changing anything:
+
+```bash
+uvx --from noisegate-hermes noisegate install-hermes --dry-run
+```
+
+From a checkout, install that exact checkout into Hermes:
+
+```bash
+uv run noisegate install-hermes --package .
+```
+
+Manual fallback for older installs where `command -v hermes` is a Python console script:
 
 ```bash
 HERMES_PYTHON="$(head -1 "$(command -v hermes)" | sed 's/^#!//')"
-uv pip install --python "$HERMES_PYTHON" -e .
-```
-
-From a GitHub release wheel, use the wheel URL from the [latest release](https://github.com/Tosko4/noisegate/releases):
-
-```bash
-HERMES_PYTHON="$(head -1 "$(command -v hermes)" | sed 's/^#!//')"
-uv pip install --python "$HERMES_PYTHON" "https://github.com/Tosko4/noisegate/releases/download/v0.1.0/noisegate_hermes-0.1.0-py3-none-any.whl"
-```
-
-Then enable the entry-point plugin in Hermes config:
-
-```bash
+case "$(basename "$HERMES_PYTHON")" in
+  python*|pypy*) ;;
+  *) echo "Hermes launcher is not a Python console script; use noisegate install-hermes" >&2; exit 1 ;;
+esac
+HERMES_PREFIX="$(dirname "$(dirname "$HERMES_PYTHON")")"
+if [ ! -f "$HERMES_PREFIX/pyvenv.cfg" ]; then
+  echo "Hermes Python is not inside a virtual environment; use noisegate install-hermes" >&2
+  exit 1
+fi
+uv pip install --python "$HERMES_PYTHON" noisegate-hermes
 "$HERMES_PYTHON" - <<'PY'
 from hermes_cli.config import load_config, save_config
 cfg = load_config()
 plugins = cfg.setdefault("plugins", {})
 enabled = plugins.get("enabled") if isinstance(plugins.get("enabled"), list) else []
+disabled = plugins.get("disabled") if isinstance(plugins.get("disabled"), list) else []
 if "noisegate" not in enabled:
     enabled.append("noisegate")
 plugins["enabled"] = enabled
-plugins.setdefault("disabled", [])
+plugins["disabled"] = [name for name in disabled if name != "noisegate"]
 save_config(cfg)
 PY
+"$HERMES_PYTHON" -m noisegate.cli doctor
 ```
 
-Newer Hermes versions may also support:
-
-```bash
-hermes plugins enable noisegate
-```
-
-If that command says the pip package is not installed or bundled, use the config-helper snippet above. Hermes discovers the pip entry point `hermes_agent.plugins:noisegate`.
-
-Noisegate registers two hooks:
+Noisegate registers two Hermes hooks:
 
 ```text
 transform_terminal_output
 transform_tool_result
 ```
+
+### npm installer wrapper
+
+The npm package `noisegate` is only a thin convenience installer and name reservation. It is not the canonical implementation. It delegates to the Python package:
+
+```bash
+npx noisegate install-hermes
+```
+
+If your npm client does not resolve the single-bin shortcut, use:
+
+```bash
+npx -p noisegate noisegate-hermes-installer install-hermes
+```
+
+The npm package has no `postinstall` script and does not bundle the Python implementation.
+
+### Publishing and package security
+
+Noisegate uses release-cycle package publishing, not ad-hoc local tokens:
+
+- PyPI package: `noisegate-hermes`
+- npm package: `noisegate` installer wrapper
+- the main release workflow publishes the GitHub Release, then PyPI, then npm
+- npm publish waits until the matching `noisegate-hermes` version is visible on PyPI
+- GitHub Actions publish with OIDC/trusted publishing where supported
+- npm publish uses provenance (`npm publish --provenance`)
+- no long-lived publish tokens in git or workflow files
+- any emergency/recovery credentials belong in Keeper, not chat, git, logs, or CI output
+- `main` is branch-protected; package releases must come from reviewed release-cycle changes
 
 ## Try it in 30 seconds
 
@@ -151,6 +198,7 @@ noisegate reduce-json < hermes-tool-result.json
 noisegate wrap -- pytest -q
 noisegate wrap --store-artifact -- pytest -q
 noisegate wrap --raw -- cat exact-output.txt
+noisegate install-hermes --dry-run
 noisegate doctor
 noisegate cat ng_<artifact-id>
 noisegate cat --artifact-dir /tmp/noisegate-artifacts ng_<artifact-id>
@@ -209,6 +257,7 @@ Expected result:
 - the failure line stays visible
 - bypass output stays unchanged
 - no config writes, git writes, service restarts, or artifact writes happen unless explicitly requested
+- install-hermes dry-runs show exact install/enable commands before changing Hermes
 
 ## Safety model
 
@@ -339,8 +388,10 @@ Release metadata must stay aligned across:
 - `noisegate/_version.py` -> `__version__`
 - `noisegate/plugin.yaml` -> plugin manifest `version`
 - `uv.lock` -> locked editable project version
+- `npm/noisegate/package.json` -> npm wrapper version
+- `npm/noisegate/package-lock.json` -> npm wrapper lockfile version
 
-GitHub Actions run linting, tests, release metadata checks, contributor checks, package build, `twine check`, and wheel install smoke tests on Python 3.11, 3.12, and 3.13.
+GitHub Actions run linting, tests, release metadata checks, contributor checks, package build, `twine check`, npm wrapper checks, npm dry-run packing, and wheel install smoke tests on Python 3.11, 3.12, and 3.13.
 
 ## What Noisegate is not
 

@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 concurrency:
   group: release-${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
@@ -20,10 +21,12 @@ concurrency:
 
 jobs:
   release:
-    name: Build and publish release
+    name: Build and publish GitHub release
     runs-on: ubuntu-latest
     timeout-minutes: 30
     if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    outputs:
+      release-tag: ${{ steps.release-vars.outputs.tag }}
 
     steps:
       - name: Checkout
@@ -40,8 +43,21 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
       - name: Install dependencies
         run: uv sync --locked --group dev
+
+      - name: Set release variables
+        id: release-vars
+        env:
+          RELEASE_REF: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          echo "tag=v${RELEASE_REF#v}" >> "$GITHUB_OUTPUT"
 
       - name: Prepare release metadata for manual release
         if: github.event_name == 'workflow_dispatch'
@@ -65,10 +81,20 @@ jobs:
           set -euo pipefail
           uv run ruff check .
           uv run python -m pytest -q
+          (cd npm/noisegate && npm ci --ignore-scripts && npm test && npm pack --dry-run)
           rm -rf dist
           uv build
           uvx twine check dist/*
           git diff --check
+
+      - name: Upload Python distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          if-no-files-found: error
 
       - name: Commit version bump and tag for manual release
         if: github.event_name == 'workflow_dispatch'
@@ -81,7 +107,14 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           if ! git diff --quiet; then
-            git add pyproject.toml noisegate/_version.py noisegate/plugin.yaml CHANGELOG.md uv.lock
+            git add \
+              pyproject.toml \
+              noisegate/_version.py \
+              noisegate/plugin.yaml \
+              CHANGELOG.md \
+              uv.lock \
+              npm/noisegate/package.json \
+              npm/noisegate/package-lock.json
             git commit -m "release: $TAG"
           fi
           if git rev-parse "$TAG" >/dev/null 2>&1; then
@@ -119,3 +152,130 @@ jobs:
               --notes-file dist/release-notes.md \
               --verify-tag
           fi
+
+  publish_pypi:
+    name: Publish noisegate-hermes to PyPI
+    needs: release
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.release.outputs.release-tag }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: uv sync --locked --group dev
+
+      - name: Validate release metadata
+        env:
+          RELEASE_REF: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          RELEASE_TAG="v${RELEASE_REF#v}"
+          uv run python scripts/check_release.py --tag "$RELEASE_TAG"
+          uv run python scripts/check_contributors.py
+
+      - name: Download Python distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: python-distributions
+          path: dist
+
+      - name: Publish to PyPI with trusted publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  publish_npm:
+    name: Publish noisegate npm installer
+    needs: [release, publish_pypi]
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: npm/noisegate
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.release.outputs.release-tag }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Validate release metadata
+        working-directory: ${{ github.workspace }}
+        env:
+          RELEASE_REF: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          RELEASE_TAG="v${RELEASE_REF#v}"
+          python scripts/check_release.py --tag "$RELEASE_TAG"
+          python scripts/check_contributors.py
+
+      - name: Validate package
+        run: |
+          set -euo pipefail
+          npm test
+          npm pack --dry-run
+
+      - name: Wait for matching PyPI package
+        working-directory: ${{ github.workspace }}
+        env:
+          RELEASE_REF: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          export VERSION="${RELEASE_REF#v}"
+          python - <<'PY'
+          import os
+          import time
+          import urllib.error
+          import urllib.request
+
+          version = os.environ["VERSION"]
+          url = f"https://pypi.org/pypi/noisegate-hermes/{version}/json"
+          for attempt in range(1, 31):
+              try:
+                  with urllib.request.urlopen(url, timeout=10) as response:
+                      if response.status == 200:
+                          print(f"noisegate-hermes=={version} is visible on PyPI")
+                          break
+              except urllib.error.HTTPError as exc:
+                  if exc.code != 404:
+                      raise
+              except urllib.error.URLError:
+                  if attempt == 30:
+                      raise
+              print(f"waiting for {url} (attempt {attempt}/30)")
+              time.sleep(10)
+          else:
+              raise SystemExit(f"noisegate-hermes=={version} is not visible on PyPI")
+          PY
+
+      - name: Publish to npm with provenance
+        run: npm publish --provenance --access public

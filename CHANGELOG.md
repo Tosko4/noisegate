@@ -7,9 +7,14 @@ All notable changes to Noisegate are documented here. Release notes are generate
 ### Added
 - `noisegate doctor` now reports invalid Noisegate environment values instead of silently falling back.
 - CI now validates GitHub Actions workflow syntax and uses explicit job timeouts.
+- `noisegate install-hermes` to install and enable Noisegate inside the same Python environment as Hermes, with a dry-run mode for safe operator review.
+- PyPI trusted-publishing workflow foundation for `noisegate-hermes`.
+- npm installer-wrapper package foundation for reserving `noisegate` and delegating to the Python package without postinstall scripts.
+- npm trusted-publishing/provenance workflow foundation for the installer wrapper.
 
 ### Changed
 - Contributor checks now ignore merge commits and wrap `git log` failures with a clearer troubleshooting message.
+- README now presents PyPI as the canonical distribution path and documents the npm wrapper as installer-only.
 
 ## [0.1.0] - 2026-07-06
 

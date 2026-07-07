@@ -11,6 +11,7 @@ from typing import Any
 from ._version import __version__
 from .artifacts import ArtifactError, ArtifactStore
 from .engine import NoisegateOptions, _is_compactable_tool_name, env_diagnostics, reduce_text
+from .installer import DEFAULT_PACKAGE_SPEC, InstallHermesError, install_hermes
 from .plugin import transform_tool_result
 from .wrap import DEFAULT_MAX_CAPTURE_BYTES, WrappedCommandInterrupted, run_wrapped_command
 
@@ -52,6 +53,33 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = subparsers.add_parser("doctor", help="report package and artifact health")
     doctor.set_defaults(func=cmd_doctor)
+
+    install_hermes_parser = subparsers.add_parser(
+        "install-hermes",
+        help="install and enable Noisegate in the same Python environment as Hermes",
+    )
+    install_hermes_parser.add_argument(
+        "--hermes",
+        default="hermes",
+        help="Hermes executable to inspect (default: hermes on PATH)",
+    )
+    install_hermes_parser.add_argument(
+        "--package",
+        default=DEFAULT_PACKAGE_SPEC,
+        help=f"package spec to install into Hermes Python (default: {DEFAULT_PACKAGE_SPEC})",
+    )
+    install_hermes_parser.add_argument(
+        "--installer",
+        choices=["uv", "pip"],
+        default=None,
+        help="installer backend (default: uv when available, otherwise pip)",
+    )
+    install_hermes_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print planned commands without executing them",
+    )
+    install_hermes_parser.set_defaults(func=cmd_install_hermes)
 
     cat = subparsers.add_parser("cat", help="print an artifact by id")
     cat.add_argument("--artifact-dir", default=None)
@@ -170,6 +198,29 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
     else:
         print("artifacts: disabled")
         print(f"artifact_dir: {artifact_dir}")
+    return 0
+
+
+def cmd_install_hermes(args: argparse.Namespace) -> int:
+    try:
+        plan = install_hermes(
+            hermes=args.hermes,
+            package_spec=args.package,
+            installer=args.installer,
+            dry_run=args.dry_run,
+        )
+    except InstallHermesError as exc:
+        print(f"noisegate install-hermes: {exc}", file=sys.stderr)
+        return 2
+
+    if args.dry_run:
+        print("Noisegate Hermes install plan")
+        for line in plan.as_lines():
+            print(line)
+    else:
+        print("Noisegate installed and enabled for Hermes")
+        print(f"hermes: {plan.hermes_executable}")
+        print(f"hermes_python: {plan.hermes_python}")
     return 0
 
 
