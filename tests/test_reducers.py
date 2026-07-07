@@ -190,6 +190,70 @@ def test_important_line_char_cap_keeps_middle_failure() -> None:
     assert "AssertionError: boom" in result.text
 
 
+def test_line_budget_prefers_pytest_assertion_detail_over_progress_line() -> None:
+    lines = [
+        f"tests/test_generated.py::test_pass_before_{index:03d} PASSED [ 20%]"
+        for index in range(120)
+    ]
+    lines.append("tests/test_generated.py::test_signal FAILED [ 50%]")
+    lines.extend(
+        f"tests/test_generated.py::test_pass_after_{index:03d} PASSED [ 70%]"
+        for index in range(120)
+    )
+    lines.extend(
+        [
+            "=================================== FAILURES ===================================",
+            "_______________________________ test_signal _______________________________",
+            "E       AssertionError: DOGFOOD_SIGNAL_SURVIVED",
+            "=========================== short test summary info ===========================",
+            "FAILED tests/test_generated.py::test_signal - AssertionError: DOGFOOD_SIGNAL_SURVIVED",
+        ]
+    )
+    raw = "\n".join(lines)
+
+    result = reduce_text(
+        raw,
+        command="uv run pytest -vv tests/test_generated.py",
+        options=options(max_chars=700, max_lines=20, max_important_lines=20),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 700
+    assert "DOGFOOD_SIGNAL_SURVIVED" in result.text
+
+
+def test_char_budget_prefers_pytest_assertion_detail_over_progress_line() -> None:
+    lines = [
+        f"tests/test_generated.py::test_pass_before_{index:03d} PASSED [ 20%]"
+        for index in range(20)
+    ]
+    lines.append("tests/test_generated.py::test_signal FAILED [ 50%]")
+    lines.extend(
+        f"tests/test_generated.py::test_pass_after_{index:03d} PASSED [ 70%]"
+        for index in range(20)
+    )
+    lines.extend(
+        [
+            "=================================== FAILURES ===================================",
+            "_______________________________ test_signal _______________________________",
+            "E       AssertionError: DOGFOOD_SIGNAL_SURVIVED",
+            "=========================== short test summary info ===========================",
+            "FAILED tests/test_generated.py::test_signal - AssertionError: DOGFOOD_SIGNAL_SURVIVED",
+        ]
+    )
+    raw = "\n".join(lines)
+
+    result = reduce_text(
+        raw,
+        command="uv run pytest -vv tests/test_generated.py",
+        options=options(max_chars=700, max_lines=160, max_important_lines=80),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 700
+    assert "DOGFOOD_SIGNAL_SURVIVED" in result.text
+
+
 def test_first_pattern_match_short_circuits_after_first_matching_pattern() -> None:
     match = _first_pattern_match("FIRST then SECOND", (re.compile("FIRST"), re.compile("SECOND")))
 

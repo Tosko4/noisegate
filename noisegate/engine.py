@@ -395,11 +395,11 @@ TEST_PATTERNS = tuple(
 CRITICAL_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
-        r"\bFAILED\b|\bERROR\b",
-        r"^(failed|error)\s+",
         r"assertionerror|traceback|exception",
         r"^\s*E\s+",
         r"\d+\s+failed",
+        r"^(failed|error)\s+",
+        r"\bFAILED\b|\bERROR\b",
         r"\berror\b|\bfailed\b|\bfail\b",
     )
 )
@@ -529,6 +529,10 @@ def _line_budgeted_important_excerpt(
         for index in important
         if any(pattern.search(lines[index]) for pattern in CRITICAL_PATTERNS)
     ] or important
+    priority = sorted(
+        priority,
+        key=lambda index: (_failure_detail_rank(lines[index]), index),
+    )
     max_context = max(0, options.important_context_lines)
     for anchor in priority:
         for context in range(max_context, -1, -1):
@@ -538,6 +542,19 @@ def _line_budgeted_important_excerpt(
             if _line_count(candidate) <= options.max_lines:
                 return candidate
     return None
+
+
+def _failure_detail_rank(line: str) -> int:
+    """Prefer diagnostic detail over progress/status lines when budgets are tight."""
+    if re.search(r"assertionerror|traceback|exception", line, re.IGNORECASE):
+        return 0
+    if re.search(r"^\s*E\s+", line):
+        return 0
+    if re.search(r"={2,}.*(failures|errors|short test summary)", line, re.IGNORECASE):
+        return 1
+    if re.search(r"\d+\s+failed", line, re.IGNORECASE):
+        return 1
+    return 2
 
 
 def _trim_indices_around_priority(

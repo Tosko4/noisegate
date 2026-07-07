@@ -10,6 +10,7 @@ All notable changes to Noisegate are documented here. Release notes are generate
 ### Fixed
 - `install-hermes` now rejects non-Hermes Python launchers instead of trusting any virtualenv Python shebang, and it validates shell shims that exec Python are actually invoking `hermes_cli`.
 - The Hermes config helper now avoids rewriting an already-correct plugin config while still removing stale `noisegate` entries from `plugins.disabled`.
+- Pytest compaction now prefers assertion/traceback detail over progress lines when tight line budgets force a single failure excerpt.
 
 ## [0.1.2] - 2026-07-07
 
