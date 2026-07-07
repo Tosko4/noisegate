@@ -62,15 +62,23 @@ class NoisegateOptions:
     @classmethod
     def from_env(cls, **overrides: object) -> NoisegateOptions:
         enabled = True
+        mode = "auto"
         env_mode = os.environ.get("NOISEGATE")
         if env_mode is not None and env_mode.strip().lower() in FALSE_VALUES | {"off"}:
             enabled = False
         if _env_flag("NOISEGATE_DISABLE", default=False):
             enabled = False
+        if _env_flag("NOISEGATE_BYPASS", default=False) or _env_flag(
+            "NOISEGATE_RAW",
+            default=False,
+        ):
+            enabled = False
+            mode = "off"
 
         artifact_dir = os.environ.get("NOISEGATE_ARTIFACT_DIR")
         options = cls(
             enabled=enabled,
+            mode=mode,
             artifact_enabled=_env_flag("NOISEGATE_ARTIFACTS", default=False),
             artifact_dir=Path(artifact_dir).expanduser() if artifact_dir else None,
             artifact_size_cap=_parse_nonnegative_int(
@@ -775,9 +783,10 @@ def _has_usable_budget(text: str, options: NoisegateOptions) -> bool:
         return False
     if len(text) <= options.max_chars and _line_count(text) <= options.max_lines:
         return True
-    minimum_omitted = max(0, len(text) - MIN_HEAD_TAIL_CHARS)
-    longest_marker = f"\n[noisegate: omitted {minimum_omitted} chars]\n"
-    return options.max_chars >= len(longest_marker) + MIN_HEAD_TAIL_CHARS
+    if options.max_lines < 3:
+        return False
+    shortest_marker = "\n[noisegate: omitted 1 chars]\n"
+    return options.max_chars >= len(shortest_marker) + MIN_HEAD_TAIL_CHARS
 
 
 def _should_reduce(text: str, options: NoisegateOptions) -> bool:

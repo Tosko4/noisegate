@@ -96,6 +96,43 @@ def test_char_budget_accepts_tight_budget_that_can_fit_notice_and_content() -> N
     assert len(result.text) == 33
 
 
+def test_line_reducer_can_shrink_marker_before_tight_char_budget() -> None:
+    raw = "\n".join(f"l{index:02d}" for index in range(100))
+
+    result = reduce_text(
+        raw,
+        options=options(max_chars=34, max_lines=10, head_lines=1, tail_lines=1),
+    )
+
+    assert result.changed is True
+    assert result.text == "l\n[noisegate: omitted 34 chars]\n99"
+    assert len(result.text) == 34
+
+
+def test_tiny_line_budget_fails_open_instead_of_dropping_marker() -> None:
+    cases = (
+        numbered("line", 10),
+        "A" * 130,
+        ("A" * 80) + "\n" + ("B" * 80),
+    )
+
+    for raw in cases:
+        for max_lines in (1, 2):
+            result = reduce_text(
+                raw,
+                options=options(
+                    max_chars=40,
+                    max_lines=max_lines,
+                    head_lines=1,
+                    tail_lines=1,
+                ),
+            )
+
+            assert result.changed is False
+            assert result.text == raw
+            assert result.metadata["reason"] == "invalid_budget"
+
+
 def test_recovery_notices_do_not_exceed_budget_or_grow_output() -> None:
     raw = "A" * 130
 
@@ -382,6 +419,17 @@ def test_bypass_marker_leaves_text_unchanged() -> None:
 
 def test_disable_env_leaves_text_unchanged(monkeypatch) -> None:
     monkeypatch.setenv("NOISEGATE_DISABLE", "1")
+    raw = numbered("line", 50)
+
+    result = reduce_text(raw, command="pytest", options=NoisegateOptions.from_env())
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reducer"] == "disabled"
+
+
+def test_bypass_env_leaves_text_unchanged(monkeypatch) -> None:
+    monkeypatch.setenv("NOISEGATE_BYPASS", "1")
     raw = numbered("line", 50)
 
     result = reduce_text(raw, command="pytest", options=NoisegateOptions.from_env())
