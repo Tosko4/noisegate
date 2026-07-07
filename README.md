@@ -227,7 +227,7 @@ If capture is truncated, Noisegate adds this marker:
 [noisegate: capture truncated]
 ```
 
-`reduce-json` accepts either a Hermes-like envelope with a `result` string or a direct JSON tool result. Bad JSON fails open and is written back unchanged.
+`reduce-json` accepts a Hermes-like envelope with a `result` string, a nested `result` object, or a direct JSON tool result. Bad JSON fails open and is written back unchanged; non-text result values such as lists and `null` remain valid JSON and pass through unchanged.
 
 Use `--metadata` (or `--debug`) on `reduce`, `reduce-json`, or `wrap` when you need to explain a compaction decision without changing stdout. Diagnostics are written as one JSON object on stderr. `reduce` and `wrap` include the chosen `command_class`, reducer or attempted reducer, unchanged reason code, and chars/lines saved. `reduce-json` reports envelope-level size metrics, includes reducer details when it directly reduces a plain `result` string, exposes that field's sizes under `field_*` keys, and leaves field-level reducer details in the transformed JSON metadata when compaction happens inside nested tool-result JSON.
 
