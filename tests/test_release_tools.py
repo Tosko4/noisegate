@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import tomllib
 from pathlib import Path
@@ -12,6 +13,8 @@ from scripts.release_tools import (
     git_contributor_names,
     prepare_release,
     read_versions,
+    release_notes_for_version,
+    release_pull_request_summary,
     validate_release_state,
 )
 
@@ -172,6 +175,265 @@ def test_standalone_publish_workflows_checkout_requested_tag() -> None:
         assert expected_ref in text
 
 
+def test_release_notes_include_categorized_prs_and_new_contributors(
+    monkeypatch, tmp_path: Path
+) -> None:
+    write_project(tmp_path, "0.2.0")
+    (tmp_path / "CHANGELOG.md").write_text(
+        "# Changelog\n\n"
+        "## [0.2.0] - 2026-07-07\n\n"
+        "### Added\n"
+        "- Release notes now include PR context.\n",
+        encoding="utf-8",
+    )
+    merged_prs = [
+        {
+            "number": 1,
+            "title": "Old release setup",
+            "author": {"login": "Alice"},
+            "mergedAt": "2026-07-01T10:00:00Z",
+            "mergeCommit": {"oid": "old-sha"},
+            "url": "https://github.com/Tosko4/noisegate/pull/1",
+            "body": "",
+        },
+        {
+            "number": 7,
+            "title": "Add npm installer packaging",
+            "author": {"login": "Bob"},
+            "mergedAt": "2026-07-07T10:00:00Z",
+            "mergeCommit": {"oid": "release-sha"},
+            "url": "https://github.com/Tosko4/noisegate/pull/7",
+            "body": "## Summary\n- add npm package and PyPI release notes",
+        },
+        {
+            "number": 8,
+            "title": "Harden artifact writes",
+            "author": {"login": "Alice"},
+            "mergedAt": "2026-07-07T11:00:00Z",
+            "mergeCommit": {"oid": "security-sha"},
+            "url": "https://github.com/Tosko4/noisegate/pull/8",
+            "body": "## Summary\n- protect artifact writes under concurrency",
+        },
+        {
+            "number": 9,
+            "title": "Docs: clarify install flow",
+            "author": {"login": "Charlie"},
+            "mergedAt": "2026-07-07T12:00:00Z",
+            "mergeCommit": {"oid": "docs-sha"},
+            "url": "https://github.com/Tosko4/noisegate/pull/9",
+            "body": "README polish",
+        },
+    ]
+
+    def fake_which(name: str) -> str:
+        return f"/usr/bin/{name}"
+
+    def fake_run(argv, **_kwargs):
+        if argv[:2] == ["/usr/bin/git", "describe"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="v0.1.0\n", stderr="")
+        if argv[:2] == ["/usr/bin/git", "rev-list"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout="release-sha\nsecurity-sha\ndocs-sha\n",
+                stderr="",
+            )
+        if argv[:3] == ["/usr/bin/gh", "api", "graphql"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "data": {
+                            "repository": {
+                                "pullRequests": {
+                                    "nodes": merged_prs,
+                                    "pageInfo": {
+                                        "hasNextPage": False,
+                                        "endCursor": None,
+                                    },
+                                }
+                            }
+                        }
+                    }
+                ),
+                stderr="",
+            )
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr("scripts.release_tools.shutil.which", fake_which)
+    monkeypatch.setattr("scripts.release_tools.subprocess.run", fake_run)
+
+    notes = release_notes_for_version(tmp_path, "0.2.0", repo="Tosko4/noisegate")
+    summary = release_pull_request_summary(tmp_path, "0.2.0", repo="Tosko4/noisegate")
+
+    assert "### Added" in notes
+    assert "## How to update" in notes
+    assert "uvx --from noisegate-hermes noisegate install-hermes" in notes
+    assert "npx -p noisegate-hermes noisegate install-hermes" in notes
+    assert "## Included pull requests" in notes
+    assert "Release range: `v0.1.0...v0.2.0`." in notes
+    assert "### Release / Packaging" in notes
+    assert (
+        "[#7](https://github.com/Tosko4/noisegate/pull/7) "
+        "Add npm installer packaging — @Bob"
+    ) in notes
+    assert "### Security / Safety" in notes
+    assert (
+        "[#8](https://github.com/Tosko4/noisegate/pull/8) "
+        "Harden artifact writes — @Alice"
+    ) in notes
+    assert "### Documentation" in notes
+    assert (
+        "[#9](https://github.com/Tosko4/noisegate/pull/9) "
+        "Docs: clarify install flow — @Charlie"
+    ) in notes
+    assert "https://github.com/Tosko4/noisegate/pull/7\n" not in notes
+    assert "https://github.com/Tosko4/noisegate/pull/8\n" not in notes
+    assert "https://github.com/Tosko4/noisegate/pull/9\n" not in notes
+    assert "## New contributors" in notes
+    assert "@Bob made their first merged Noisegate PR in #7" in notes
+    assert "@Charlie made their first merged Noisegate PR in #9" in notes
+    assert "@Alice made their first" not in notes
+    assert [pr.number for pr in summary.included] == [7, 8, 9]
+    assert [pr.number for pr in summary.new_contributors] == [7, 9]
+
+
+def test_release_notes_paginates_merged_prs_for_contributor_history(
+    monkeypatch, tmp_path: Path
+) -> None:
+    write_project(tmp_path, "0.2.0")
+    (tmp_path / "CHANGELOG.md").write_text(
+        "# Changelog\n\n"
+        "## [0.2.0] - 2026-07-07\n\n"
+        "### Changed\n"
+        "- Release notes page through merged PR metadata.\n",
+        encoding="utf-8",
+    )
+    pages = [
+        {
+            "nodes": [
+                {
+                    "number": 101,
+                    "title": "Clarify README update flow",
+                    "author": {"login": "Bob"},
+                    "mergedAt": "2026-07-07T10:00:00Z",
+                    "mergeCommit": {"oid": "release-sha"},
+                    "url": "https://github.com/Tosko4/noisegate/pull/101",
+                    "body": "README updates",
+                }
+            ],
+            "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+        },
+        {
+            "nodes": [
+                {
+                    "number": 2,
+                    "title": "Initial docs contribution",
+                    "author": {"login": "Bob"},
+                    "mergedAt": "2026-07-01T10:00:00Z",
+                    "mergeCommit": {"oid": "old-sha"},
+                    "url": "https://github.com/Tosko4/noisegate/pull/2",
+                    "body": "",
+                }
+            ],
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+        },
+    ]
+    graph_argvs: list[list[str]] = []
+
+    def fake_which(name: str) -> str:
+        return f"/usr/bin/{name}"
+
+    def fake_run(argv, **_kwargs):
+        if argv[:2] == ["/usr/bin/git", "describe"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="v0.1.0\n", stderr="")
+        if argv[:2] == ["/usr/bin/git", "rev-list"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="release-sha\n", stderr="")
+        if argv[:3] == ["/usr/bin/gh", "api", "graphql"]:
+            graph_argvs.append(argv)
+            page = pages.pop(0)
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps({"data": {"repository": {"pullRequests": page}}}),
+                stderr="",
+            )
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr("scripts.release_tools.shutil.which", fake_which)
+    monkeypatch.setattr("scripts.release_tools.subprocess.run", fake_run)
+
+    summary = release_pull_request_summary(tmp_path, "0.2.0", repo="Tosko4/noisegate")
+
+    assert [pr.number for pr in summary.included] == [101]
+    assert summary.new_contributors == []
+    assert len(graph_argvs) == 2
+    assert "cursor=cursor-1" in graph_argvs[1]
+
+
+def test_release_pr_categories_use_word_boundaries(monkeypatch, tmp_path: Path) -> None:
+    write_project(tmp_path, "0.2.0")
+    (tmp_path / "CHANGELOG.md").write_text(
+        "# Changelog\n\n"
+        "## [0.2.0] - 2026-07-07\n\n"
+        "### Changed\n"
+        "- Release notes categorize PR titles without substring false positives.\n",
+        encoding="utf-8",
+    )
+    merged_prs = [
+        {
+            "number": 12,
+            "title": "Address review feedback",
+            "author": {"login": "Alice"},
+            "mergedAt": "2026-07-07T10:00:00Z",
+            "mergeCommit": {"oid": "review-sha"},
+            "url": "https://github.com/Tosko4/noisegate/pull/12",
+            "body": "",
+        }
+    ]
+
+    def fake_which(name: str) -> str:
+        return f"/usr/bin/{name}"
+
+    def fake_run(argv, **_kwargs):
+        if argv[:2] == ["/usr/bin/git", "describe"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="v0.1.0\n", stderr="")
+        if argv[:2] == ["/usr/bin/git", "rev-list"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="review-sha\n", stderr="")
+        if argv[:3] == ["/usr/bin/gh", "api", "graphql"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "data": {
+                            "repository": {
+                                "pullRequests": {
+                                    "nodes": merged_prs,
+                                    "pageInfo": {
+                                        "hasNextPage": False,
+                                        "endCursor": None,
+                                    },
+                                }
+                            }
+                        }
+                    }
+                ),
+                stderr="",
+            )
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr("scripts.release_tools.shutil.which", fake_which)
+    monkeypatch.setattr("scripts.release_tools.subprocess.run", fake_run)
+
+    notes = release_notes_for_version(tmp_path, "0.2.0", repo="Tosko4/noisegate")
+
+    assert "### Changed" in notes
+    assert "[#12](https://github.com/Tosko4/noisegate/pull/12) Address review feedback" in notes
+    assert "### Added" not in notes
+
+
 def test_manual_release_workflow_respects_protected_main() -> None:
     root = Path(__file__).resolve().parents[1]
     text = (root / ".github" / "workflows" / "release.yml").read_text(
@@ -194,11 +456,28 @@ def test_npm_oidc_publish_uses_supported_node_version() -> None:
 
 def test_release_pypi_publish_is_retry_safe_after_partial_release() -> None:
     root = Path(__file__).resolve().parents[1]
+    for workflow in ("release.yml", "publish-pypi.yml"):
+        text = (root / ".github" / "workflows" / workflow).read_text(
+            encoding="utf-8"
+        )
+        assert "skip-existing: true" in text
+
+def test_release_workflow_updates_existing_release_notes() -> None:
+    root = Path(__file__).resolve().parents[1]
     text = (root / ".github" / "workflows" / "release.yml").read_text(
         encoding="utf-8"
     )
 
-    assert "skip-existing: true" in text
+    assert "GH_TOKEN: ${{ github.token }}" in text
+    assert "GITHUB_REPOSITORY: ${{ github.repository }}" in text
+    assert "pull-requests: read" in text
+    assert (
+        'uv run python scripts/build_release_notes.py "$RELEASE_TAG" '
+        '--repo "$GITHUB_REPOSITORY" --output dist/release-notes.md'
+    ) in text
+    assert 'gh release edit "$RELEASE_TAG" --notes-file dist/release-notes.md' in text
+    assert 'gh release upload "$RELEASE_TAG" dist/* --clobber' in text
+
 
 def test_git_contributor_names_requires_resolved_git(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("scripts.release_tools.shutil.which", lambda _name: None)

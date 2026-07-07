@@ -4,6 +4,18 @@ All notable changes to Noisegate are documented here. Release notes are generate
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-07-07
+
+### Changed
+- README install/update guidance is clearer and more human, with the canonical Hermes install command shown up front.
+- npm package README now documents install and update behavior, dry-run usage, and the wrapper's relationship to the Python package.
+- Release notes generation now includes update instructions, merged PRs by category, PR authors, release ranges, and first-time contributors since the previous release.
+- PyPI package metadata now includes homepage, repository, issues, and changelog links.
+
+### Fixed
+- Release workflow reruns now update existing GitHub Release notes as well as replacing assets.
+- Standalone PyPI publish retries now tolerate already-published immutable files.
+
 ## [0.1.1] - 2026-07-07
 
 ### Added

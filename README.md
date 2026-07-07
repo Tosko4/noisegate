@@ -13,17 +13,23 @@
 
 **Gate the noise. Keep the signal.**
 
-Noisegate is a tiny, deterministic compaction layer for Hermes Agent. It catches the massive terminal walls, test logs, build spam, and search dumps before they flood your model context, while leaving exact content alone.
+Noisegate is a small, deterministic compaction layer for Hermes Agent. It catches the terminal walls, test-log avalanches, build spam, and other context-gremlins before they flood your model window.
 
-No model calls. No fuzzy summaries. No "trust me bro" compression.
+It does not call a model. It does not vibe-summarize your logs. It does not pretend a chopped-off wall of text is "analysis".
 
-Just predictable reducers, safe bypasses, protected outputs, and enough metadata to know what happened.
+It keeps the useful bits, leaves exact content alone, and gets out of the way when it is not sure.
+
+```bash
+uvx --from noisegate-hermes noisegate install-hermes
+```
+
+That is the normal install/update path for an existing Hermes Agent setup.
 
 ## The problem
 
 Agents are great at running tools.
 
-Tools are great at producing nonsense amounts of output.
+Tools are great at producing nonsense amounts of output. Truly Olympic levels of nonsense.
 
 A single test run, package install, Docker build, or search command can dump thousands of lines into context. Most of it is noise. Some of it matters. If you blindly truncate it, you lose the useful part. If you blindly keep it, you burn context and make the next model call worse.
 
@@ -35,9 +41,9 @@ noisy tool output  ->  Noisegate  ->  compact signal-rich result
 
 It is built for agent work where the context window is valuable and exactness matters.
 
-## What it does
+## What you get
 
-Noisegate gives Hermes Agent two surfaces:
+Noisegate gives you two surfaces:
 
 - a **Hermes plugin** that can compact noisy tool results before they enter the conversation
 - a **CLI** you can use directly in terminals, scripts, CI jobs, and smoke tests
@@ -61,29 +67,27 @@ And it refuses to touch things that should stay exact:
 
 That last bit matters. A compactor that damages retrieved context is worse than no compactor.
 
-## Install for Hermes
+## Install or update
 
 Noisegate is distributed as the Python package `noisegate-hermes`. The Hermes plugin must be installed into the same Python environment that runs `hermes`.
 
-The easiest path is the installer command:
+Most users want this:
 
 ```bash
 uvx --from noisegate-hermes noisegate install-hermes
 ```
 
-That command:
+Use the same command for first install and updates.
 
-1. finds the `hermes` launcher on `PATH`;
-2. resolves the Hermes Python interpreter from either a Python console-script shebang or the official Hermes bash shim;
-3. installs `noisegate-hermes` into that interpreter environment;
-4. enables the `noisegate` Hermes entry-point plugin through Hermes config helpers;
-5. runs `noisegate doctor` inside the Hermes Python environment.
+It finds `hermes` on `PATH`, resolves the Python environment that actually runs Hermes, installs `noisegate-hermes` there, enables the `noisegate` plugin, and runs `noisegate doctor`.
 
-Preview the exact commands without changing anything:
+Preview the exact commands first:
 
 ```bash
 uvx --from noisegate-hermes noisegate install-hermes --dry-run
 ```
+
+If Hermes is running as a long-lived gateway/service, restart or reload that Hermes process through your normal maintenance flow after installing so the plugin/config change is picked up. Do not kick the chair out from under in-flight agent work.
 
 From a checkout, install that exact checkout into Hermes:
 
@@ -91,7 +95,33 @@ From a checkout, install that exact checkout into Hermes:
 uv run noisegate install-hermes --package .
 ```
 
-Manual fallback for older installs where `command -v hermes` is a Python console script:
+Noisegate registers two Hermes hooks:
+
+```text
+transform_terminal_output
+transform_tool_result
+```
+
+### npm wrapper
+
+The npm package is a thin installer wrapper. The Python package is still the real thing.
+
+If you prefer npm-shaped commands:
+
+```bash
+npx -p noisegate-hermes noisegate install-hermes
+```
+
+If your npm client does not resolve the single-bin shortcut, use:
+
+```bash
+npx -p noisegate-hermes noisegate-hermes-installer install-hermes
+```
+
+<details>
+<summary>Manual fallback for unusual Hermes launchers</summary>
+
+Prefer `noisegate install-hermes`. Use this only when you need to inspect or reproduce the low-level install flow manually.
 
 ```bash
 HERMES_PYTHON="$(head -1 "$(command -v hermes)" | sed 's/^#!//')"
@@ -120,42 +150,7 @@ PY
 "$HERMES_PYTHON" -m noisegate.cli doctor
 ```
 
-Noisegate registers two Hermes hooks:
-
-```text
-transform_terminal_output
-transform_tool_result
-```
-
-### npm installer wrapper
-
-The npm package `noisegate-hermes` is only a thin convenience installer. It is not the canonical implementation. It delegates to the Python package:
-
-```bash
-npx -p noisegate-hermes noisegate install-hermes
-```
-
-If your npm client does not resolve the single-bin shortcut, use:
-
-```bash
-npx -p noisegate-hermes noisegate-hermes-installer install-hermes
-```
-
-The npm package has no `postinstall` script and does not bundle the Python implementation.
-
-### Publishing and package security
-
-Noisegate uses release-cycle package publishing, not ad-hoc local tokens:
-
-- PyPI package: `noisegate-hermes`
-- npm package: `noisegate-hermes` installer wrapper
-- the main release workflow publishes the GitHub Release, then PyPI, then npm
-- npm publish waits until the matching `noisegate-hermes` version is visible on PyPI
-- GitHub Actions publish with OIDC/trusted publishing where supported
-- npm publish uses provenance (`npm publish --provenance`)
-- no long-lived publish tokens in git or workflow files
-- any emergency/recovery credentials belong in Keeper, not chat, git, logs, or CI output
-- `main` is branch-protected; package releases must come from reviewed release-cycle changes
+</details>
 
 ## Try it in 30 seconds
 
@@ -261,7 +256,7 @@ Expected result:
 
 ## Safety model
 
-Noisegate is intentionally conservative.
+Noisegate is intentionally conservative. Paranoid, even. That is a feature.
 
 Compacted output is kept within the configured `max_chars` and `max_lines` caps. If a readable omission marker plus preserved content cannot fit, Noisegate leaves the original output unchanged instead of emitting marker fragments or dropping important failure text.
 
@@ -370,19 +365,35 @@ uv run ruff check .
 uv run python -m pytest -q
 uv run python scripts/check_release.py
 uv run python scripts/check_contributors.py
+(cd npm/noisegate && npm ci --ignore-scripts && npm test && npm pack --dry-run)
 rm -rf dist
 uv build
 uvx twine check dist/*
 git diff --check
 ```
 
+### Release and publishing
+
+Noisegate uses release-cycle publishing, not random local tokens and crossed fingers:
+
+- PyPI package: `noisegate-hermes`
+- npm package: `noisegate-hermes` installer wrapper
+- the main release workflow publishes the GitHub Release, then PyPI, then npm
+- npm publish waits until the matching PyPI version is visible
+- GitHub Actions publish through OIDC/trusted publishing where supported
+- npm publish uses provenance (`npm publish --provenance`)
+- no long-lived publish tokens in git or workflow files
+- `main` is branch-protected; release changes go through PR review
+
 Release helpers:
 
 ```bash
 uv run python scripts/prepare_release.py 0.2.0
 uv run python scripts/check_release.py --tag v0.2.0
-uv run python scripts/build_release_notes.py v0.2.0 --output dist/release-notes.md
+uv run python scripts/build_release_notes.py v0.2.0 --repo Tosko4/noisegate --output dist/release-notes.md
 ```
+
+`build_release_notes.py` combines the versioned changelog section with GitHub PR metadata for the tag range. Release notes must include update instructions, categorized PRs, each PR's OP/author handle, and first-time contributors whose first merged PR landed since the previous release.
 
 Release metadata must stay aligned across:
 
