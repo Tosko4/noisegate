@@ -46,11 +46,13 @@ packages = ["noisegate"]
 
 [tool.hatch.build.targets.sdist]
 include = [
+  "/assets",
   "/CHANGELOG.md",
   "/CONTRIBUTORS.md",
   "/LICENSE",
   "/README.md",
   "/pyproject.toml",
+  "/npm",
   "/scripts",
   "/tests",
   "/noisegate",

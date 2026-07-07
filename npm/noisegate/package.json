@@ -1,0 +1,40 @@
+{
+  "name": "noisegate",
+  "version": "0.1.0",
+  "description": "Thin npm installer wrapper for the Noisegate Hermes Agent plugin and CLI.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "noisegate": "./bin/noisegate-hermes-installer.js",
+    "noisegate-hermes-installer": "./bin/noisegate-hermes-installer.js"
+  },
+  "files": [
+    "bin/",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Tosko4/noisegate.git",
+    "directory": "npm/noisegate"
+  },
+  "bugs": {
+    "url": "https://github.com/Tosko4/noisegate/issues"
+  },
+  "homepage": "https://github.com/Tosko4/noisegate#readme",
+  "keywords": [
+    "hermes-agent",
+    "noisegate",
+    "installer",
+    "cli",
+    "agent"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "node --check bin/noisegate-hermes-installer.js && node --check test-wrapper.js && node test-wrapper.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
