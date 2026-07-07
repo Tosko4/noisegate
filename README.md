@@ -129,16 +129,16 @@ transform_tool_result
 
 ### npm installer wrapper
 
-The npm package `noisegate` is only a thin convenience installer and name reservation. It is not the canonical implementation. It delegates to the Python package:
+The npm package `noisegate-hermes` is only a thin convenience installer. It is not the canonical implementation. It delegates to the Python package:
 
 ```bash
-npx noisegate install-hermes
+npx -p noisegate-hermes noisegate install-hermes
 ```
 
 If your npm client does not resolve the single-bin shortcut, use:
 
 ```bash
-npx -p noisegate noisegate-hermes-installer install-hermes
+npx -p noisegate-hermes noisegate-hermes-installer install-hermes
 ```
 
 The npm package has no `postinstall` script and does not bundle the Python implementation.
@@ -148,7 +148,7 @@ The npm package has no `postinstall` script and does not bundle the Python imple
 Noisegate uses release-cycle package publishing, not ad-hoc local tokens:
 
 - PyPI package: `noisegate-hermes`
-- npm package: `noisegate` installer wrapper
+- npm package: `noisegate-hermes` installer wrapper
 - the main release workflow publishes the GitHub Release, then PyPI, then npm
 - npm publish waits until the matching `noisegate-hermes` version is visible on PyPI
 - GitHub Actions publish with OIDC/trusted publishing where supported
