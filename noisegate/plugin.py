@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import Any, Protocol, TypeAlias
 
 from ._version import __version__
 from .engine import (
+    CRITICAL_PATTERNS,
+    NODE_PATTERNS,
     JsonValue,
     NoisegateOptions,
     _append_recovery_notices,
@@ -14,6 +17,7 @@ from .engine import (
     _is_compactable_tool_name,
     _plan_artifact,
     _store_artifact,
+    classify_command,
     reduce_text,
 )
 
@@ -98,6 +102,7 @@ def transform_tool_result(
                 metadata = dict(reduced.metadata)
                 text = reduced.text
                 if options.artifact_enabled:
+                    preserve_patterns = _preserve_patterns_for(command, text)
                     metadata["artifact"] = _plan_artifact(value, options)
                     _drop_artifact_if_notice_cannot_fit(
                         metadata,
@@ -111,6 +116,7 @@ def transform_tool_result(
                         notice_metadata,
                         artifact_dir=options.artifact_dir,
                         options=options,
+                        preserve_patterns=preserve_patterns,
                     )
                     if len(text) >= len(value):
                         continue
@@ -149,11 +155,24 @@ def transform_tool_result(
                         notice_metadata,
                         artifact_dir=options.artifact_dir,
                         options=options,
+                        preserve_patterns=_preserve_patterns_for(command, reduced_text),
                     )
             candidate = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         return candidate if len(candidate) < len(result) else None
     except Exception:
         return None
+
+
+def _preserve_patterns_for(
+    command: str,
+    text: str,
+) -> tuple[re.Pattern[str], ...] | None:
+    command_class = classify_command(command, text)
+    if command_class in {"pytest", "unittest"}:
+        return CRITICAL_PATTERNS
+    if command_class == "node":
+        return NODE_PATTERNS
+    return None
 
 
 def transform_terminal_output(

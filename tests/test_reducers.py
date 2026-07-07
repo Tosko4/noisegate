@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
+import noisegate.engine as engine
 from noisegate.engine import NoisegateOptions, _first_pattern_match, reduce_text
 
 
@@ -480,3 +483,254 @@ def test_reducers_enforce_max_lines_when_output_is_short_but_tall() -> None:
     assert result.metadata["reducer"] == "generic_head_tail"
     assert result.text.count("\n") + 1 <= 10
     assert "[noisegate: omitted" in result.text
+
+
+def test_line_reducer_fails_open_when_marker_digits_make_result_over_char_budget() -> None:
+    raw = "\n".join(f"l{index:02d}" for index in range(20))
+
+    result = reduce_text(
+        raw,
+        options=options(max_chars=32, max_lines=10, head_lines=2, tail_lines=2),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+
+
+def test_important_pattern_tight_budget_keeps_match_centered_excerpt() -> None:
+    raw = "\n".join(
+        [
+            "setup noise " + ("x" * 80),
+            "more setup noise " + ("y" * 80),
+            "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+            "post noise " + ("z" * 80),
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        options=options(max_chars=40, max_lines=10, head_lines=1, tail_lines=1),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 40
+    assert "FAILED" in result.text
+
+
+def test_important_pattern_focus_does_not_split_full_match() -> None:
+    raw = "\n".join(
+        [
+            "setup noise " + ("x" * 200),
+            "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+            "post noise " + ("z" * 200),
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        options=options(max_chars=100, max_lines=10, head_lines=1, tail_lines=1),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 100
+    assert "FAILED" in result.text
+    assert "FAILE\n" not in result.text
+
+
+def test_recovery_notices_do_not_destroy_tight_important_excerpt() -> None:
+    raw = "\n".join(
+        [
+            "setup noise " + ("x" * 80),
+            "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+            "post noise " + ("z" * 80),
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=options(max_chars=40, max_lines=10, head_lines=1, tail_lines=1),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 40
+    assert "FAILED" in result.text
+    assert "[noisegate" not in result.text or "[noisegate:" in result.text
+
+
+def test_important_line_reducer_tight_line_cap_preserves_middle_failure() -> None:
+    raw = "\n".join(
+        [
+            "setup 1",
+            "setup 2",
+            "setup 3",
+            "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+            "E       AssertionError: boom",
+            "teardown 1",
+            "teardown 2",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        options=options(
+            max_chars=10_000,
+            max_lines=4,
+            head_lines=2,
+            tail_lines=2,
+            important_context_lines=2,
+        ),
+    )
+
+    assert result.changed is True
+    assert len(result.text.splitlines()) <= 4
+    assert "FAILED" in result.text or "AssertionError" in result.text
+
+
+def test_final_budget_enforcement_preserves_middle_failure_under_line_cap() -> None:
+    lines = [f"setup {index}" for index in range(20)]
+    lines += [
+        "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+        "E       AssertionError: boom",
+    ]
+    lines += [f"teardown {index}" for index in range(20)]
+    raw = "\n".join(lines)
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        options=options(
+            max_chars=10_000,
+            max_lines=5,
+            head_lines=3,
+            tail_lines=3,
+            important_context_lines=2,
+        ),
+    )
+
+    assert result.changed is True
+    assert len(result.text.splitlines()) <= 5
+    assert "FAILED" in result.text or "AssertionError" in result.text
+
+
+def test_recovery_notices_do_not_emit_partial_important_markers() -> None:
+    lines = [f"setup {index} " + ("x" * 10) for index in range(20)]
+    lines += [
+        "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+        "E       AssertionError: boom",
+    ]
+    lines += [f"teardown {index} " + ("z" * 10) for index in range(20)]
+    raw = "\n".join(lines)
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=options(
+            max_chars=180,
+            max_lines=20,
+            head_lines=3,
+            tail_lines=3,
+            important_context_lines=2,
+        ),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 180
+    assert len(result.text.splitlines()) <= 20
+    assert "FAILED" in result.text or "AssertionError" in result.text
+    assert "\nomitted after important output]" not in result.text
+
+
+def test_node_reducer_tight_budget_preserves_node_error() -> None:
+    raw = "\n".join(
+        [
+            "setup " + ("x" * 100),
+            "npm ERR! lifecycle script crashed " + ("z" * 100),
+            "tail " + ("q" * 100),
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="npm test",
+        exit_code=1,
+        options=options(max_chars=80, max_lines=10, head_lines=1, tail_lines=1),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 80
+    assert "npm ERR!" in result.text
+
+
+def test_artifact_notice_only_does_not_replace_preserved_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_store(text: str, options: NoisegateOptions) -> dict[str, object]:
+        return {
+            "stored": True,
+            "id": "ng_" + ("a" * 24),
+            "sha256": "b" * 64,
+            "size_bytes": len(text.encode()),
+        }
+
+    monkeypatch.setattr(engine, "_store_artifact", fake_store)
+    raw = "\n".join(
+        [
+            "setup noise " + ("x" * 80),
+            "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+            "post noise " + ("z" * 80),
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        options=options(
+            max_chars=110,
+            max_lines=10,
+            head_lines=1,
+            tail_lines=1,
+            artifact_enabled=True,
+        ),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 110
+    assert "FAILED" in result.text
+
+
+def test_changed_outputs_always_fit_configured_budgets() -> None:
+    cases = [
+        numbered("line", 30),
+        "\n".join("A" * 80 for _ in range(8)),
+        "\n".join(
+            [
+                "setup " + ("x" * 80),
+                "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+                "post " + ("z" * 80),
+            ]
+        ),
+    ]
+
+    for raw in cases:
+        for max_chars in (32, 40, 80, 120):
+            for max_lines in (3, 5, 10):
+                result = reduce_text(
+                    raw,
+                    command="pytest -q",
+                    exit_code=1,
+                    options=options(
+                        max_chars=max_chars,
+                        max_lines=max_lines,
+                        head_lines=1,
+                        tail_lines=1,
+                    ),
+                )
+                if result.changed:
+                    assert len(result.text) <= max_chars
+                    assert len(result.text.splitlines()) <= max_lines

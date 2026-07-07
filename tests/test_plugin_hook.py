@@ -348,6 +348,34 @@ def test_transform_tool_result_rebuilds_artifact_notice_after_store_failure(tmp_
     assert metadata["stored"] is False
 
 
+def test_transform_tool_result_artifact_notice_does_not_replace_failure(
+    tmp_path: Path,
+) -> None:
+    stdout = "\n".join(
+        [
+            *["setup noise " + ("x" * 80) for _ in range(30)],
+            "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+            *["post noise " + ("z" * 80) for _ in range(30)],
+        ]
+    )
+    raw = terminal_result(stdout, command="pytest -q", exit_code=1)
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        noisegate_max_chars=90,
+        noisegate_max_lines=10,
+        noisegate_artifacts=True,
+        noisegate_artifact_dir=str(tmp_path / "artifacts"),
+    )
+
+    payload = parse_hook_result(transformed)
+    stdout = payload["stdout"]
+    assert isinstance(stdout, str)
+    assert len(stdout) <= 90
+    assert "FAILED" in stdout
+
+
 def test_transform_tool_result_does_not_treat_http_status_code_as_exit_code() -> None:
     raw = json.dumps({"status_code": 200, "content": numbered("html", 200)})
 

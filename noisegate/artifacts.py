@@ -96,6 +96,22 @@ class ArtifactStore:
         artifact_id = f"ng_{digest[:24]}"
         path = self._path_for(artifact_id, root=root)
 
+        try:
+            stat_result = path.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise ArtifactSecurityError(type(exc).__name__) from exc
+        else:
+            if not stat.S_ISREG(stat_result.st_mode):
+                raise ArtifactSecurityError("artifact path must be a regular file")
+            existing = self._read_bytes(artifact_id, root=root)
+            if hashlib.sha256(existing).hexdigest() != digest:
+                raise ArtifactSecurityError(
+                    "artifact id collision with different content"
+                ) from None
+            return StoredArtifact(artifact_id, digest, len(data))
+
         temp_path: Path | None = None
         try:
             fd, raw_temp_path = tempfile.mkstemp(

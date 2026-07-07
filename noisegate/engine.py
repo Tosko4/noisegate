@@ -228,8 +228,18 @@ def _reduce_text(
         return _unchanged(text, "below_threshold", command_class, reason="below_threshold")
 
     reducer_name, compacted = _apply_reducer(text, command_class, options, exit_code)
+    if command_class in {"pytest", "unittest"}:
+        preserve_patterns = CRITICAL_PATTERNS
+    elif command_class == "node":
+        preserve_patterns = NODE_PATTERNS
+    else:
+        preserve_patterns = None
     if compacted is not None:
-        compacted = _enforce_final_budget(compacted, options)
+        compacted = _enforce_final_budget(
+            compacted,
+            options,
+            preserve_patterns=preserve_patterns,
+        )
     if compacted is None or compacted == text or len(compacted) >= len(text):
         return _unchanged(text, "no_gain", command_class, reason="no_gain")
 
@@ -252,7 +262,10 @@ def _reduce_text(
         metadata,
         artifact_dir=options.artifact_dir,
         options=options,
+        preserve_patterns=preserve_patterns,
     )
+    if not _fits_budget(compacted, options):
+        return _unchanged(text, "invalid_budget", command_class, reason="invalid_budget")
     if len(compacted) >= len(text):
         return _unchanged(text, "no_gain", command_class, reason="no_gain_after_notices")
     if options.artifact_enabled:
@@ -264,7 +277,10 @@ def _reduce_text(
                 metadata,
                 artifact_dir=options.artifact_dir,
                 options=options,
+                preserve_patterns=preserve_patterns,
             )
+            if not _fits_budget(compacted, options):
+                return _unchanged(text, "invalid_budget", command_class, reason="invalid_budget")
             if len(compacted) >= len(text):
                 return _unchanged(
                     text,
@@ -404,6 +420,12 @@ def _important_lines(
         len(lines) <= options.head_lines + options.tail_lines + 1
         and len(lines) <= options.max_lines
     ):
+        if len(text) > options.max_chars:
+            return _char_head_tail_preserving_patterns(
+                text,
+                options,
+                _preservation_patterns(text, patterns),
+            )
         return _char_head_tail(text, options)
 
     important: list[int] = []
@@ -439,14 +461,62 @@ def _important_lines(
 
     if len(keep) >= len(lines):
         if len(lines) > options.max_lines:
+            budgeted = _line_budgeted_important_excerpt(lines, important, options)
+            if budgeted is not None:
+                return budgeted
             return _head_tail(text, options)
+        if len(text) > options.max_chars:
+            return _char_head_tail_preserving_patterns(
+                text,
+                options,
+                _preservation_patterns(text, patterns),
+            )
         return _char_head_tail(text, options)
     selected = _lines_with_markers(lines, sorted(keep))
+    if _line_count(selected) > options.max_lines:
+        budgeted = _line_budgeted_important_excerpt(lines, important, options)
+        if budgeted is None:
+            return None
+        selected = budgeted
     if len(selected) > options.max_chars:
-        preserved = _char_head_tail_preserving_patterns(selected, options, CRITICAL_PATTERNS)
-        if preserved is not None:
-            return preserved
+        return _char_head_tail_preserving_patterns(
+            selected,
+            options,
+            _preservation_patterns(selected, patterns),
+        )
     return selected
+
+
+def _preservation_patterns(
+    text: str,
+    patterns: tuple[re.Pattern[str], ...],
+) -> tuple[re.Pattern[str], ...]:
+    return CRITICAL_PATTERNS if _first_pattern_match(text, CRITICAL_PATTERNS) else patterns
+
+
+def _line_budgeted_important_excerpt(
+    lines: list[str],
+    important: list[int],
+    options: NoisegateOptions,
+) -> str | None:
+    if not important:
+        return None
+    priority = [
+        index
+        for index in important
+        if any(pattern.search(lines[index]) for pattern in CRITICAL_PATTERNS)
+    ] or important
+    max_context = max(0, options.important_context_lines)
+    for anchor in priority:
+        for context in range(max_context, -1, -1):
+            start = max(0, anchor - context)
+            end = min(len(lines), anchor + context + 1)
+            candidate = _lines_with_markers(lines, list(range(start, end)))
+            if end < len(lines) and _line_count(candidate) < options.max_lines:
+                candidate = f"{candidate}\n[noisegate: omitted {len(lines) - end} lines]"
+            if _line_count(candidate) <= options.max_lines:
+                return candidate
+    return None
 
 
 def _trim_indices_around_priority(
@@ -505,16 +575,33 @@ def _head_tail(text: str, options: NoisegateOptions) -> str | None:
     return _lines_with_markers(lines, keep)
 
 
-def _enforce_final_budget(text: str, options: NoisegateOptions) -> str:
+def _enforce_final_budget(
+    text: str,
+    options: NoisegateOptions,
+    *,
+    preserve_patterns: tuple[re.Pattern[str], ...] | None = None,
+) -> str | None:
     compacted = text
     if _line_count(compacted) > options.max_lines:
-        line_capped = _head_tail(compacted, options)
+        if preserve_patterns is not None and _first_pattern_match(compacted, preserve_patterns):
+            line_capped = _important_lines(compacted, options, preserve_patterns)
+        else:
+            line_capped = _head_tail(compacted, options)
         if line_capped is not None and len(line_capped) < len(compacted):
             compacted = line_capped
     if len(compacted) > options.max_chars:
-        char_capped = _char_head_tail(compacted, options)
+        if preserve_patterns is not None and _first_pattern_match(compacted, preserve_patterns):
+            char_capped = _char_head_tail_preserving_patterns(
+                compacted,
+                options,
+                preserve_patterns,
+            )
+        else:
+            char_capped = _char_head_tail(compacted, options)
         if char_capped is not None and len(char_capped) < len(compacted):
             compacted = char_capped
+    if not _fits_budget(compacted, options):
+        return None
     return compacted
 
 
@@ -536,21 +623,55 @@ def _char_head_tail_preserving_patterns(
     marker_b = "\n[noisegate: omitted after important output]\n"
     available = budget - len(marker_a) - len(marker_b)
     if available <= 0:
-        return _char_head_tail(text, options)
+        return _match_centered_excerpt(text, options, match)
 
     head_chars = max(1, available // 5)
     tail_chars = max(1, available // 5)
     focus_chars = max(1, available - head_chars - tail_chars)
-    focus_start = max(head_chars, match.start() - focus_chars // 3)
+    match_len = match.end() - match.start()
+    if match_len > focus_chars:
+        return _match_centered_excerpt(text, options, match)
+
+    focus_start = match.start() - max(0, (focus_chars - match_len) // 2)
+    if match.end() > focus_start + focus_chars:
+        focus_start = match.end() - focus_chars
+    focus_start = max(head_chars, focus_start)
+    focus_start = min(focus_start, max(head_chars, len(text) - tail_chars - focus_chars))
     focus_end = min(len(text) - tail_chars, focus_start + focus_chars)
-    focus_start = max(head_chars, focus_end - focus_chars)
-    if focus_start >= focus_end:
-        return _char_head_tail(text, options)
-    return (
+    if focus_start >= focus_end or focus_start > match.start() or focus_end < match.end():
+        return _match_centered_excerpt(text, options, match)
+    compacted = (
         f"{text[:head_chars]}{marker_a}"
         f"{text[focus_start:focus_end]}{marker_b}"
         f"{text[-tail_chars:]}"
     )
+    if not _fits_budget(compacted, options):
+        return _match_centered_excerpt(text, options, match)
+    return compacted
+
+
+def _match_centered_excerpt(
+    text: str,
+    options: NoisegateOptions,
+    match: re.Match[str],
+) -> str | None:
+    budget = max(0, options.max_chars)
+    match_len = match.end() - match.start()
+    if budget <= 0 or match_len > budget:
+        return None
+    slack = budget - match_len
+    start = match.start() - slack // 2
+    start = max(0, min(start, len(text) - budget))
+    end = min(len(text), start + budget)
+    if match.end() > end:
+        end = match.end()
+        start = max(0, end - budget)
+    if start > match.start() or end < match.end():
+        return None
+    excerpt = text[start:end]
+    if not _fits_budget(excerpt, options):
+        return None
+    return excerpt
 
 
 def _first_pattern_match(
@@ -728,6 +849,7 @@ def _append_recovery_notices(
     *,
     artifact_dir: Path | None = None,
     options: NoisegateOptions | None = None,
+    preserve_patterns: tuple[re.Pattern[str], ...] | None = None,
 ) -> str:
     notices = _recovery_notices(metadata, artifact_dir=artifact_dir)
     if not notices:
@@ -740,16 +862,41 @@ def _append_recovery_notices(
     if budget == 0:
         return ""
     if len(text) + len(suffix) <= budget:
-        return f"{text}{suffix}"
+        candidate = f"{text}{suffix}"
+        if _fits_budget(candidate, options):
+            return candidate
+        return text
     if len(suffix) >= budget:
-        return _enforce_final_budget(text, options)
+        return _enforce_final_budget(
+            text,
+            options,
+            preserve_patterns=preserve_patterns,
+        ) or text
 
     text_budget = budget - len(suffix)
-    reserved_options = replace(options, max_chars=text_budget)
-    shortened = _enforce_final_budget(text, reserved_options)
-    if len(shortened) > text_budget:
-        shortened = shortened[:text_budget]
-    return f"{shortened}{suffix}"
+    reserved_options = replace(
+        options,
+        max_chars=text_budget,
+        max_lines=max(1, options.max_lines - _line_count(suffix)),
+    )
+    shortened = _enforce_final_budget(
+        text,
+        reserved_options,
+        preserve_patterns=preserve_patterns,
+    )
+    if shortened is None:
+        notice_only = suffix.lstrip("\n")
+        if (
+            (preserve_patterns is None or _first_pattern_match(text, preserve_patterns) is None)
+            and "[noisegate artifact:" in notice_only
+            and _fits_budget(notice_only, options)
+        ):
+            return notice_only
+        return text
+    candidate = f"{shortened}{suffix}"
+    if not _fits_budget(candidate, options):
+        return text
+    return candidate
 
 
 def _recovery_notices(
@@ -785,8 +932,18 @@ def _has_usable_budget(text: str, options: NoisegateOptions) -> bool:
         return True
     if options.max_lines < 3:
         return False
-    shortest_marker = "\n[noisegate: omitted 1 chars]\n"
-    return options.max_chars >= len(shortest_marker) + MIN_HEAD_TAIL_CHARS
+    max_omitted_chars = max(1, len(text) - MIN_HEAD_TAIL_CHARS)
+    max_omitted_lines = max(1, _line_count(text) - MIN_HEAD_TAIL_CHARS)
+    longest_marker = max(
+        f"\n[noisegate: omitted {max_omitted_chars} chars]\n",
+        f"[noisegate: omitted {max_omitted_lines} lines]",
+        key=len,
+    )
+    return options.max_chars >= len(longest_marker) + MIN_HEAD_TAIL_CHARS
+
+
+def _fits_budget(text: str, options: NoisegateOptions) -> bool:
+    return len(text) <= options.max_chars and _line_count(text) <= options.max_lines
 
 
 def _should_reduce(text: str, options: NoisegateOptions) -> bool:

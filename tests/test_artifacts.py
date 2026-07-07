@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import stat
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -145,6 +146,25 @@ def test_artifact_store_handles_concurrent_same_content_writes(tmp_path: Path) -
     assert len(list((tmp_path / "store").glob("ng_*.txt"))) == 1
     assert list((tmp_path / "store").glob(".ng_*.tmp")) == []
 
+
+def test_artifact_store_reuses_existing_artifact_without_temp_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ArtifactStore(tmp_path / "store", size_cap=10_000)
+    raw = "raw terminal output"
+    first = store.store(raw)
+
+    def fail_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        raise OSError("mkstemp should not be called for existing artifacts")
+
+    monkeypatch.setattr(tempfile, "mkstemp", fail_mkstemp)
+
+    second = store.store(raw)
+
+    assert second == first
+    assert store.read(second.artifact_id) == raw
+    assert list((tmp_path / "store").glob(".ng_*.tmp")) == []
 
 def test_artifact_verify_reports_temp_files_without_exposing_raw_content(
     tmp_path: Path,

@@ -263,6 +263,8 @@ Expected result:
 
 Noisegate is intentionally conservative.
 
+Compacted output is kept within the configured `max_chars` and `max_lines` caps. If a readable omission marker plus preserved content cannot fit, Noisegate leaves the original output unchanged instead of emitting marker fragments or dropping important failure text.
+
 For Hermes hook traffic, it compacts only this explicit allowlist:
 
 ```text
