@@ -21,9 +21,38 @@ CHANGELOG_HEADING_RE = re.compile(
     r"(?m)^## \[(?P<version>[^\]]+)\](?: - (?P<date>\d{4}-\d{2}-\d{2}))?\s*$"
 )
 CONTRIBUTOR_BULLET_RE = re.compile(r"(?m)^-\s+(?P<name>[^<\n]+?)(?:\s+<[^>]+>)?\s*$")
+GITHUB_OWNER_REPO_RE = re.compile(r"^(?P<owner>[^/]+)/(?P<name>[^/]+)$")
 GITHUB_NOREPLY_RE = re.compile(
     r"^(?:\d+\+)?(?P<login>[^@]+)@users\.noreply\.github\.com$",
     re.IGNORECASE,
+)
+
+GH_PR_JSON_FIELDS = "number,title,author,mergedAt,mergeCommit,url,body"
+GH_PR_GRAPHQL_PAGE_SIZE = 100
+
+CATEGORY_TERMS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Security / Safety", ("security", "safety", "harden", "protect")),
+    (
+        "Release / Packaging",
+        (
+            "release",
+            "publish",
+            "publishing",
+            "pypi",
+            "npm",
+            "package",
+            "packages",
+            "packaging",
+            "installer",
+            "distribution",
+            "trusted publishing",
+            "provenance",
+        ),
+    ),
+    ("Internal / CI", ("ci", "workflow", "actionlint", "contributors")),
+    ("Documentation", ("readme", "docs", "documentation")),
+    ("Fixed", ("fix", "fixed", "bug", "fail", "failure", "collision")),
+    ("Added", ("add", "added", "new", "introduce", "introduced")),
 )
 
 VERSION_FILES = (
@@ -411,42 +440,22 @@ def _format_release_pr_section(summary: ReleasePullRequestSummary) -> str:
 def _release_pr_category(pr: ReleasePullRequest) -> str:
     title = pr.title.lower()
     body = pr.body.lower()
-    release_words = (
-        "release",
-        "publish",
-        "pypi",
-        "npm",
-        "package",
-        "installer",
-        "distribution",
-        "trusted publishing",
-        "provenance",
-    )
-    safety_words = ("security", "safety", "harden", "protect")
-
-    if any(word in title for word in safety_words):
-        return "Security / Safety"
-    if any(word in title for word in release_words):
-        return "Release / Packaging"
-    if any(word in title for word in ("ci", "workflow", "actionlint", "contributors")):
-        return "Internal / CI"
-    if any(word in title for word in ("readme", "docs", "documentation")):
-        return "Documentation"
-    if any(word in title for word in ("fix", "bug", "fail", "collision")):
-        return "Fixed"
-    if any(word in title for word in ("add", "new", "introduce")):
-        return "Added"
-    if any(word in body for word in release_words):
-        return "Release / Packaging"
-    if any(word in body for word in safety_words):
-        return "Security / Safety"
-    if any(word in body for word in ("ci", "workflow", "actionlint", "contributors")):
-        return "Internal / CI"
-    if any(word in body for word in ("readme", "docs", "documentation")):
-        return "Documentation"
-    if any(word in body for word in ("fix", "bug", "fail", "collision")):
-        return "Fixed"
+    for category, terms in CATEGORY_TERMS:
+        if _contains_category_term(title, terms):
+            return category
+    for category, terms in CATEGORY_TERMS:
+        if _contains_category_term(body, terms):
+            return category
     return "Changed"
+
+
+def _contains_category_term(text: str, terms: tuple[str, ...]) -> bool:
+    return any(_contains_whole_term(text, term) for term in terms)
+
+
+def _contains_whole_term(text: str, term: str) -> bool:
+    pattern = rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])"
+    return re.search(pattern, text) is not None
 
 
 def _previous_release_tag(root: Path, tag: str) -> str | None:
@@ -457,22 +466,33 @@ def _previous_release_tag(root: Path, tag: str) -> str | None:
 
 
 def _merged_pull_requests(root: Path, *, repo: str | None = None) -> list[ReleasePullRequest]:
-    argv = [
-        "pr",
-        "list",
-        "--state",
-        "merged",
-        "--limit",
-        "200",
-        "--json",
-        "number,title,author,mergedAt,mergeCommit,url,body",
-    ]
-    if repo:
-        argv.extend(("--repo", repo))
     gh = _gh_executable()
+    owner, name = _github_repo_parts(root, gh, repo=repo)
+    prs: list[ReleasePullRequest] = []
+    cursor: str | None = None
+    while True:
+        page = _merged_pull_request_page(root, gh, owner=owner, name=name, cursor=cursor)
+        prs.extend(_release_pull_requests_from_items(page["nodes"]))
+        if not page["has_next_page"]:
+            return prs
+        end_cursor = page["end_cursor"]
+        cursor = str(end_cursor) if end_cursor is not None else None
+        if not cursor:  # pragma: no cover - defensive against malformed GitHub data
+            raise ReleaseError("gh pr pagination did not return an end cursor")
+
+
+def _github_repo_parts(root: Path, gh: str, *, repo: str | None) -> tuple[str, str]:
+    if repo:
+        match = GITHUB_OWNER_REPO_RE.match(repo)
+        if not match:
+            raise ReleaseError(
+                f"GitHub repository must use owner/name form, got {repo!r}"
+            )
+        return match.group("owner"), match.group("name")
+
     try:
         proc = subprocess.run(  # nosec B603
-            [gh, *argv],
+            [gh, "repo", "view", "--json", "owner,name"],
             cwd=root,
             text=True,
             capture_output=True,
@@ -480,19 +500,107 @@ def _merged_pull_requests(root: Path, *, repo: str | None = None) -> list[Releas
         )
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or exc.stdout or "").strip() or f"exit code {exc.returncode}"
-        raise ReleaseError(f"gh pr list failed while reading merged PRs: {detail}") from exc
+        raise ReleaseError(f"gh repo view failed while resolving repository: {detail}") from exc
     except OSError as exc:
-        raise ReleaseError(f"gh pr list failed while reading merged PRs: {exc}") from exc
+        raise ReleaseError(f"gh repo view failed while resolving repository: {exc}") from exc
     try:
         data = json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:
-        raise ReleaseError(f"gh pr list returned invalid JSON: {exc}") from exc
+        owner = data["owner"]["login"]
+        name = data["name"]
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ReleaseError(f"gh repo view returned invalid JSON: {exc}") from exc
+    return str(owner), str(name)
+
+
+def _merged_pull_request_page(
+    root: Path,
+    gh: str,
+    *,
+    owner: str,
+    name: str,
+    cursor: str | None,
+) -> dict[str, object]:
+    query = _merged_pr_query(include_cursor=cursor is not None)
+    argv = [
+        gh,
+        "api",
+        "graphql",
+        "-f",
+        f"owner={owner}",
+        "-f",
+        f"name={name}",
+        "-F",
+        f"limit={GH_PR_GRAPHQL_PAGE_SIZE}",
+        "-f",
+        f"query={query}",
+    ]
+    if cursor is not None:
+        argv.extend(("-f", f"cursor={cursor}"))
+    try:
+        proc = subprocess.run(  # nosec B603
+            argv,
+            cwd=root,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip() or f"exit code {exc.returncode}"
+        raise ReleaseError(f"gh api graphql failed while reading merged PRs: {detail}") from exc
+    except OSError as exc:
+        raise ReleaseError(f"gh api graphql failed while reading merged PRs: {exc}") from exc
+    try:
+        data = json.loads(proc.stdout)
+        pull_requests = data["data"]["repository"]["pullRequests"]
+        page_info = pull_requests["pageInfo"]
+        nodes = pull_requests["nodes"]
+        return {
+            "nodes": nodes,
+            "has_next_page": bool(page_info["hasNextPage"]),
+            "end_cursor": page_info.get("endCursor"),
+        }
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ReleaseError(f"gh api graphql returned invalid PR JSON: {exc}") from exc
+
+
+def _merged_pr_query(*, include_cursor: bool) -> str:
+    cursor_argument = ", after: $cursor" if include_cursor else ""
+    cursor_variable = ", $cursor: String" if include_cursor else ""
+    return f"""
+query($owner: String!, $name: String!, $limit: Int!{cursor_variable}) {{
+  repository(owner: $owner, name: $name) {{
+    pullRequests(
+      states: MERGED,
+      first: $limit{cursor_argument},
+      orderBy: {{field: UPDATED_AT, direction: DESC}}
+    ) {{
+      nodes {{
+        number
+        title
+        body
+        mergedAt
+        url
+        author {{ login }}
+        mergeCommit {{ oid }}
+      }}
+      pageInfo {{ hasNextPage endCursor }}
+    }}
+  }}
+}}
+"""
+
+
+def _release_pull_requests_from_items(items: object) -> list[ReleasePullRequest]:
+    if not isinstance(items, list):
+        raise ReleaseError("merged PR JSON did not contain a node list")
     prs: list[ReleasePullRequest] = []
-    for item in data:
+    for item in items:
+        if not isinstance(item, dict):
+            continue
         author = item.get("author") or {}
         merge_commit = item.get("mergeCommit") or {}
-        login = author.get("login")
-        oid = merge_commit.get("oid")
+        login = author.get("login") if isinstance(author, dict) else None
+        oid = merge_commit.get("oid") if isinstance(merge_commit, dict) else None
         if not login or not oid:
             continue
         prs.append(

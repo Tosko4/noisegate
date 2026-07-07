@@ -14,6 +14,7 @@ on:
 permissions:
   contents: write
   id-token: write
+  pull-requests: read
 
 concurrency:
   group: release-${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
@@ -116,11 +117,13 @@ jobs:
 
       - name: Build release notes
         env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           RELEASE_REF: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
         run: |
           set -euo pipefail
           RELEASE_TAG="v${RELEASE_REF#v}"
-          uv run python scripts/build_release_notes.py "$RELEASE_TAG" --output dist/release-notes.md
+          uv run python scripts/build_release_notes.py "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --output dist/release-notes.md
 
       - name: Publish GitHub Release
         env:
