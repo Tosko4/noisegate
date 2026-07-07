@@ -609,12 +609,25 @@ def test_wrap_cli_kills_sigterm_ignoring_descendant_on_interrupt(tmp_path: Path)
 def _assert_process_exited(pid: int) -> None:
     deadline = time.monotonic() + 1
     while time.monotonic() < deadline:
+        if _process_is_zombie(pid):
+            return
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
             return
         time.sleep(0.02)
     raise AssertionError(f"process still alive: {pid}")
+
+
+def _process_is_zombie(pid: int) -> bool:
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        return stat_text.rsplit(")", 1)[1].lstrip().startswith("Z ")
+    except IndexError:
+        return False
 
 
 def sh_quote(value: str) -> str:

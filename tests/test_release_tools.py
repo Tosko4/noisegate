@@ -231,6 +231,26 @@ def test_git_contributor_names_ignores_synthetic_merge_commits(monkeypatch, tmp_
     assert calls == [["/usr/bin/git", "log", "--no-merges", "--format=%aN%x00%aE"]]
 
 
+def test_git_contributor_names_ignores_codex_automation_author(
+    monkeypatch, tmp_path: Path
+) -> None:
+    def fake_run(argv, **_kwargs):
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=(
+                "Tosko4\x001294707+Tosko4@users.noreply.github.com\n"
+                "Codex\x00codex@openai.com\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("scripts.release_tools.shutil.which", lambda _name: "/usr/bin/git")
+    monkeypatch.setattr("scripts.release_tools.subprocess.run", fake_run)
+
+    assert git_contributor_names(tmp_path) == ["Tosko4"]
+
+
 def test_git_contributor_names_wraps_git_log_failure(monkeypatch, tmp_path: Path) -> None:
     def fake_run(argv, **_kwargs):
         raise subprocess.CalledProcessError(128, argv, stderr="not a git repository")

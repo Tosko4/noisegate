@@ -198,7 +198,10 @@ def git_contributor_names(root: Path) -> list[str]:
 def _normalized_contributor_name(git_log_line: str) -> str:
     name, separator, email = git_log_line.strip().partition("\x00")
     if separator:
-        match = GITHUB_NOREPLY_RE.match(email.strip())
+        email = email.strip()
+        if email.lower() == "codex@openai.com":
+            return ""
+        match = GITHUB_NOREPLY_RE.match(email)
         if match:
             return match.group("login")
     return name.strip()
