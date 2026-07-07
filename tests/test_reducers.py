@@ -646,6 +646,127 @@ def test_recovery_notices_do_not_emit_partial_important_markers() -> None:
     assert "\nomitted after important output]" not in result.text
 
 
+def test_tight_recovery_notice_is_dropped_instead_of_failure_line() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index} " + ("x" * 20) for index in range(20)],
+            "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+            *[f"teardown {index} " + ("z" * 20) for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=options(
+            max_chars=80,
+            max_lines=3,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=1,
+        ),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 80
+    assert len(result.text.splitlines()) <= 3
+    assert "FAILED tests/test_middle.py::test_breaks - AssertionError: boom" in result.text
+    assert "exit_code=1" not in result.text
+
+
+def test_tight_important_excerpt_does_not_slice_omission_marker() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index} " + ("x" * 20) for index in range(20)],
+            "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+            *[f"teardown {index} " + ("z" * 20) for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=options(
+            max_chars=35,
+            max_lines=3,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=1,
+        ),
+    )
+
+    assert result.changed is False or len(result.text) <= 35
+    assert "ted 20 lines]" not in result.text
+    assert "itted 20 lines]" not in result.text
+    assert "mitted 20 lines]" not in result.text
+    assert "tted 20 lines]" not in result.text
+    if result.changed:
+        assert "FAILED" in result.text
+
+
+def test_tight_important_excerpt_does_not_slice_marker_suffix_lines() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index} " + ("x" * 20) for index in range(20)],
+            "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+            *[f"teardown {index} " + ("z" * 20) for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=options(
+            max_chars=80,
+            max_lines=4,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=1,
+        ),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 80
+    assert len(result.text.splitlines()) <= 4
+    assert "FAILED tests/test_middle.py::test_breaks - AssertionError: boom" in result.text
+    assert "lines]" not in result.text
+    assert "exit_code=1" not in result.text
+
+
+def test_tight_important_excerpt_does_not_slice_numeric_marker_suffixes() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index} " + ("x" * 20) for index in range(30)],
+            "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+            *[f"teardown {index} " + ("z" * 20) for index in range(30)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=options(
+            max_chars=84,
+            max_lines=5,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=1,
+        ),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 84
+    assert len(result.text.splitlines()) <= 5
+    assert "FAILED tests/test_middle.py::test_breaks - AssertionError: boom" in result.text
+    assert "lines]" not in result.text
+    assert "chars]" not in result.text
+    assert "exit_code=1" not in result.text
+
+
 def test_node_reducer_tight_budget_preserves_node_error() -> None:
     raw = "\n".join(
         [
@@ -670,7 +791,10 @@ def test_node_reducer_tight_budget_preserves_node_error() -> None:
 def test_artifact_notice_only_does_not_replace_preserved_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    store_calls: list[str] = []
+
     def fake_store(text: str, options: NoisegateOptions) -> dict[str, object]:
+        store_calls.append(text)
         return {
             "stored": True,
             "id": "ng_" + ("a" * 24),
@@ -702,6 +826,13 @@ def test_artifact_notice_only_does_not_replace_preserved_failure(
     assert result.changed is True
     assert len(result.text) <= 110
     assert "FAILED" in result.text
+    assert "noisegate artifact:" not in result.text
+    assert result.metadata["artifact"] == {
+        "stored": False,
+        "reason": "recovery_notice_dropped",
+        "size_bytes": len(raw.encode()),
+    }
+    assert store_calls == []
 
 
 def test_changed_outputs_always_fit_configured_budgets() -> None:
