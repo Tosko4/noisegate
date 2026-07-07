@@ -14,6 +14,8 @@ from ._version import __version__
 DEFAULT_PACKAGE_SPEC = f"noisegate-hermes=={__version__}"
 PYTHON_ENV_VARS = ("PYTHONHOME", "PYTHONPATH")
 SHELL_LAUNCHER_NAMES = {"bash", "dash", "sh", "zsh"}
+WINDOWS_LAUNCHER_SUFFIXES = {".bat", ".cmd", ".exe"}
+WINDOWS_PYTHON_CANDIDATES = ("python.exe", "python3.exe", "python", "python3")
 SHELL_ASSIGNMENT_RE = re.compile(
     r"^([A-Za-z_][A-Za-z0-9_]*)=(?P<quote>[\"']?)(.*?)(?P=quote)$"
 )
@@ -121,6 +123,8 @@ def _python_from_launcher(executable: Path, *, seen: set[Path] | None = None) ->
     except (OSError, IndexError) as exc:
         raise InstallHermesError(f"Cannot read Hermes launcher shebang: {executable}") from exc
     if not first_line.startswith("#!"):
+        if _looks_like_windows_launcher(executable):
+            return _python_from_windows_launcher(executable)
         raise InstallHermesError(f"Hermes launcher has no Python shebang: {executable}")
     parts = shlex.split(first_line[2:].strip())
     if not parts:
@@ -157,6 +161,21 @@ def _python_from_shell_launcher(executable: Path, text: str, *, seen: set[Path])
             if target is not None and target.exists():
                 return _python_from_launcher(target, seen=seen)
     raise InstallHermesError(f"Unsupported Hermes shell launcher: {executable}")
+
+
+def _looks_like_windows_launcher(executable: Path) -> bool:
+    return executable.suffix.lower() in WINDOWS_LAUNCHER_SUFFIXES
+
+
+def _python_from_windows_launcher(executable: Path) -> str:
+    for name in WINDOWS_PYTHON_CANDIDATES:
+        candidate = executable.parent / name
+        if candidate.exists():
+            return _validated_python_command(str(candidate))
+    raise InstallHermesError(
+        "Hermes Windows launcher has no adjacent virtual-environment Python: "
+        f"{executable}"
+    )
 
 
 def _shell_assignments(text: str) -> dict[str, str]:

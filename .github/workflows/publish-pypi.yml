@@ -19,10 +19,11 @@ jobs:
     environment: pypi
 
     steps:
-      - name: Checkout
+      - name: Checkout release tag
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ startsWith(inputs.version, 'v') && inputs.version || format('v{0}', inputs.version) }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5

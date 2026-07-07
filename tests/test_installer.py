@@ -183,6 +183,50 @@ def test_build_install_hermes_plan_accepts_existing_custom_named_venv(
     assert plan.hermes_python == str(python)
 
 
+def test_build_install_hermes_plan_supports_windows_exe_launcher(
+    tmp_path: Path,
+) -> None:
+    scripts = tmp_path / "venv" / "Scripts"
+    scripts.mkdir(parents=True)
+    python = scripts / "python.exe"
+    python.write_bytes(b"")
+    (tmp_path / "venv" / "pyvenv.cfg").write_text("home = C:\\Python311\n", encoding="utf-8")
+    hermes = scripts / "hermes.exe"
+    hermes.write_bytes(b"MZ\x00\x00binary launcher")
+
+    plan = build_install_hermes_plan(hermes=str(hermes), installer="pip")
+
+    assert plan.hermes_python == str(python)
+
+
+def test_build_install_hermes_plan_supports_windows_cmd_launcher(
+    tmp_path: Path,
+) -> None:
+    scripts = tmp_path / "venv" / "Scripts"
+    scripts.mkdir(parents=True)
+    python = scripts / "python.exe"
+    python.write_bytes(b"")
+    (tmp_path / "venv" / "pyvenv.cfg").write_text("home = C:\\Python311\n", encoding="utf-8")
+    hermes = scripts / "hermes.cmd"
+    hermes.write_text("@echo off\r\nhermes.exe %*\r\n", encoding="utf-8")
+
+    plan = build_install_hermes_plan(hermes=str(hermes), installer="pip")
+
+    assert plan.hermes_python == str(python)
+
+
+def test_build_install_hermes_plan_rejects_windows_launcher_without_venv_python(
+    tmp_path: Path,
+) -> None:
+    scripts = tmp_path / "Scripts"
+    scripts.mkdir()
+    hermes = scripts / "hermes.exe"
+    hermes.write_bytes(b"MZ\x00\x00binary launcher")
+
+    with pytest.raises(InstallHermesError, match="no adjacent virtual-environment Python"):
+        build_install_hermes_plan(hermes=str(hermes), installer="pip")
+
+
 def test_build_install_hermes_plan_supports_bash_env_shim_to_python(
     tmp_path: Path,
 ) -> None:

@@ -177,6 +177,18 @@ def test_sdist_includes_npm_release_metadata() -> None:
     assert "/npm" in include
 
 
+def test_standalone_publish_workflows_checkout_requested_tag() -> None:
+    root = Path(__file__).resolve().parents[1]
+    expected_ref = (
+        "ref: ${{ startsWith(inputs.version, 'v') "
+        "&& inputs.version || format('v{0}', inputs.version) }}"
+    )
+    for workflow in ("publish-pypi.yml", "publish-npm.yml"):
+        text = (root / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
+        assert "Checkout release tag" in text
+        assert expected_ref in text
+
+
 def test_release_scripts_are_executable_from_repo_root() -> None:
     root = Path(__file__).resolve().parents[1]
     subprocess.run(
