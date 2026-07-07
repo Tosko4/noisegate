@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import tomllib
 from pathlib import Path
+from typing import Any
 
 from scripts.release_tools import (
     ReleaseError,
@@ -151,24 +152,6 @@ def test_check_contributors_file_reports_missing_names(tmp_path: Path) -> None:
     assert missing == ["Charlie"]
 
 
-def test_git_contributor_names_ignores_merge_commits(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    captured: dict[str, object] = {}
-
-    def fake_run(argv, **kwargs):
-        captured["argv"] = argv
-        captured["cwd"] = kwargs.get("cwd")
-        return subprocess.CompletedProcess(argv, 0, stdout="Tosko4\n", stderr="")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    assert git_contributor_names(tmp_path) == ["Tosko4"]
-    assert captured["argv"] == ["git", "log", "--no-merges", "--format=%aN"]
-    assert captured["cwd"] == tmp_path
-
-
 def test_sdist_includes_npm_release_metadata() -> None:
     root = Path(__file__).resolve().parents[1]
     pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
@@ -196,3 +179,56 @@ def test_release_scripts_are_executable_from_repo_root() -> None:
         cwd=root,
         check=True,
     )
+
+
+def test_git_contributor_names_ignores_merge_commits(monkeypatch: Any, tmp_path: Path) -> None:
+    seen_args: list[str] = []
+
+    def fake_run(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        seen_args.extend(args)
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            stdout=(
+                "Alice\x00123+Alice@users.noreply.github.com\n"
+                "Display Name\x00Bob@users.noreply.github.com\n"
+                "Alice\x00123+Alice@users.noreply.github.com\n"
+            ),
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert git_contributor_names(tmp_path) == ["Alice", "Bob"]
+    assert "--no-merges" in seen_args
+    assert "--format=%aN%x00%aE" in seen_args
+
+
+def test_git_contributor_names_reports_git_failures(monkeypatch: Any, tmp_path: Path) -> None:
+    def fake_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.CalledProcessError(
+            128,
+            ["git", "log", "--format=%aN"],
+            stderr="fatal: not a git repository",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    try:
+        git_contributor_names(tmp_path)
+    except ReleaseError as exc:
+        assert "git log failed while reading contributor names" in str(exc)
+        assert "fatal: not a git repository" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected git failure to be wrapped")
+
+
+def test_git_contributor_names_reports_missing_root(tmp_path: Path) -> None:
+    missing = tmp_path / "missing"
+
+    try:
+        git_contributor_names(missing)
+    except ReleaseError as exc:
+        assert "repository root does not exist while reading contributor names" in str(exc)
+        assert str(missing) in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected missing root to be wrapped")

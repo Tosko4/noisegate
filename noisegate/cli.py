@@ -10,7 +10,7 @@ from typing import Any
 
 from ._version import __version__
 from .artifacts import ArtifactError, ArtifactStore
-from .engine import NoisegateOptions, _is_compactable_tool_name, reduce_text
+from .engine import NoisegateOptions, _is_compactable_tool_name, env_diagnostics, reduce_text
 from .installer import DEFAULT_PACKAGE_SPEC, InstallHermesError, install_hermes
 from .plugin import transform_tool_result
 from .wrap import DEFAULT_MAX_CAPTURE_BYTES, WrappedCommandInterrupted, run_wrapped_command
@@ -179,6 +179,13 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
     print(f"package: ok ({dist_version})")
     print("plugin: ok (transform_tool_result, transform_terminal_output)")
     print(f"entrypoint: {_entrypoint_status()}")
+    diagnostics = env_diagnostics()
+    if diagnostics:
+        print("environment: warnings")
+        for diagnostic in diagnostics:
+            print(f"- {diagnostic}")
+    else:
+        print("environment: ok")
     options = NoisegateOptions.from_env()
     artifact_dir = options.artifact_dir or ArtifactStore.from_env().root
     if options.artifact_enabled:

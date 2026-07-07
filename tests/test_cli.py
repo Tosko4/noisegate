@@ -168,6 +168,26 @@ def test_doctor_cli_reports_health(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr
     assert "Noisegate doctor" in proc.stdout
     assert "package: ok" in proc.stdout
+    assert "environment: ok" in proc.stdout
+    assert "artifacts: disabled" in proc.stdout
+
+
+def test_doctor_cli_reports_invalid_environment_values(tmp_path: Path) -> None:
+    proc = run_cli(
+        "doctor",
+        env={
+            "NOISEGATE_ARTIFACT_DIR": str(tmp_path / "artifacts"),
+            "NOISEGATE_DISABLE": "definitely",
+            "NOISEGATE_ARTIFACTS": "sometimes",
+            "NOISEGATE_ARTIFACT_SIZE_CAP": "-1",
+        },
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "environment: warnings" in proc.stdout
+    assert "NOISEGATE_DISABLE='definitely' is not recognized" in proc.stdout
+    assert "NOISEGATE_ARTIFACTS='sometimes' is not recognized" in proc.stdout
+    assert "NOISEGATE_ARTIFACT_SIZE_CAP='-1' is invalid" in proc.stdout
     assert "artifacts: disabled" in proc.stdout
 
 

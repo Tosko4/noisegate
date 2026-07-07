@@ -72,7 +72,7 @@ class NoisegateOptions:
             enabled=enabled,
             artifact_enabled=_env_flag("NOISEGATE_ARTIFACTS", default=False),
             artifact_dir=Path(artifact_dir).expanduser() if artifact_dir else None,
-            artifact_size_cap=_parse_int(
+            artifact_size_cap=_parse_nonnegative_int(
                 os.environ.get("NOISEGATE_ARTIFACT_SIZE_CAP"),
                 DEFAULT_SIZE_CAP,
             ),
@@ -130,6 +130,38 @@ class ReducedOutput:
     text: str
     changed: bool
     metadata: dict[str, JsonValue]
+
+
+def env_diagnostics(environ: Mapping[str, str] | None = None) -> list[str]:
+    """Return human-readable warnings for ignored or fallback environment values."""
+    env = environ if environ is not None else os.environ
+    diagnostics: list[str] = []
+    bool_vars = (
+        ("NOISEGATE", "controls whether compaction is enabled"),
+        ("NOISEGATE_DISABLE", "disables compaction when true"),
+        ("NOISEGATE_ARTIFACTS", "enables private artifact storage when true"),
+    )
+    accepted = ", ".join(sorted(TRUE_VALUES | FALSE_VALUES))
+    for name, description in bool_vars:
+        value = env.get(name)
+        if value is None or _parse_bool(value) is not None:
+            continue
+        diagnostics.append(
+            f"{name}={value!r} is not recognized; ignored ({description}). "
+            f"Use one of: {accepted}."
+        )
+
+    cap_value = env.get("NOISEGATE_ARTIFACT_SIZE_CAP")
+    if cap_value is not None:
+        parsed_cap = _parse_int(cap_value, -1)
+        if parsed_cap < 0:
+            diagnostics.append(
+                "NOISEGATE_ARTIFACT_SIZE_CAP="
+                f"{cap_value!r} is invalid; using {DEFAULT_SIZE_CAP}. "
+                "Set a non-negative integer byte cap."
+            )
+
+    return diagnostics
 
 
 def reduce_text(
@@ -803,6 +835,11 @@ def _parse_int(value: object, default: int) -> int:
         except ValueError:
             return default
     return default
+
+
+def _parse_nonnegative_int(value: object, default: int) -> int:
+    parsed = _parse_int(value, default)
+    return parsed if parsed >= 0 else default
 
 
 def _parse_bool(value: object) -> bool | None:
