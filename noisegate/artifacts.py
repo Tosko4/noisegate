@@ -13,6 +13,8 @@ from pathlib import Path
 
 DEFAULT_SIZE_CAP = 1_000_000
 ARTIFACT_ID_RE = re.compile(r"ng_[a-f0-9]{24,64}")
+TEMP_ARTIFACT_RE = re.compile(r"\.ng_[a-f0-9]{24,64}\.[^.]+\.tmp")
+TEMP_ARTIFACT_STALE_SECONDS = 60 * 60
 
 
 
@@ -89,6 +91,7 @@ class ArtifactStore:
             raise ArtifactTooLarge(len(data), self.size_cap)
 
         root = self._ensure_root()
+        self._cleanup_stale_temp_files(root)
         digest = hashlib.sha256(data).hexdigest()
         artifact_id = f"ng_{digest[:24]}"
         path = self._path_for(artifact_id, root=root)
@@ -161,6 +164,8 @@ class ArtifactStore:
         checks: list[ArtifactCheck] = []
         for path in sorted(root.iterdir()):
             if path.name.startswith("."):
+                if TEMP_ARTIFACT_RE.fullmatch(path.name):
+                    checks.append(self._check_temp_artifact(path))
                 continue
             if path.suffix != ".txt" or not path.name.startswith("ng_"):
                 continue
@@ -250,6 +255,41 @@ class ArtifactStore:
                 )
             )
         return checks
+
+    def _check_temp_artifact(self, path: Path) -> ArtifactCheck:
+        try:
+            stat_result = path.lstat()
+        except OSError as exc:
+            return ArtifactCheck(path.name, False, type(exc).__name__, str(path))
+        if path.is_symlink():
+            return ArtifactCheck(path.name, False, "temp_symlink", str(path))
+        if not stat.S_ISREG(stat_result.st_mode):
+            return ArtifactCheck(path.name, False, "temp_non_regular", str(path))
+        if stat_result.st_size > self.size_cap:
+            return ArtifactCheck(path.name, False, "temp_too_large", str(path))
+        if self._is_stale_temp(stat_result):
+            with suppress(FileNotFoundError):
+                path.unlink()
+            return ArtifactCheck(path.name, True, "stale_temp_removed", str(path))
+        return ArtifactCheck(path.name, False, "temp_file", str(path))
+
+    def _cleanup_stale_temp_files(self, root: Path) -> None:
+        for path in root.iterdir():
+            if not TEMP_ARTIFACT_RE.fullmatch(path.name):
+                continue
+            try:
+                stat_result = path.lstat()
+            except OSError:
+                continue
+            if path.is_symlink() or not stat.S_ISREG(stat_result.st_mode):
+                continue
+            if self._is_stale_temp(stat_result):
+                with suppress(FileNotFoundError):
+                    path.unlink()
+
+    def _is_stale_temp(self, stat_result: os.stat_result) -> bool:
+        now = datetime.now(UTC).timestamp()
+        return now - stat_result.st_mtime >= TEMP_ARTIFACT_STALE_SECONDS
 
 
     def _ensure_root(self) -> Path:

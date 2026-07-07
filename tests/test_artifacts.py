@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import stat
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -142,3 +143,38 @@ def test_artifact_store_handles_concurrent_same_content_writes(tmp_path: Path) -
     assert mode(tmp_path / "store") == 0o700
     assert mode(tmp_path / "store" / f"{artifact_id}.txt") == 0o600
     assert len(list((tmp_path / "store").glob("ng_*.txt"))) == 1
+    assert list((tmp_path / "store").glob(".ng_*.tmp")) == []
+
+
+def test_artifact_verify_reports_temp_files_without_exposing_raw_content(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "store", size_cap=10_000)
+    root = store._ensure_root()
+    temp_path = root / f".ng_{'a' * 24}.leftover.tmp"
+    temp_path.write_text("raw terminal output", encoding="utf-8")
+    os.chmod(temp_path, 0o600)
+
+    checks = store.verify()
+
+    assert len(checks) == 1
+    check = checks[0]
+    assert check.ok is False
+    assert check.reason == "temp_file"
+    assert "raw terminal output" not in check.artifact_id
+    assert "raw terminal output" not in check.path
+
+
+def test_artifact_store_cleans_stale_temp_files_before_writes(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "store", size_cap=10_000)
+    root = store._ensure_root()
+    temp_path = root / f".ng_{'a' * 24}.leftover.tmp"
+    temp_path.write_text("stale raw terminal output", encoding="utf-8")
+    os.chmod(temp_path, 0o600)
+    stale_time = time.time() - 7_200
+    os.utime(temp_path, (stale_time, stale_time))
+
+    artifact = store.store("new raw output")
+
+    assert store.read(artifact.artifact_id) == "new raw output"
+    assert not temp_path.exists()

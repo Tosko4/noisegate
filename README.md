@@ -342,7 +342,7 @@ noisegate artifacts stats --artifact-dir /tmp/noisegate-artifacts
 noisegate artifacts verify --artifact-dir /tmp/noisegate-artifacts
 ```
 
-`verify` recomputes hashes and returns a non-zero exit code if an artifact was tampered with or has an invalid private-store path.
+`verify` recomputes hashes and returns a non-zero exit code if an artifact was tampered with, has an invalid private-store path, or if a live temp artifact file is still present. Stale temp files created by interrupted writes are removed during verification/new writes without printing their raw contents.
 
 ## Hermes-LCM and memory layers
 

@@ -292,6 +292,21 @@ def test_reduce_cli_does_not_store_artifact_when_recovery_notice_cannot_fit(tmp_
     assert not artifact_dir.exists() or list(artifact_dir.iterdir()) == []
 
 
+def test_artifacts_verify_reports_temp_files_without_raw_content(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    temp_path = artifact_dir / f".ng_{'a' * 24}.leftover.tmp"
+    temp_path.write_text("raw terminal output", encoding="utf-8")
+    os.chmod(temp_path, 0o600)
+
+    proc = run_cli("artifacts", "verify", "--artifact-dir", str(artifact_dir))
+
+    assert proc.returncode == 2
+    assert "temp_file" in proc.stdout
+    assert "raw terminal output" not in proc.stdout
+    assert "raw terminal output" not in proc.stderr
+
+
 def test_wrap_cli_compacts_output_and_preserves_exit_code() -> None:
     script = (
         "import sys\n"

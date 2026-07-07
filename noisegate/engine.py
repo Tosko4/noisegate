@@ -775,8 +775,9 @@ def _has_usable_budget(text: str, options: NoisegateOptions) -> bool:
         return False
     if len(text) <= options.max_chars and _line_count(text) <= options.max_lines:
         return True
-    longest_marker = f"\n[noisegate: omitted {len(text)} chars]\n"
-    return options.max_chars >= len(longest_marker) + (MIN_HEAD_TAIL_CHARS * 2)
+    minimum_omitted = max(0, len(text) - MIN_HEAD_TAIL_CHARS)
+    longest_marker = f"\n[noisegate: omitted {minimum_omitted} chars]\n"
+    return options.max_chars >= len(longest_marker) + MIN_HEAD_TAIL_CHARS
 
 
 def _should_reduce(text: str, options: NoisegateOptions) -> bool:

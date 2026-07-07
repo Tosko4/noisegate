@@ -86,6 +86,16 @@ def test_char_budget_reduces_only_when_notice_and_content_fit() -> None:
     assert "[noisegate: omitted" in result.text
 
 
+def test_char_budget_accepts_tight_budget_that_can_fit_notice_and_content() -> None:
+    raw = "A" * 100
+
+    result = reduce_text(raw, options=options(max_chars=33))
+
+    assert result.changed is True
+    assert result.text == "A\n[noisegate: omitted 98 chars]\nA"
+    assert len(result.text) == 33
+
+
 def test_recovery_notices_do_not_exceed_budget_or_grow_output() -> None:
     raw = "A" * 130
 
