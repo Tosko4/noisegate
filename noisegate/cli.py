@@ -12,7 +12,13 @@ from typing import Any
 
 from ._version import __version__
 from .artifacts import ArtifactError, ArtifactStore
-from .engine import NoisegateOptions, _is_compactable_tool_name, env_diagnostics, reduce_text
+from .engine import (
+    NoisegateOptions,
+    _is_compactable_tool_name,
+    classify_command,
+    env_diagnostics,
+    reduce_text,
+)
 from .installer import DEFAULT_PACKAGE_SPEC, InstallHermesError, install_hermes
 from .plugin import transform_tool_result
 from .wrap import DEFAULT_MAX_CAPTURE_BYTES, WrappedCommandInterrupted, run_wrapped_command
@@ -323,9 +329,12 @@ def _reduce_json_value(
         )
         call_args = _combined_call_args(parsed.get("args"), parsed.get("arguments"))
         top_level_command = _extract_command_arg(parsed)
-        if not _has_command_arg(call_args) and top_level_command:
-            call_args = {**call_args, "command": top_level_command}
         result_text = parsed["result"]
+        if top_level_command and (
+            _is_protected_exact_command(top_level_command, result_text)
+            or not _has_command_arg(call_args)
+        ):
+            call_args = {**call_args, "command": top_level_command}
         transformed = transform_tool_result(
             result_text,
             tool_name=tool_name,
@@ -365,7 +374,10 @@ def _reduce_json_value(
         )
         call_args = _combined_call_args(parsed.get("args"), parsed.get("arguments"))
         top_level_command = _extract_command_arg(parsed)
-        if not _has_command_arg(call_args) and top_level_command:
+        if top_level_command and (
+            _is_protected_exact_command(top_level_command, raw)
+            or not _has_command_arg(call_args)
+        ):
             call_args = {**call_args, "command": top_level_command}
         if not tool_name and _looks_terminal_payload(parsed):
             tool_name = "terminal"
@@ -381,6 +393,10 @@ def _looks_terminal_payload(payload: dict[Any, Any]) -> bool:
 
 def _has_command_arg(args: dict[Any, Any]) -> bool:
     return bool(_extract_command_arg(args))
+
+
+def _is_protected_exact_command(command: str, text: str) -> bool:
+    return bool(command) and classify_command(command, text) in {"file_read", "git_diff", "patch"}
 
 
 def _combined_call_args(args: object, arguments: object) -> dict[Any, Any]:

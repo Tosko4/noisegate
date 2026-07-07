@@ -7,11 +7,13 @@ All notable changes to Noisegate are documented here. Release notes are generate
 ### Added
 - `noisegate reduce`, `reduce-json`, and `wrap` now accept `--metadata`/`--debug` to print diagnostic JSON to stderr without changing stdout.
 - Regression coverage now defines the `execute_code` print-output boundary across JSON, source, config, diff, test, web excerpt, dependency, package-manager, and invalid-text payloads.
+- Reducer coverage for real agent slop from apt, pip/uv, npm/pnpm/yarn, Docker, pytest/unittest, search, and inventory-style commands.
 
 ### Changed
 - `noisegate install-hermes --dry-run` now explicitly states that install/enable/doctor commands are not run and no Hermes restart/reload is performed.
 - Unchanged reduction metadata now reports more specific reason codes and the attempted reducer when a reducer could not produce a safe smaller output.
 - `noisegate doctor` now prints the effective runtime config, artifact directory, and artifact size cap alongside environment warnings.
+- Package-manager, Docker, and inventory reducers now preserve actionable failure signals such as apt lock/GPG/hash errors, dependency conflicts, npm/pnpm/yarn errors, Dockerfile/exit-code failures, and permission errors.
 
 ### Fixed
 - Preserve Hermes-LCM externalized payload placeholders and `externalized_ref` metadata while compacting noisy terminal-style output, without requiring Noisegate artifacts.

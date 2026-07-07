@@ -116,6 +116,9 @@ def transform_tool_result(
 
         payload: dict[str, JsonValue] = dict(parsed)
         command = _extract_command(payload, call_args)
+        payload_command = _extract_command(payload, {})
+        if _is_protected_exact_command(payload_command, result):
+            command = payload_command
         exit_code = _extract_exit_code(payload, tool_name)
         fields = _candidate_fields(tool_name, payload)
         field_metadata: dict[str, JsonValue] = {}
@@ -287,6 +290,10 @@ def _extract_command(payload: Mapping[str, JsonValue], args: Mapping[str, Any]) 
     if isinstance(argv, list) and all(isinstance(item, str) for item in argv):
         return shlex.join(argv)
     return ""
+
+
+def _is_protected_exact_command(command: str, text: str) -> bool:
+    return bool(command) and classify_command(command, text) in {"file_read", "git_diff", "patch"}
 
 
 def _extract_exit_code(payload: Mapping[str, JsonValue], tool_name: str) -> int | None:

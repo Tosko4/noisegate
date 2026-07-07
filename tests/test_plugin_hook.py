@@ -370,6 +370,21 @@ def test_terminal_tool_result_args_command_alias_wins_over_payload_command() -> 
     )
 
 
+def test_terminal_tool_result_protected_payload_command_wins_over_stale_args() -> None:
+    exact = source_like_payload()
+    raw = terminal_result(exact, command="cat src/source_fixture.py")
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="terminal",
+            args={"command": "pytest -q"},
+            noisegate_max_chars=200,
+        )
+        is None
+    )
+
+
 def test_terminal_tool_result_preserves_argv_file_display_with_metachar_paths() -> None:
     exact = source_like_payload()
     raw = terminal_result(exact, command="")
@@ -572,6 +587,64 @@ def test_transform_tool_result_artifact_notice_uses_original_output_for_preserva
     assert isinstance(stdout, str)
     assert "FAILED tests/test_middle.py::test_breaks - AssertionError: boom" in stdout
     assert "FAILED tests/test_middle\n" not in stdout
+
+
+def test_transform_tool_result_artifact_notice_uses_package_preservation_patterns() -> None:
+    patterns = plugin._preserve_patterns_for(
+        "apt-get --yes install imaginary-package",
+        "E: Unable to locate package imaginary-package",
+    )
+    pip_patterns = plugin._preserve_patterns_for(
+        "pip install demo",
+        "ERROR: Invalid requirement: bad@@",
+    )
+
+    assert patterns is not None
+    assert any(
+        pattern.search("E: Unable to locate package imaginary-package")
+        for pattern in patterns
+    )
+    assert any(
+        pattern.search("noise\nE: Sub-process /usr/bin/dpkg returned an error code (1)")
+        for pattern in patterns
+    )
+    assert pip_patterns is not None
+    assert any(
+        pattern.search("noise\nERROR: Invalid requirement: bad@@")
+        for pattern in pip_patterns
+    )
+
+
+def test_transform_tool_result_artifact_notice_preserves_package_error(
+    tmp_path: Path,
+) -> None:
+    original_stdout = "\n".join(
+        [
+            *["Reading package database " + ("x" * 40) for _ in range(20)],
+            "E: Unable to locate package imaginary-package",
+            *["tail apt output " + ("z" * 40) for _ in range(20)],
+        ]
+    )
+    raw = terminal_result(
+        original_stdout,
+        command="apt-get --yes install imaginary-package",
+        exit_code=100,
+    )
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        noisegate_max_chars=300,
+        noisegate_max_lines=10,
+        noisegate_artifacts=True,
+        noisegate_artifact_dir=str(tmp_path / "artifacts"),
+    )
+
+    payload = parse_hook_result(transformed)
+    stdout = payload["stdout"]
+    assert isinstance(stdout, str)
+    assert "Unable to locate package" in stdout
+    assert "Unable to locate\n" not in stdout
 
 
 def test_transform_tool_result_does_not_store_artifact_when_recovery_notice_drops(

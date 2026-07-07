@@ -706,7 +706,41 @@ def test_terminal_file_read_commands_are_protected_by_default() -> None:
 
     commands = (
         "cat important.txt",
+        "/bin/cat important.txt",
+        "bash -lc 'cat important.txt'",
+        "/bin/bash -lc 'cat important.txt'",
+        "env FOO=1 bash -lc 'cat important.txt'",
+        "env -i cat important.txt",
+        "env --ignore-environment cat important.txt",
+        "env -u FOO cat important.txt",
+        "env --unset FOO cat important.txt",
+        "env -C pkg cat important.txt",
+        "env --chdir pkg cat important.txt",
+        "env --argv0 display cat important.txt",
+        "sudo cat important.txt",
+        "sudo -n -u root cat important.txt",
+        "sudo -Eu root cat important.txt",
+        "sudo -nEu root cat important.txt",
+        "sudo -C 3 cat important.txt",
+        "sudo -D /tmp cat important.txt",
+        "sudo --chdir /tmp cat important.txt",
+        "doas cat important.txt",
+        "command cat important.txt",
+        "command -p cat important.txt",
+        "sudo env FOO=1 cat important.txt",
+        "doas env FOO=1 cat important.txt",
+        "command env FOO=1 cat important.txt",
+        "env env FOO=1 cat important.txt",
+        "/usr/bin/env FOO=1 bash -lc 'cat important.txt'",
+        "/usr/bin/env -i bash -lc 'cat important.txt'",
+        "cd pkg && cat important.txt",
+        "bash -lc 'cd pkg && cat important.txt'",
+        "bash -euo pipefail -c 'cat important.txt'",
+        "bash -O extglob -c 'cat important.txt'",
+        "bash --norc -c 'cat important.txt'",
+        "bash --posix -c 'cat important.txt'",
         "sed -n '1,200p' file",
+        "/usr/bin/sed -n '1,200p' file",
         "head -200 file",
         "tail -200 file",
     )
@@ -732,6 +766,24 @@ def test_source_like_terminal_file_display_commands_are_protected() -> None:
         "sed -n -e '1,200p' src/example.py",
         "cat 'src/A&B.py'",
         "cat 'src/A>B.py'",
+        "cat src/example.py >&2",
+        "cat src/example.py 1>&2",
+        "cat src/example.py 2>&1",
+        "cat src/example.py 2>/dev/null",
+        "cat < src/example.py",
+        "cat <src/example.py",
+        "cat 0<src/example.py",
+        "sed -n '1,200p' < src/example.py",
+        "sed -n '1,200p' <src/example.py",
+        "sed -n '1,200p' 0<src/example.py",
+        "find . -execdir cat {} +",
+        "/usr/bin/find . -exec cat {} \\;",
+        "find . -exec cat {} + 2>/dev/null",
+        "fd TODO . -x cat {}",
+        "find . -exec sed -n '1,80p' {} +",
+        "find . -execdir sed -n '1,80p' {} +",
+        "fd TODO . -x sed -n '1,80p' {}",
+        "fd TODO . --exec sed -n '1,80p' {}",
         "nl -ba src/example.py",
         "bat --paging=never src/example.py",
     )
@@ -752,11 +804,21 @@ def test_shell_substitution_file_display_commands_are_not_file_read() -> None:
 
     for command in (
         "cat $(pytest -q)",
+        "cat <(pytest -q)",
+        "cat < <(pytest -q)",
+        "cat <<EOF",
+        "cat <<<payload",
         "cat `pytest -q`",
         "cat \"$(pytest -q)\"",
+        "bash -lc 'cat $(pytest -q)'",
+        "bash --norc -c 'cat $(pytest -q)'",
         "cat 'file\\'; pytest -q",
         "nl -ba src/foo.py\npytest -q",
         "nl -ba src/foo.py\r\npytest -q",
+        "bash -lc 'nl -ba src/foo.py\npytest -q'",
+        "bash -lc 'cat src/foo.py\npytest -q'",
+        "cat important.txt |& pytest -q",
+        "bash -lc 'cat important.txt & pytest -q'",
     ):
         assert engine.classify_command(command, raw) != "file_read", command
 
@@ -829,6 +891,20 @@ def test_git_diff_is_protected_by_default() -> None:
     )
 
     result = reduce_text(raw, command="git diff -- app.py", options=options())
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reducer"] == "protected_diff"
+
+
+def test_wrapped_git_diff_name_output_is_protected_by_command_intent() -> None:
+    raw = "\n".join([f"src/changed_{index:03d}.py" for index in range(120)])
+
+    result = reduce_text(
+        raw,
+        command="env CI=1 bash -lc 'git diff --name-only'",
+        options=options(max_chars=120, max_lines=8),
+    )
 
     assert result.changed is False
     assert result.text == raw
@@ -1755,7 +1831,8 @@ def test_direct_node_command_preserves_error_line() -> None:
         assert "[noisegate: omitted" in result.text
 
 
-def test_vitest_command_preserves_error_line() -> None:
+@pytest.mark.parametrize("command", ("npx vitest run", "./node_modules/.bin/vitest run"))
+def test_vitest_command_preserves_error_line(command: str) -> None:
     raw = "\n".join(
         [
             *[f"setup {index}" for index in range(20)],
@@ -1767,7 +1844,7 @@ def test_vitest_command_preserves_error_line() -> None:
 
     result = reduce_text(
         raw,
-        command="npx vitest run",
+        command=command,
         exit_code=1,
         options=options(max_chars=120, max_lines=6, head_lines=1, tail_lines=1),
     )
@@ -1870,6 +1947,1431 @@ def test_artifact_notice_only_does_not_replace_preserved_failure(
     assert result.text == raw
     assert result.metadata["reason"] == "reducer_no_output"
     assert store_calls == []
+
+
+def test_inventory_artifact_notice_preserves_prefixed_error_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_store(text: str, options: NoisegateOptions) -> dict[str, object]:
+        return {
+            "stored": True,
+            "id": "ng_" + ("a" * 24),
+            "sha256": "b" * 64,
+            "size_bytes": len(text.encode()),
+        }
+
+    monkeypatch.setattr(engine, "_store_artifact", fake_store)
+    raw = "\n".join(
+        [
+            *[f"./src/generated/file {index:03d} " + ("x" * 40) for index in range(20)],
+            "find: paths must precede expression: `-name'",
+            *[f"./tests/generated/file {index:03d} " + ("z" * 40) for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="find . -type f",
+        exit_code=1,
+        options=options(
+            max_chars=260,
+            max_lines=8,
+            head_lines=1,
+            tail_lines=1,
+            artifact_enabled=True,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.metadata["command_class"] == "inventory"
+    assert "find: paths must precede expression" in result.text
+    assert "[noisegate artifact: id=ng_" in result.text
+
+
+def _real_agent_lines(prefix: str, count: int) -> list[str]:
+    return [f"{prefix} {index:03d}" for index in range(1, count + 1)]
+
+
+def _with_noise(before: list[str], signal: list[str], after: list[str] | None = None) -> str:
+    return "\n".join([*before, *signal, *(after or [])])
+
+
+def test_fd_exec_commands_are_not_inventory_slop() -> None:
+    commands = (
+        "fd TODO . -x sh -c 'printf %s {}'",
+        "find . -execdir pytest {} +",
+    )
+
+    for command in commands:
+        assert engine.classify_command(command, "candidate output") == "generic"
+
+
+def test_search_commands_with_package_terms_stay_search() -> None:
+    commands = (
+        "rg uv sync README.md",
+        "rg apt install README.md",
+        "grep pip install README.md",
+    )
+
+    for command in commands:
+        assert engine.classify_command(command, "README.md: package command example") == "search"
+
+
+@pytest.mark.parametrize(
+    ("command", "raw", "command_class"),
+    [
+        (
+            "apt-get update",
+            _with_noise(
+                _real_agent_lines("Hit: package index mirror", 35),
+                ["Reading package lists... Done"],
+                _real_agent_lines("Fetched translation metadata", 35),
+            ),
+            "os_package",
+        ),
+        (
+            "apt install -y curl",
+            _with_noise(
+                _real_agent_lines("Selecting package", 35),
+                [
+                    "0 upgraded, 1 newly installed, 0 to remove and 8 not upgraded",
+                    "Setting up curl (8.5.0-2ubuntu10) ...",
+                ],
+                _real_agent_lines("Processing triggers for man-db", 35),
+            ),
+            "os_package",
+        ),
+        (
+            "python -m pip install requests",
+            _with_noise(
+                _real_agent_lines("Collecting transitive dependency", 35),
+                [
+                    "Successfully installed certifi-2025.1.31 "
+                    "charset-normalizer-3.4.1 requests-2.32.3"
+                ],
+                _real_agent_lines("Using cached wheel", 35),
+            ),
+            "dependency_install",
+        ),
+        (
+            "uv sync",
+            _with_noise(
+                _real_agent_lines("Resolved package", 35),
+                ["Resolved 86 packages in 14ms", "Installed 86 packages in 120ms"],
+                _real_agent_lines(" + dependency", 35),
+            ),
+            "dependency_install",
+        ),
+        (
+            "uv pip install pytest",
+            _with_noise(
+                _real_agent_lines("Resolved wheel", 35),
+                ["Resolved 8 packages in 4ms", "Installed 8 packages in 11ms"],
+                _real_agent_lines(" + pytest dependency", 35),
+            ),
+            "dependency_install",
+        ),
+        (
+            "npm install",
+            _with_noise(
+                _real_agent_lines("npm fetch GET 200", 35),
+                ["added 184 packages, and audited 185 packages in 7s", "found 0 vulnerabilities"],
+                _real_agent_lines("npm timing idealTree", 35),
+            ),
+            "node",
+        ),
+        (
+            "pnpm install",
+            _with_noise(
+                _real_agent_lines("Progress: resolved package", 35),
+                ["Packages: +184", "Done in 4.2s"],
+                _real_agent_lines("Progress: downloaded package", 35),
+            ),
+            "node",
+        ),
+        (
+            "yarn install",
+            _with_noise(
+                _real_agent_lines("YN0000: Resolving package", 35),
+                ["➤ YN0000: Done with warnings in 3s 221ms"],
+                _real_agent_lines("YN0000: Fetch step", 35),
+            ),
+            "node",
+        ),
+        (
+            "npm test",
+            _with_noise(
+                _real_agent_lines("PASS packages/pkg/test", 35),
+                ["Test Suites: 12 passed, 12 total", "Tests: 248 passed, 248 total"],
+                _real_agent_lines("coverage line", 35),
+            ),
+            "node",
+        ),
+        (
+            "pnpm test",
+            _with_noise(
+                _real_agent_lines("✓ package tests passed", 35),
+                ["Tests: 248 passed, 248 total"],
+                _real_agent_lines("coverage line", 35),
+            ),
+            "node",
+        ),
+        (
+            "yarn test",
+            _with_noise(
+                _real_agent_lines("YN0000: Running test shard", 35),
+                ["Test Suites: 12 passed, 12 total"],
+                _real_agent_lines("YN0000: Test output", 35),
+            ),
+            "node",
+        ),
+        (
+            "docker build .",
+            _with_noise(
+                _real_agent_lines("#1 CACHED layer", 35),
+                ["#18 exporting to image", "#18 DONE 0.7s"],
+                _real_agent_lines("#19 naming layer", 35),
+            ),
+            "docker_build",
+        ),
+        (
+            "docker compose build",
+            _with_noise(
+                _real_agent_lines("=> CACHED service layer", 35),
+                ["=> exporting layers", "=> naming to local/app:latest"],
+                _real_agent_lines("=> DONE service layer", 35),
+            ),
+            "docker_build",
+        ),
+        (
+            "docker compose --profile web --env-file .env --parallel 4 build",
+            _with_noise(
+                _real_agent_lines("=> CACHED service layer", 35),
+                ["=> exporting layers", "=> naming to local/app:latest"],
+                _real_agent_lines("=> DONE service layer", 35),
+            ),
+            "docker_build",
+        ),
+        (
+            "pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_module.py .", 35),
+                ["84 passed in 3.42s"],
+                _real_agent_lines("tests/test_more.py .", 35),
+            ),
+            "pytest",
+        ),
+        (
+            "python -m unittest discover",
+            _with_noise(
+                _real_agent_lines("test_case ok", 35),
+                ["Ran 84 tests in 3.420s", "OK"],
+                _real_agent_lines("test_more ok", 35),
+            ),
+            "unittest",
+        ),
+        (
+            "find . -type f",
+            _with_noise(
+                _real_agent_lines("./src/file", 40),
+                ["./pyproject.toml"],
+                _real_agent_lines("./tests/test_file", 40),
+            ),
+            "inventory",
+        ),
+        (
+            "rg TODO .",
+            _with_noise(
+                _real_agent_lines("src/module.py: TODO marker", 40),
+                ["tests/test_module.py: TODO regression"],
+                _real_agent_lines("docs/page.md: TODO mention", 40),
+            ),
+            "search",
+        ),
+        (
+            "bash -lc 'rg TODO .'",
+            _with_noise(
+                _real_agent_lines("src/module.py: TODO marker", 40),
+                ["tests/test_module.py: TODO regression"],
+                _real_agent_lines("docs/page.md: TODO mention", 40),
+            ),
+            "search",
+        ),
+    ],
+)
+def test_real_agent_slop_success_outputs_are_strongly_compacted(
+    command: str,
+    raw: str,
+    command_class: str,
+) -> None:
+    result = reduce_text(
+        raw,
+        command=command,
+        options=options(max_chars=600, max_lines=18, head_lines=3, tail_lines=3),
+    )
+
+    assert result.changed is True
+    assert result.metadata["command_class"] == command_class
+    assert len(result.text) < len(raw) * 0.6
+    assert len(result.text.splitlines()) <= 18
+    assert "[noisegate: omitted" in result.text
+
+
+@pytest.mark.parametrize(
+    ("command", "raw", "command_class", "signals"),
+    [
+        (
+            "apt-get update",
+            _with_noise(
+                _real_agent_lines("Get: package index", 40),
+                [
+                    "W: GPG error: https://example.invalid stable InRelease: NO_PUBKEY DEADBEEF",
+                    "E: The repository 'https://example.invalid stable InRelease' is not signed.",
+                ],
+                _real_agent_lines("tail apt output", 40),
+            ),
+            "os_package",
+            ("GPG error", "not signed"),
+        ),
+        (
+            "apt-get update",
+            _with_noise(
+                _real_agent_lines("Get: package index", 40),
+                ["E: Failed to fetch https://mirror.invalid/Packages Hash Sum mismatch"],
+                _real_agent_lines("tail apt output", 40),
+            ),
+            "os_package",
+            ("Hash Sum mismatch",),
+        ),
+        (
+            "apt install -y imaginary-package",
+            _with_noise(
+                _real_agent_lines("Reading package database", 40),
+                ["E: Unable to locate package imaginary-package"],
+                _real_agent_lines("tail apt output", 40),
+            ),
+            "os_package",
+            ("Unable to locate package",),
+        ),
+        (
+            "apt-get --yes install imaginary-package",
+            _with_noise(
+                _real_agent_lines("Reading package database", 40),
+                ["E: Unable to locate package imaginary-package"],
+                _real_agent_lines("tail apt output", 40),
+            ),
+            "os_package",
+            ("Unable to locate package",),
+        ),
+        (
+            "apt-get -qq update",
+            _with_noise(
+                _real_agent_lines("Get: package index", 40),
+                ["E: Failed to fetch https://mirror.invalid/Packages Hash Sum mismatch"],
+                _real_agent_lines("tail apt output", 40),
+            ),
+            "os_package",
+            ("Hash Sum mismatch",),
+        ),
+        (
+            "apt-get -o Acquire::Retries=3 update",
+            _with_noise(
+                _real_agent_lines("Get: package index", 40),
+                ["E: Failed to fetch https://mirror.invalid/Packages Hash Sum mismatch"],
+                _real_agent_lines("tail apt output", 40),
+            ),
+            "os_package",
+            ("Hash Sum mismatch",),
+        ),
+        (
+            "apt-get -c apt.conf update",
+            _with_noise(
+                _real_agent_lines("Get: package index", 40),
+                ["E: Failed to fetch https://mirror.invalid/Packages Hash Sum mismatch"],
+                _real_agent_lines("tail apt output", 40),
+            ),
+            "os_package",
+            ("Hash Sum mismatch",),
+        ),
+        (
+            "bash -lc 'apt-get -o Acquire::Retries=3 update'",
+            _with_noise(
+                _real_agent_lines("Get: package index", 40),
+                ["E: Failed to fetch https://mirror.invalid/Packages Hash Sum mismatch"],
+                _real_agent_lines("tail apt output", 40),
+            ),
+            "os_package",
+            ("Hash Sum mismatch",),
+        ),
+        (
+            "apt install -y curl",
+            _with_noise(
+                _real_agent_lines("Reading package database", 40),
+                [
+                    "E: Could not get lock /var/lib/dpkg/lock-frontend. "
+                    "It is held by process 1234 (apt)"
+                ],
+                _real_agent_lines("tail apt output", 40),
+            ),
+            "os_package",
+            ("Could not get lock",),
+        ),
+        (
+            "apt-get -t stable install curl",
+            _with_noise(
+                _real_agent_lines("Reading package database", 40),
+                [
+                    "E: Could not get lock /var/lib/dpkg/lock-frontend. "
+                    "It is held by process 1234 (apt)"
+                ],
+                _real_agent_lines("tail apt output", 40),
+            ),
+            "os_package",
+            ("Could not get lock",),
+        ),
+        (
+            "apt-get --target-release stable install curl",
+            _with_noise(
+                _real_agent_lines("Reading package database", 40),
+                [
+                    "E: Could not get lock /var/lib/dpkg/lock-frontend. "
+                    "It is held by process 1234 (apt)"
+                ],
+                _real_agent_lines("tail apt output", 40),
+            ),
+            "os_package",
+            ("Could not get lock",),
+        ),
+        (
+            "apt-get remove imaginary-package",
+            _with_noise(
+                _real_agent_lines("Reading package database", 40),
+                ["E: Unable to locate package imaginary-package"],
+                _real_agent_lines("tail apt output", 40),
+            ),
+            "os_package",
+            ("Unable to locate package",),
+        ),
+        (
+            "apt-get install broken-package",
+            _with_noise(
+                _real_agent_lines("Unpacking package", 40),
+                ["E: Sub-process /usr/bin/dpkg returned an error code (1)"],
+                _real_agent_lines("tail apt output", 40),
+            ),
+            "os_package",
+            ("Sub-process /usr/bin/dpkg", "error code (1)"),
+        ),
+        (
+            "apt-get install imaginary-package && rg TODO .",
+            _with_noise(
+                _real_agent_lines("Reading package database", 40),
+                ["E: Unable to locate package imaginary-package"],
+                _real_agent_lines("README.md: TODO", 40),
+            ),
+            "os_package",
+            ("Unable to locate package",),
+        ),
+        (
+            "rg TODO . && apt-get install imaginary-package",
+            _with_noise(
+                _real_agent_lines("README.md: TODO", 40),
+                ["E: Unable to locate package imaginary-package"],
+                _real_agent_lines("tail apt output", 40),
+            ),
+            "os_package",
+            ("Unable to locate package",),
+        ),
+        (
+            "apt-get install imaginary-package && pytest -q",
+            _with_noise(
+                _real_agent_lines("Reading package database " + ("x" * 80), 70),
+                ["E: Unable to locate package imaginary-package"],
+                _real_agent_lines("tests/test_ok.py .", 40),
+            ),
+            "os_package",
+            ("Unable to locate package",),
+        ),
+        (
+            "npm install && pytest -q",
+            _with_noise(
+                _real_agent_lines("npm timing idealTree " + ("x" * 80), 70),
+                [
+                    "npm ERR! code ERESOLVE",
+                    "npm ERR! ERESOLVE could not resolve dependency conflict",
+                ],
+                _real_agent_lines("tests/test_ok.py .", 40),
+            ),
+            "node",
+            ("npm ERR!", "dependency conflict"),
+        ),
+        (
+            "python -m pip install demo",
+            _with_noise(
+                _real_agent_lines("Collecting dependency", 40),
+                [
+                    "ERROR: Cannot install demo because these package versions "
+                    "have conflicting dependencies.",
+                    "ResolutionImpossible: for help visit https://pip.pypa.io/",
+                ],
+                _real_agent_lines("tail pip output", 40),
+            ),
+            "dependency_install",
+            ("conflicting dependencies", "ResolutionImpossible"),
+        ),
+        (
+            "python -mpip install demo",
+            _with_noise(
+                _real_agent_lines("Collecting dependency", 40),
+                [
+                    "ERROR: Cannot install demo because these package versions "
+                    "have conflicting dependencies.",
+                    "ResolutionImpossible: for help visit https://pip.pypa.io/",
+                ],
+                _real_agent_lines("tail pip output", 40),
+            ),
+            "dependency_install",
+            ("conflicting dependencies", "ResolutionImpossible"),
+        ),
+        (
+            "python -m pip --disable-pip-version-check install demo",
+            _with_noise(
+                _real_agent_lines("Collecting dependency", 40),
+                [
+                    "ERROR: Cannot install demo because these package versions "
+                    "have conflicting dependencies.",
+                    "ResolutionImpossible: for help visit https://pip.pypa.io/",
+                ],
+                _real_agent_lines("tail pip output", 40),
+            ),
+            "dependency_install",
+            ("conflicting dependencies", "ResolutionImpossible"),
+        ),
+        (
+            "python -I -m pip --disable-pip-version-check install demo",
+            _with_noise(
+                _real_agent_lines("Collecting dependency", 40),
+                [
+                    "ERROR: Cannot install demo because these package versions "
+                    "have conflicting dependencies.",
+                    "ResolutionImpossible: for help visit https://pip.pypa.io/",
+                ],
+                _real_agent_lines("tail pip output", 40),
+            ),
+            "dependency_install",
+            ("conflicting dependencies", "ResolutionImpossible"),
+        ),
+        (
+            "pip --proxy http://proxy.invalid install demo",
+            _with_noise(
+                _real_agent_lines("Collecting dependency", 40),
+                [
+                    "ERROR: Cannot install demo because these package versions "
+                    "have conflicting dependencies.",
+                    "ResolutionImpossible: for help visit https://pip.pypa.io/",
+                ],
+                _real_agent_lines("tail pip output", 40),
+            ),
+            "dependency_install",
+            ("conflicting dependencies", "ResolutionImpossible"),
+        ),
+        (
+            "uv sync",
+            _with_noise(
+                _real_agent_lines("Resolved dependency", 40),
+                [
+                    "No solution found when resolving dependencies:",
+                    "╰─▶ Because app depends on missing-package, resolution failed.",
+                ],
+                _real_agent_lines("tail uv output", 40),
+            ),
+            "dependency_install",
+            ("No solution found", "resolution failed"),
+        ),
+        (
+            "uv --project . sync",
+            _with_noise(
+                _real_agent_lines("Resolved dependency", 40),
+                [
+                    "No solution found when resolving dependencies:",
+                    "╰─▶ Because app depends on missing-package, resolution failed.",
+                ],
+                _real_agent_lines("tail uv output", 40),
+            ),
+            "dependency_install",
+            ("No solution found", "resolution failed"),
+        ),
+        (
+            "uv pip install pytest",
+            _with_noise(
+                _real_agent_lines("Prepared distribution", 40),
+                ["error: Failed to prepare distributions", "Caused by: dependency conflict"],
+                _real_agent_lines("tail uv pip output", 40),
+            ),
+            "dependency_install",
+            ("Failed to prepare", "dependency conflict"),
+        ),
+        (
+            "pip install .",
+            _with_noise(
+                _real_agent_lines("Collecting dependency", 40),
+                [
+                    "Traceback (most recent call last):",
+                    '  File "setup.py", line 7, in <module>',
+                    "RuntimeError: boom",
+                ],
+                _real_agent_lines("tail pip output", 40),
+            ),
+            "dependency_install",
+            ("Traceback (most recent call last):", "RuntimeError: boom"),
+        ),
+        (
+            "uv sync",
+            _with_noise(
+                _real_agent_lines("Resolved dependency", 40),
+                [
+                    "Traceback (most recent call last):",
+                    '  File "build.py", line 7, in <module>',
+                    "RuntimeError: boom",
+                ],
+                _real_agent_lines("tail uv output", 40),
+            ),
+            "dependency_install",
+            ("Traceback (most recent call last):", "RuntimeError: boom"),
+        ),
+        (
+            "npm install",
+            _with_noise(
+                _real_agent_lines("npm timing idealTree", 40),
+                [
+                    "npm ERR! code ERESOLVE",
+                    "npm ERR! ERESOLVE could not resolve dependency conflict",
+                ],
+                _real_agent_lines("tail npm output", 40),
+            ),
+            "node",
+            ("npm ERR!", "dependency conflict"),
+        ),
+        (
+            "bash -lc 'npm install'",
+            _with_noise(
+                _real_agent_lines("npm timing idealTree", 40),
+                [
+                    "npm ERR! code ERESOLVE",
+                    "npm ERR! ERESOLVE could not resolve dependency conflict",
+                ],
+                _real_agent_lines("tail npm output", 40),
+            ),
+            "node",
+            ("npm ERR!", "dependency conflict"),
+        ),
+        (
+            "CI=1 npm install",
+            _with_noise(
+                _real_agent_lines("npm timing idealTree", 40),
+                [
+                    "npm ERR! code ERESOLVE",
+                    "npm ERR! ERESOLVE could not resolve dependency conflict",
+                ],
+                _real_agent_lines("tail npm output", 40),
+            ),
+            "node",
+            ("npm ERR!", "dependency conflict"),
+        ),
+        (
+            "bash -euxo pipefail -c 'npm install'",
+            _with_noise(
+                _real_agent_lines("npm timing idealTree", 40),
+                [
+                    "npm ERR! code ERESOLVE",
+                    "npm ERR! ERESOLVE could not resolve dependency conflict",
+                ],
+                _real_agent_lines("tail npm output", 40),
+            ),
+            "node",
+            ("npm ERR!", "dependency conflict"),
+        ),
+        (
+            "pnpm install",
+            _with_noise(
+                _real_agent_lines("Progress: resolved", 40),
+                [
+                    "pnpm ERR! code ERR_PNPM_PEER_DEP_ISSUES",
+                    "pnpm ERR! dependency conflict detected",
+                ],
+                _real_agent_lines("tail pnpm output", 40),
+            ),
+            "node",
+            ("pnpm ERR!", "dependency conflict"),
+        ),
+        (
+            "yarn install",
+            _with_noise(
+                _real_agent_lines("YN0000: Resolving", 40),
+                [
+                    "➤ YN0001: Error: awesome-package@npm:1.0.0: No candidates found",
+                    "➤ YN0000: Failed with errors in 2s 130ms",
+                ],
+                _real_agent_lines("tail yarn output", 40),
+            ),
+            "node",
+            ("YN0001: Error", "Failed with errors"),
+        ),
+        (
+            "npm test",
+            _with_noise(
+                _real_agent_lines("PASS packages/pkg/test.spec.ts", 40),
+                [
+                    "FAIL packages/app/component.test.ts",
+                    "Error: expected status 200, received 500",
+                    "Test Suites: 1 failed, 39 passed, 40 total",
+                ],
+                _real_agent_lines("tail npm test output", 40),
+            ),
+            "node",
+            ("FAIL packages/app", "expected status 200", "1 failed"),
+        ),
+        (
+            "pnpm test",
+            _with_noise(
+                _real_agent_lines("✓ package test ok", 40),
+                [
+                    "ELIFECYCLE Test failed. See above for more details.",
+                    "Error: snapshot mismatch in packages/ui/button.test.ts",
+                ],
+                _real_agent_lines("tail pnpm test output", 40),
+            ),
+            "node",
+            ("ELIFECYCLE", "snapshot mismatch"),
+        ),
+        (
+            "yarn test",
+            _with_noise(
+                _real_agent_lines("YN0000: Running test shard", 40),
+                [
+                    "➤ YN0001: Error: Command failed with exit code 1.",
+                    "Tests failed in workspace @app/web",
+                ],
+                _real_agent_lines("tail yarn test output", 40),
+            ),
+            "node",
+            ("YN0001: Error", "exit code 1", "Tests failed"),
+        ),
+        (
+            "docker build .",
+            _with_noise(
+                _real_agent_lines("#1 CACHED layer", 40),
+                [
+                    "#12 ERROR: failed to solve: process "
+                    '"/bin/sh -c npm test" did not complete successfully: exit code: 1',
+                    "Dockerfile:14",
+                ],
+                _real_agent_lines("tail docker output", 40),
+            ),
+            "docker_build",
+            ("failed to solve", "exit code", "Dockerfile:14"),
+        ),
+        (
+            "docker build .",
+            _with_noise(
+                _real_agent_lines("#1 CACHED layer", 40),
+                [
+                    "Traceback (most recent call last):",
+                    '  File "app.py", line 7, in <module>',
+                    "RuntimeError: boom",
+                ],
+                _real_agent_lines("tail docker output", 40),
+            ),
+            "docker_build",
+            ("Traceback (most recent call last):", "RuntimeError: boom"),
+        ),
+        (
+            "bash -lc 'docker build .'",
+            _with_noise(
+                _real_agent_lines("#1 CACHED layer", 40),
+                [
+                    "#12 ERROR: failed to solve: process "
+                    '"/bin/sh -c npm test" did not complete successfully: exit code: 1',
+                    "Dockerfile:14",
+                ],
+                _real_agent_lines("tail docker output", 40),
+            ),
+            "docker_build",
+            ("failed to solve", "exit code", "Dockerfile:14"),
+        ),
+        (
+            "docker buildx build .",
+            _with_noise(
+                _real_agent_lines("#1 CACHED layer", 40),
+                [
+                    "#12 ERROR: failed to solve: process "
+                    '"/bin/sh -c npm test" did not complete successfully: exit code: 1',
+                    "Dockerfile:14",
+                ],
+                _real_agent_lines("tail docker output", 40),
+            ),
+            "docker_build",
+            ("failed to solve", "exit code", "Dockerfile:14"),
+        ),
+        (
+            "docker image build .",
+            _with_noise(
+                _real_agent_lines("#1 CACHED layer", 40),
+                [
+                    "#12 ERROR: failed to solve: process "
+                    '"/bin/sh -c npm test" did not complete successfully: exit code: 1',
+                    "Dockerfile:14",
+                ],
+                _real_agent_lines("tail docker output", 40),
+            ),
+            "docker_build",
+            ("failed to solve", "exit code", "Dockerfile:14"),
+        ),
+        (
+            "docker --context default build .",
+            _with_noise(
+                _real_agent_lines("#1 CACHED layer", 40),
+                [
+                    "#12 ERROR: failed to solve: process "
+                    '"/bin/sh -c npm test" did not complete successfully: exit code: 1',
+                    "Dockerfile:14",
+                ],
+                _real_agent_lines("tail docker output", 40),
+            ),
+            "docker_build",
+            ("failed to solve", "exit code", "Dockerfile:14"),
+        ),
+        (
+            "docker --host unix:///var/run/docker.sock build .",
+            _with_noise(
+                _real_agent_lines("#1 CACHED layer", 40),
+                [
+                    "#12 ERROR: failed to solve: process "
+                    '"/bin/sh -c npm test" did not complete successfully: exit code: 1',
+                    "Dockerfile:14",
+                ],
+                _real_agent_lines("tail docker output", 40),
+            ),
+            "docker_build",
+            ("failed to solve", "exit code", "Dockerfile:14"),
+        ),
+        (
+            "docker -H unix:///var/run/docker.sock --log-level debug build .",
+            _with_noise(
+                _real_agent_lines("#1 CACHED layer", 40),
+                [
+                    "#12 ERROR: failed to solve: process "
+                    '"/bin/sh -c npm test" did not complete successfully: exit code: 1',
+                    "Dockerfile:14",
+                ],
+                _real_agent_lines("tail docker output", 40),
+            ),
+            "docker_build",
+            ("failed to solve", "exit code", "Dockerfile:14"),
+        ),
+        (
+            "env CI=1 docker --context default build .",
+            _with_noise(
+                _real_agent_lines("#1 CACHED layer", 40),
+                [
+                    "#12 ERROR: failed to solve: process "
+                    '"/bin/sh -c npm test" did not complete successfully: exit code: 1',
+                    "Dockerfile:14",
+                ],
+                _real_agent_lines("tail docker output", 40),
+            ),
+            "docker_build",
+            ("failed to solve", "exit code", "Dockerfile:14"),
+        ),
+        (
+            "docker compose build",
+            _with_noise(
+                _real_agent_lines("=> CACHED service layer", 40),
+                [
+                    "failed to solve: Dockerfile line 27: failed to compute cache key",
+                    "executor failed running [/bin/sh -c make build]: exit code: 2",
+                ],
+                _real_agent_lines("tail compose output", 40),
+            ),
+            "docker_build",
+            ("failed to solve", "Dockerfile line 27", "exit code"),
+        ),
+        (
+            "docker compose -f docker-compose.yml build",
+            _with_noise(
+                _real_agent_lines("=> CACHED service layer", 40),
+                [
+                    "failed to solve: Dockerfile line 27: failed to compute cache key",
+                    "executor failed running [/bin/sh -c make build]: exit code: 2",
+                ],
+                _real_agent_lines("tail compose output", 40),
+            ),
+            "docker_build",
+            ("failed to solve", "Dockerfile line 27", "exit code"),
+        ),
+        (
+            "docker compose --profile web build",
+            _with_noise(
+                _real_agent_lines("=> CACHED service layer", 40),
+                [
+                    'failed to solve: process "/bin/sh -c npm test" did not complete successfully',
+                    "exit code: 1",
+                ],
+                _real_agent_lines("tail compose output", 40),
+            ),
+            "docker_build",
+            ("failed to solve", "exit code"),
+        ),
+        (
+            "docker compose --progress plain build",
+            _with_noise(
+                _real_agent_lines("=> CACHED service layer", 40),
+                [
+                    'failed to solve: process "/bin/sh -c npm test" did not complete successfully',
+                    "exit code: 1",
+                ],
+                _real_agent_lines("tail compose output", 40),
+            ),
+            "docker_build",
+            ("failed to solve", "exit code"),
+        ),
+        (
+            "docker compose up --build",
+            _with_noise(
+                _real_agent_lines("=> CACHED service layer", 40),
+                [
+                    'failed to solve: process "/bin/sh -c npm test" did not complete successfully',
+                    "exit code: 1",
+                ],
+                _real_agent_lines("tail compose output", 40),
+            ),
+            "docker_build",
+            ("failed to solve", "exit code"),
+        ),
+        (
+            "docker compose --profile web up --build",
+            _with_noise(
+                _real_agent_lines("=> CACHED service layer", 40),
+                [
+                    "failed to solve: Dockerfile line 27: failed to compute cache key",
+                    "executor failed running [/bin/sh -c make build]: exit code: 2",
+                ],
+                _real_agent_lines("tail compose output", 40),
+            ),
+            "docker_build",
+            ("failed to solve", "Dockerfile line 27", "exit code"),
+        ),
+        (
+            "docker compose --progress plain up --build",
+            _with_noise(
+                _real_agent_lines("=> CACHED service layer", 40),
+                [
+                    "failed to solve: Dockerfile line 27: failed to compute cache key",
+                    "executor failed running [/bin/sh -c make build]: exit code: 2",
+                ],
+                _real_agent_lines("tail compose output", 40),
+            ),
+            "docker_build",
+            ("failed to solve", "Dockerfile line 27", "exit code"),
+        ),
+        (
+            "pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                [
+                    "FAILED tests/test_app.py::test_status - AssertionError: boom",
+                    "E       AssertionError: boom",
+                ],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "coverage run -m pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                [
+                    "ERROR tests/test_import.py - ImportError: boom",
+                    "ImportError: boom",
+                ],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("ERROR tests/test_import.py", "ImportError"),
+        ),
+        (
+            "bash -O extglob -c 'pytest -q'",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                [
+                    "FAILED tests/test_app.py::test_status - AssertionError: boom",
+                    "E       AssertionError: boom",
+                ],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "python -m unittest discover",
+            _with_noise(
+                _real_agent_lines("test_ok ok", 40),
+                ["FAILED (failures=1)", "AssertionError: boom"],
+                _real_agent_lines("tail unittest output", 40),
+            ),
+            "unittest",
+            ("FAILED (failures=1)", "AssertionError"),
+        ),
+        (
+            "uv sync && uv run pytest -q",
+            _with_noise(
+                _real_agent_lines("Resolved dependency", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "uv sync&&uv run pytest -q",
+            _with_noise(
+                _real_agent_lines("Resolved dependency", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "uv sync; uv run pytest -q",
+            _with_noise(
+                _real_agent_lines("Resolved dependency", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "bash -lc 'uv sync && uv run pytest -q'",
+            _with_noise(
+                _real_agent_lines("Resolved dependency", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "uv run python -m pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "uv run python -I -m pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "python -W ignore -m pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "python -X dev -m pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "python3.11 -m pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            ".venv/bin/python -m pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "/usr/bin/python3.11 -m pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "py -m pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "uv run python3.11 -m pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "/usr/bin/uv run pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            ".venv/bin/uv run pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "uv run --extra dev pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "uv run --package pkg --env-file .env --with-editable . pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "uv run -C build pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "uv run --refresh-package demo pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "poetry run pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "poetry -C pkg run pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "poetry --directory pkg run pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "poetry run -- pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "pdm -p pkg run pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "hatch -e test run pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "bash --norc -c 'pytest -q'",
+            _with_noise(
+                _real_agent_lines("tests/test_ok.py .", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "uv sync && uv run python -m pytest -q",
+            _with_noise(
+                _real_agent_lines("Resolved dependency", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "python -m pip install -e . && pytest -q",
+            _with_noise(
+                _real_agent_lines("Collecting dependency", 40),
+                ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+                _real_agent_lines("tail pytest output", 40),
+            ),
+            "pytest",
+            ("FAILED tests/test_app.py", "AssertionError"),
+        ),
+        (
+            "find . -type f",
+            _with_noise(
+                _real_agent_lines("./src/file", 40),
+                ["find: './secret': Permission denied"],
+                _real_agent_lines("./tests/test_file", 40),
+            ),
+            "inventory",
+            ("Permission denied",),
+        ),
+        (
+            "cd pkg && find . -type f",
+            _with_noise(
+                _real_agent_lines("./src/file", 40),
+                ["find: './secret': Permission denied"],
+                _real_agent_lines("./tests/test_file", 40),
+            ),
+            "inventory",
+            ("Permission denied",),
+        ),
+        (
+            "bash -lc 'cd pkg && find . -type f'",
+            _with_noise(
+                _real_agent_lines("./src/file", 40),
+                ["find: './secret': Permission denied"],
+                _real_agent_lines("./tests/test_file", 40),
+            ),
+            "inventory",
+            ("Permission denied",),
+        ),
+        (
+            "ls -laR .",
+            _with_noise(
+                _real_agent_lines("./src/file", 40),
+                ["ls: cannot access './secret': Permission denied"],
+                _real_agent_lines("./tests/test_file", 40),
+            ),
+            "inventory",
+            ("cannot access", "Permission denied"),
+        ),
+    ],
+)
+def test_real_agent_slop_failure_outputs_preserve_actionable_error_signals(
+    command: str,
+    raw: str,
+    command_class: str,
+    signals: tuple[str, ...],
+) -> None:
+    result = reduce_text(
+        raw,
+        command=command,
+        exit_code=1,
+        options=options(max_chars=900, max_lines=20, head_lines=3, tail_lines=3),
+    )
+
+    assert result.changed is True
+    assert result.metadata["command_class"] == command_class
+    assert len(result.text.splitlines()) <= 20
+    assert "[noisegate: omitted" in result.text
+    for signal in signals:
+        assert signal in result.text
+
+
+def test_inventory_char_budget_preserves_prefixed_error_after_head_context() -> None:
+    raw = "\n".join(
+        [
+            *["./src/generated/very_long_inventory_entry_" + ("x" * 80) for _ in range(8)],
+            "find: paths must precede expression: `-name'",
+            *["./tests/generated/very_long_inventory_entry_" + ("z" * 80) for _ in range(8)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="find . -type f",
+        exit_code=1,
+        options=options(max_chars=180, max_lines=10, head_lines=2, tail_lines=2),
+    )
+
+    assert result.changed is True
+    assert result.metadata["command_class"] == "inventory"
+    assert len(result.text) <= 180
+    assert "find: paths must precede expression" in result.text
+
+
+def test_runner_wrapped_pytest_beats_dependency_words_in_arguments() -> None:
+    raw = _with_noise(
+        _real_agent_lines("tests/test_ok.py .", 40),
+        ["FAILED tests/test_app.py::test_status - AssertionError: boom"],
+        _real_agent_lines("tail pytest output", 40),
+    )
+
+    for command in (
+        "poetry run pytest -k 'pip install'",
+        "poetry -C pkg run pytest -k 'pip install'",
+        "pdm run -- pytest -k 'pip install'",
+        "hatch run -- pytest -k 'pip install'",
+    ):
+        result = reduce_text(
+            raw,
+            command=command,
+            exit_code=1,
+            options=options(max_chars=500, max_lines=12, head_lines=2, tail_lines=2),
+        )
+
+        assert result.changed is True
+        assert result.metadata["command_class"] == "pytest"
+        assert "FAILED tests/test_app.py" in result.text
+
+
+def test_shell_chains_with_file_display_and_pytest_preserve_pytest_failure() -> None:
+    raw = _with_noise(
+        _real_agent_lines("file line", 40),
+        [
+            "FAILED tests/test_app.py::test_status - AssertionError: boom",
+            "E       AssertionError: boom",
+        ],
+        _real_agent_lines("tail pytest output", 40),
+    )
+
+    for command in (
+        "cat src/foo.py\npytest -q",
+        "bash -lc 'cat src/foo.py\npytest -q'",
+        "cat important.txt |& pytest -q",
+        "bash -lc 'cat important.txt & pytest -q'",
+    ):
+        result = reduce_text(
+            raw,
+            command=command,
+            exit_code=1,
+            options=options(max_chars=500, max_lines=12, head_lines=2, tail_lines=2),
+        )
+
+        assert result.changed is True
+        assert result.metadata["command_class"] == "pytest"
+        assert "FAILED tests/test_app.py" in result.text
+        assert "AssertionError: boom" in result.text
+
+
+def test_package_docker_and_inventory_tracebacks_keep_exception_under_tight_budget() -> None:
+    cases = (
+        ("pip install .", "dependency_install"),
+        ("uv sync", "dependency_install"),
+        ("docker build .", "docker_build"),
+        ("find . -type f", "inventory"),
+    )
+    for command, command_class in cases:
+        raw = _with_noise(
+            _real_agent_lines("setup noise " + ("x" * 60), 30),
+            [
+                "Traceback (most recent call last):",
+                '  File "build.py", line 7, in <module>',
+                "RuntimeError: boom",
+            ],
+            _real_agent_lines("tail noise " + ("z" * 60), 30),
+        )
+
+        for max_chars in (220, 260, 300):
+            result = reduce_text(
+                raw,
+                command=command,
+                exit_code=1,
+                options=options(max_chars=max_chars, max_lines=8, head_lines=1, tail_lines=1),
+            )
+
+            assert result.changed is True
+            assert result.metadata["command_class"] == command_class
+            assert "Traceback (most recent call last):" in result.text
+            assert "RuntimeError: boom" in result.text
 
 
 def test_changed_outputs_always_fit_configured_budgets() -> None:

@@ -348,6 +348,23 @@ def test_reduce_json_args_command_alias_wins_over_direct_payload_command() -> No
     assert json.loads(proc.stdout) == payload
 
 
+def test_reduce_json_protected_top_level_command_wins_over_stale_nested_args() -> None:
+    exact = source_like_payload()
+    inner = {"stdout": exact, "exit_code": 0}
+    payload = {
+        "tool_name": "terminal",
+        "args": {"command": "pytest -q"},
+        "command": "cat src/source_fixture.py",
+        "result": json.dumps(inner),
+        "noisegate": {"max_chars": 200, "max_lines": 20},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+
 def test_reduce_json_preserves_direct_terminal_payload_with_args_command_alias() -> None:
     exact = source_like_payload()
     payload = {

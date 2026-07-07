@@ -360,30 +360,50 @@ def _reduce_text(
 
 
 def classify_command(command: str | None, text: str) -> str:
-    command_l = (command or "").strip().lower()
+    command_raw = (command or "").strip()
+    command_l = command_raw.lower()
+    command_probe = _unwrap_shell_command(command_raw) or command_raw
+    command_probe_l = command_probe.lower()
     sample_l = text[:4_000].lower()
 
-    if _looks_like_file_read_command(command_l):
+    if _looks_like_file_read_command(command_raw):
         return "file_read"
     if _looks_like_v4a_patch(text):
         return "patch"
-    if _looks_like_diff_command(command_l):
+    if (
+        _looks_like_diff_command(command_raw)
+        or "diff --git " in text
+        or _looks_like_unified_diff(text)
+    ):
         return "git_diff"
-    if "diff --git " in text or _looks_like_unified_diff(text):
-        return "git_diff"
-    if "git status" in command_l or ("on branch " in sample_l and "working tree" in sample_l):
+    if "git status" in command_probe_l or ("on branch " in sample_l and "working tree" in sample_l):
         return "git_status"
-    if "git log" in command_l:
+    if "git log" in command_probe_l:
         return "git_log"
-    if _contains_command(command_l, ("pytest", "py.test")) or "=== failures ===" in sample_l:
+    os_package_command = _is_os_package_command(command_raw)
+    python_package_command = _is_python_package_command(command_raw)
+    node_command = _is_node_command(command_raw, sample_l)
+    if os_package_command and _has_os_package_failure_signal(text):
+        return "os_package"
+    if python_package_command and _has_dependency_failure_signal(text):
+        return "dependency_install"
+    if node_command and _has_node_failure_signal(text):
+        return "node"
+    if _is_pytest_command(command_raw, sample_l):
         return "pytest"
     if "unittest" in command_l or re.search(r"ran \d+ tests?", sample_l):
         return "unittest"
-    if _is_node_command(command_l, sample_l):
+    if os_package_command:
+        return "os_package"
+    if python_package_command:
+        return "dependency_install"
+    if node_command:
         return "node"
-    if "docker build" in command_l or "docker compose" in command_l or "dockerfile" in sample_l:
+    if _is_docker_build_command(command_raw) or "dockerfile" in sample_l:
         return "docker_build"
-    if _is_search_command(command_l):
+    if _is_inventory_command(command_raw):
+        return "inventory"
+    if _is_search_command(command_raw):
         return "search"
     return "generic"
 
@@ -415,6 +435,14 @@ def _preserve_patterns_for_output(
         return CRITICAL_PATTERNS + lcm_patterns
     if command_class == "node":
         return NODE_PRESERVATION_PATTERNS + lcm_patterns
+    if command_class == "os_package":
+        return OS_PACKAGE_PATTERNS + CRITICAL_PATTERNS + lcm_patterns
+    if command_class == "dependency_install":
+        return DEPENDENCY_INSTALL_PATTERNS + CRITICAL_PATTERNS + lcm_patterns
+    if command_class == "docker_build":
+        return DOCKER_PATTERNS + CRITICAL_PATTERNS + lcm_patterns
+    if command_class == "inventory":
+        return INVENTORY_PATTERNS + CRITICAL_PATTERNS + lcm_patterns
     return lcm_patterns or None
 
 
@@ -432,6 +460,18 @@ def _apply_reducer(
         return "generic_head_tail", _head_tail(text, options)
     if command_class in {"pytest", "unittest"}:
         return command_class, _important_lines(text, options, TEST_PATTERNS + lcm_patterns)
+    if command_class == "os_package":
+        return "os_package", _important_lines(
+            text,
+            options,
+            OS_PACKAGE_PATTERNS + CRITICAL_PATTERNS + lcm_patterns,
+        )
+    if command_class == "dependency_install":
+        return "dependency_install", _important_lines(
+            text,
+            options,
+            DEPENDENCY_INSTALL_PATTERNS + CRITICAL_PATTERNS + lcm_patterns,
+        )
     if command_class == "node":
         return "node", _important_lines(
             text,
@@ -439,11 +479,21 @@ def _apply_reducer(
             NODE_PRESERVATION_PATTERNS + lcm_patterns,
         )
     if command_class == "docker_build":
-        return "docker_build", _important_lines(text, options, DOCKER_PATTERNS + lcm_patterns)
+        return "docker_build", _important_lines(
+            text,
+            options,
+            DOCKER_PATTERNS + CRITICAL_PATTERNS + lcm_patterns,
+        )
     if command_class == "git_status":
         return "git_status", _important_lines(text, options, GIT_STATUS_PATTERNS + lcm_patterns)
     if command_class == "git_log":
         return "git_log", _head_tail(text, replace(options, head_lines=40, tail_lines=8))
+    if command_class == "inventory":
+        return "inventory", _important_lines(
+            text,
+            options,
+            INVENTORY_PATTERNS + CRITICAL_PATTERNS + lcm_patterns,
+        )
     if command_class == "search":
         if lcm_patterns:
             return "search", _important_lines(text, options, lcm_patterns)
@@ -467,26 +517,61 @@ TEST_PATTERNS = tuple(
 )
 
 CRITICAL_PATTERNS = tuple(
-    re.compile(pattern, re.IGNORECASE)
+    re.compile(pattern, re.IGNORECASE | re.MULTILINE)
     for pattern in (
         r"assertionerror|traceback|exceptiongroup|baseexception|\bexception\b\s*:",
+        r"\b[a-z0-9_]*error\b(?::|$)",
         r"\bunhandled\s+exception\b",
         r"\bexception\s+in\b",
         r"^\s*E\s+",
+        r"^\s*E:",
         r"\d+\s+failed",
         r"^(failed|error)\s+",
         r"\bFAILED\b|\bERROR\b",
         r"\berror\b|\bfailed\b|\bfail\b",
+        r"unable to locate package|could not get lock|gpg error|hash sum mismatch",
+        r"dependency conflict|conflicting dependencies|resolutionimpossible",
+        r"resolution failed|no solution found",
+        r"npm err!|pnpm err!|yn\d{4}: error|err_pnpm|eresolve|elifecycle",
+        r"failed to solve|dockerfile(?::| line)|exit code:|executor failed",
+        r"permission denied|no such file|cannot access",
     )
 )
+
+OS_PACKAGE_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+    for pattern in (
+        r"^err:\d+|^e:|^w:.*gpg error",
+        r"unable to locate package|could not get lock|gpg error|hash sum mismatch|failed to fetch",
+        r"does not have a release file|repository .* not signed|no_pubkey|404\s+not found",
+        r"sub-process .* returned an error code|dpkg.*error|returned an error code",
+        r"reading package lists\.\.\. done|fetched .* in .*|\d+ upgraded, .* newly installed",
+        r"setting up \S+|processing triggers for",
+    )
+)
+
+PYTHON_PACKAGE_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+    for pattern in (
+        r"^error:|^error\b|resolutionimpossible|no solution found|resolution failed",
+        r"dependency conflict|conflicting dependencies|failed to prepare distributions",
+        r"could not find a version",
+        r"no matching distribution|failed to build|because .* depends on|caused by:",
+        r"successfully installed|resolved \d+ packages|installed \S+",
+    )
+)
+
+DEPENDENCY_INSTALL_PATTERNS = PYTHON_PACKAGE_PATTERNS
 
 NODE_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
-        r"npm err!|pnpm err!|yarn.*error|err_pnpm|elifecycle",
-        r"\berror\b|\bfailed\b|\bfail\b",
+        r"npm err!|pnpm err!|yarn.*error|yn\d{4}: error|err_pnpm|elifecycle|eresolve",
+        r"\berror\b|\bfailed\b|\bfail\b|failed with errors|test failed",
         r"\bwarning\b|\bwarn\b",
-        r"tests?.*(failed|passed)",
+        r"could not resolve|unable to resolve|peer dep|lockfile|e404|enotfound",
+        r"added \d+ packages|found \d+ vulnerabilities|audited \d+ packages",
+        r"tests?.*(failed|passed)|test suites?:",
     )
 )
 
@@ -495,11 +580,37 @@ NODE_PRESERVATION_PATTERNS = (*NODE_PATTERNS, *CRITICAL_PATTERNS)
 DOCKER_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
+        r"failed to solve",
+        r"dockerfile(?::| line)",
+        r"exit code:|executor failed|did not complete successfully",
         r"\berror\b|\bfailed\b|\bfail\b",
-        r"dockerfile|unable to|denied|not found",
-        r"^#\d+|^=>",
+        r"unable to|denied|not found",
+        r"^#\d+\s+error:|^=>\s+error:",
     )
 )
+
+INVENTORY_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+    for pattern in (
+        r"permission denied|no such file|cannot access|not found",
+        r"^(find|ls|fd|tree):",
+    )
+)
+
+COMMAND_CLASS_PRESERVE_PATTERNS = {
+    "pytest": CRITICAL_PATTERNS,
+    "unittest": CRITICAL_PATTERNS,
+    "os_package": OS_PACKAGE_PATTERNS,
+    "dependency_install": DEPENDENCY_INSTALL_PATTERNS,
+    "node": NODE_PATTERNS,
+    "docker_build": DOCKER_PATTERNS,
+    "inventory": INVENTORY_PATTERNS,
+}
+
+
+def _preserve_patterns_for_command_class(command_class: str) -> tuple[re.Pattern[str], ...] | None:
+    return COMMAND_CLASS_PRESERVE_PATTERNS.get(command_class)
+
 
 GIT_STATUS_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
@@ -670,6 +781,8 @@ def _line_budgeted_important_excerpt(
 
 def _failure_detail_rank(line: str) -> int:
     """Prefer diagnostic detail over progress/status lines when budgets are tight."""
+    if _prefers_previous_traceback_context(line):
+        return -1
     if _is_diagnostic_detail_line(line):
         return 0
     if re.search(r"npm err!|pnpm err!|err_pnpm|elifecycle|yarn.*error", line, re.IGNORECASE):
@@ -689,6 +802,19 @@ def _failure_detail_rank(line: str) -> int:
     if _is_incidental_exception_line(line):
         return 6
     return 5
+
+
+def _prefers_previous_traceback_context(line: str) -> bool:
+    stripped = line.strip()
+    if stripped.startswith("E "):
+        return False
+    return bool(
+        re.search(
+            r"^(?:[a-z_][a-z0-9_]*\.)*[a-z_]*[a-z0-9_]*(?:error|exception)\b(?::|$)",
+            stripped,
+            re.IGNORECASE,
+        )
+    )
 
 
 def _is_diagnostic_detail_line(line: str) -> bool:
@@ -925,18 +1051,26 @@ def _line_centered_excerpt(
         return None
 
     start_line = end_line = match_line
+    prefer_previous = _prefers_previous_traceback_context(line)
     while True:
+        expanded = False
+        if prefer_previous and start_line > 0:
+            candidate = "\n".join(lines[start_line - 1 : end_line + 1])
+            if _fits_budget(candidate, options):
+                start_line -= 1
+                expanded = True
         if end_line + 1 < len(lines):
             candidate = "\n".join(lines[start_line : end_line + 2])
             if _fits_budget(candidate, options):
                 end_line += 1
-                continue
-        if start_line > 0:
+                expanded = True
+        if not prefer_previous and start_line > 0:
             candidate = "\n".join(lines[start_line - 1 : end_line + 1])
             if _fits_budget(candidate, options):
                 start_line -= 1
-                continue
-        break
+                expanded = True
+        if not expanded:
+            break
 
     while True:
         candidate = _lines_with_surrounding_omission_markers(lines, start_line, end_line)
@@ -944,7 +1078,14 @@ def _line_centered_excerpt(
             return candidate
         if start_line == match_line and end_line == match_line:
             return None
-        if end_line > match_line and (end_line - match_line) >= (match_line - start_line):
+        if prefer_previous:
+            if end_line > match_line:
+                end_line -= 1
+            elif start_line < match_line:
+                start_line += 1
+            else:
+                return None
+        elif end_line > match_line and (end_line - match_line) >= (match_line - start_line):
             end_line -= 1
         elif start_line < match_line:
             start_line += 1
@@ -1468,14 +1609,37 @@ def _contains_command(command: str, names: tuple[str, ...]) -> bool:
 def _looks_like_diff_command(command: str) -> bool:
     if not command:
         return False
-    if bool(re.search(r"(^|[\s;&|])git\b.*\bdiff\b", command)) or command.startswith("diff "):
+    for tokens in _shell_command_tokens(command):
+        if not tokens:
+            continue
+        command_name = _command_basename(tokens[0]).lower()
+        if command_name == "diff":
+            return True
+        if command_name != "git":
+            continue
+        index = 1
+        while index + 1 < len(tokens) and tokens[index].lower() == "-c":
+            index += 2
+        if index >= len(tokens):
+            continue
+        subcommand = tokens[index].lower()
+        args = [token.lower() for token in tokens[index + 1 :]]
+        if subcommand == "diff":
+            return True
+        if subcommand == "log" and any(arg in {"-p", "--patch"} for arg in args):
+            return True
+        if subcommand == "show":
+            excluded = {"--no-patch", "--stat", "--summary", "--name-only", "--name-status"}
+            return not any(arg.split("=", 1)[0] in excluded for arg in args)
+    command_l = command.lower()
+    if bool(re.search(r"(^|[\s;&|])git\b.*\bdiff\b", command_l)) or command_l.startswith("diff "):
         return True
-    if re.search(r"(^|[\s;&|])git\b.*\blog\b.*?(\s-p\b|\s--patch\b)", command):
+    if re.search(r"(^|[\s;&|])git\b.*\blog\b.*?(\s-p\b|\s--patch\b)", command_l):
         return True
-    return bool(re.search(r"(^|[\s;&|])git\b.*\bshow\b", command)) and not bool(
+    return bool(re.search(r"(^|[\s;&|])git\b.*\bshow\b", command_l)) and not bool(
         re.search(
             r"\s--(no-patch|stat|summary|name-only|name-status)\b",
-            command,
+            command_l,
         )
     )
 
@@ -1494,24 +1658,85 @@ def _looks_like_v4a_patch(text: str) -> bool:
 
 
 def _looks_like_file_read_command(command: str) -> bool:
-    if not command or _has_unquoted_shell_operator(command):
+    command = _strip_safe_fd_redirections(command)
+    if (
+        not command
+        or _has_unquoted_shell_operator(command)
+        or _has_unsafe_unwrapped_shell_payload(command)
+    ):
         return False
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        tokens = command.split()
+    saw_file_read = False
+    for tokens in _shell_command_tokens(command):
+        if not tokens:
+            continue
+        command_name = _command_basename(tokens[0]).lower()
+        if command_name == "cd":
+            continue
+        if command_name in {"cat", "head", "tail", "less", "more", "bat", "nl"}:
+            saw_file_read = True
+            continue
+        if _looks_like_find_exec_file_read_tokens(tokens):
+            saw_file_read = True
+            continue
+        if _looks_like_fd_exec_file_read_tokens(tokens):
+            saw_file_read = True
+            continue
+        if _looks_like_git_show_file_read_tokens(tokens):
+            saw_file_read = True
+            continue
+        if command_name != "sed":
+            return False
+        if "-i" in tokens or any(token.startswith("-i") and token != "-i" for token in tokens):
+            return False
+        if any(_looks_like_sed_print_script(token) for token in tokens[1:]):
+            saw_file_read = True
+            continue
+        return False
+    return saw_file_read
+
+
+def _strip_safe_fd_redirections(command: str) -> str:
+    command = re.sub(r"(?<!\S)(?:\d?>&[12])(?=\s|$)", "", command)
+    command = re.sub(r"(?<!\S)\d?>\s*/dev/null(?=\s|$)", "", command)
+    command = re.sub(r"(?<!\S)<\s+(?!<\()\S+(?=\s|$)", "", command)
+    return re.sub(r"(?<!\S)\d?<(?![<(])\S+(?=\s|$)", "", command)
+
+
+def _is_file_display_command_name(command_name: str) -> bool:
+    return command_name in {"cat", "head", "tail", "less", "more", "bat", "nl"}
+
+
+def _looks_like_file_display_tokens(tokens: list[str]) -> bool:
     if not tokens:
         return False
-    executable = tokens[0]
-    if executable in {"cat", "head", "tail", "less", "more", "bat", "nl"}:
+    command_name = _command_basename(tokens[0]).lower()
+    if _is_file_display_command_name(command_name):
         return True
-    if _looks_like_git_show_file_read_tokens(tokens):
-        return True
-    if executable != "sed":
+    if command_name != "sed":
         return False
     if "-i" in tokens or any(token.startswith("-i") and token != "-i" for token in tokens):
         return False
     return any(_looks_like_sed_print_script(token) for token in tokens[1:])
+
+
+def _looks_like_find_exec_file_read_tokens(tokens: list[str]) -> bool:
+    if not tokens or _command_basename(tokens[0]).lower() != "find":
+        return False
+    for index, token in enumerate(tokens[:-1]):
+        if token not in {"-exec", "-execdir"}:
+            continue
+        return _looks_like_file_display_tokens(tokens[index + 1 :])
+    return False
+
+
+def _looks_like_fd_exec_file_read_tokens(tokens: list[str]) -> bool:
+    if not tokens or _command_basename(tokens[0]).lower() != "fd":
+        return False
+    for index, token in enumerate(tokens[:-1]):
+        if token not in {"-x", "--exec", "-X", "--exec-batch"}:
+            continue
+        return _looks_like_file_display_tokens(tokens[index + 1 :])
+    return False
 
 
 def _has_unquoted_shell_operator(command: str) -> bool:
@@ -1541,7 +1766,13 @@ def _has_unquoted_shell_operator(command: str) -> bool:
         if char in {"'", '"'}:
             quote = char
             continue
-        if char in "|;&><`\n\r" or (char == "$" and command[index + 1 : index + 2] == "("):
+        if char in "><`\n\r" or (char == "$" and command[index + 1 : index + 2] == "("):
+            return True
+        if (
+            char == "&"
+            and command[index - 1 : index] != "&"
+            and command[index + 1 : index + 2] != "&"
+        ):
             return True
     return False
 
@@ -1556,7 +1787,7 @@ def _looks_like_sed_print_script(token: str) -> bool:
 
 
 def _looks_like_git_show_file_read_tokens(tokens: list[str]) -> bool:
-    if not tokens or tokens[0] != "git" or "show" not in tokens:
+    if not tokens or _command_basename(tokens[0]).lower() != "git" or "show" not in tokens:
         return False
     show_index = tokens.index("show")
     skip_next = False
@@ -1566,29 +1797,657 @@ def _looks_like_git_show_file_read_tokens(tokens: list[str]) -> bool:
             continue
         if token == "--":
             continue
-        if token in {"-l", "--format", "--pretty", "--date"}:
+        if token in {"-l", "-L", "--format", "--pretty", "--date"}:
             skip_next = True
             continue
-        if token.startswith(("-l", "--format=", "--pretty=", "--date=")):
+        if token.startswith(("-l", "-L", "--format=", "--pretty=", "--date=")):
             continue
         if token.startswith("-"):
             continue
-        _, separator, path = token.partition(":")
-        if separator and path:
+        _, separator, file_path = token.partition(":")
+        if separator and file_path:
             return True
     return False
 
 
+_APT_OPERATIONS = {
+    "install",
+    "update",
+    "upgrade",
+    "remove",
+    "purge",
+    "autoremove",
+    "dist-upgrade",
+    "full-upgrade",
+}
+_APT_VALUE_OPTIONS = {
+    "--target-release",
+    "-c",
+    "-o",
+    "-t",
+    "--config-file",
+    "--option",
+}
+_PIP_VALUE_OPTIONS = {
+    "--cache-dir",
+    "--cert",
+    "--client-cert",
+    "--config-settings",
+    "--constraint",
+    "--exists-action",
+    "--extra-index-url",
+    "--find-links",
+    "--global-option",
+    "--index-url",
+    "--keyring-provider",
+    "--log",
+    "--platform",
+    "--prefix",
+    "--progress-bar",
+    "--proxy",
+    "--python",
+    "--report",
+    "--requirement",
+    "--retries",
+    "--root",
+    "--src",
+    "--target",
+    "--timeout",
+    "--trusted-host",
+}
+_UV_GLOBAL_VALUE_OPTIONS = {
+    "--cache-dir",
+    "--color",
+    "--config-file",
+    "--config-setting",
+    "--directory",
+    "--index-url",
+    "--keyring-provider",
+    "--link-mode",
+    "--project",
+    "--python",
+    "--resolution",
+    "--settings",
+}
+_UV_RUN_VALUE_OPTIONS = _UV_GLOBAL_VALUE_OPTIONS | {
+    "--allow-insecure-host",
+    "--config-setting",
+    "--config-settings-package",
+    "--default-index",
+    "--env-file",
+    "--exclude-newer",
+    "--exclude-newer-package",
+    "--extra",
+    "--extra-index-url",
+    "--find-links",
+    "--fork-strategy",
+    "--group",
+    "--index",
+    "--index-strategy",
+    "--index-url",
+    "--keyring-provider",
+    "--link-mode",
+    "--no-binary-package",
+    "--no-build-package",
+    "--no-extra",
+    "--no-group",
+    "--no-sources-package",
+    "--only-group",
+    "--package",
+    "--prerelease",
+    "--python-platform",
+    "--refresh-package",
+    "--reinstall-package",
+    "--resolution",
+    "--upgrade-group",
+    "--upgrade-package",
+    "--with",
+    "--with-editable",
+    "--with-requirements",
+    "-C",
+    "-P",
+    "-f",
+    "-i",
+    "-p",
+    "-s",
+    "-w",
+}
+_UV_PIP_VALUE_OPTIONS = _PIP_VALUE_OPTIONS | _UV_GLOBAL_VALUE_OPTIONS | {
+    "--exclude-newer",
+    "--find-links",
+    "--index-strategy",
+    "--prerelease",
+    "--reinstall-package",
+}
+_DOCKER_GLOBAL_VALUE_OPTIONS = {
+    "--config",
+    "--context",
+    "--host",
+    "--log-level",
+    "--tlscacert",
+    "--tlscert",
+    "--tlskey",
+    "-c",
+    "-H",
+}
+_DOCKER_COMPOSE_VALUE_OPTIONS = {
+    "--ansi",
+    "--env-file",
+    "--file",
+    "--parallel",
+    "--progress",
+    "--profile",
+    "--project-directory",
+    "--project-name",
+    "-f",
+    "-p",
+}
+_COVERAGE_RUN_VALUE_OPTIONS = {
+    "--branch",
+    "--concurrency",
+    "--context",
+    "--data-file",
+    "--debug",
+    "--include",
+    "--omit",
+    "--pylib",
+    "--rcfile",
+    "--source",
+}
+_PYTHON_VALUE_OPTIONS = {"-W", "-X"}
+_ENV_VALUE_OPTIONS = {"-a", "-C", "-u", "--argv0", "--chdir", "--unset"}
+_SUDO_VALUE_OPTIONS = {
+    "-C",
+    "-D",
+    "-g",
+    "-h",
+    "-p",
+    "-r",
+    "-t",
+    "-T",
+    "-u",
+    "--close-from",
+    "--command-timeout",
+    "--chdir",
+    "--group",
+    "--host",
+    "--prompt",
+    "--role",
+    "--type",
+    "--user",
+}
+_SHELL_LONG_VALUE_OPTIONS = {"--init-file", "--rcfile"}
+_PYTHON_RUNNER_COMMANDS = {"poetry", "pipenv", "pdm", "hatch", "rye"}
+_PYTHON_RUNNER_VALUE_OPTIONS = {
+    "--directory",
+    "--env",
+    "--env-file",
+    "--name",
+    "--project",
+    "--python",
+    "--pyproject",
+    "-C",
+    "-e",
+    "-n",
+    "-p",
+}
+_SHELL_COMMAND_SEPARATORS = {"&&", "||", ";", "|", "&", "|&"}
+
+
+def _looks_like_assignment(token: str) -> bool:
+    return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token))
+
+
+def _command_basename(token: str) -> str:
+    return token.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _normalize_command_tokens(tokens: list[str]) -> list[str]:
+    index = 0
+    while index < len(tokens):
+        start_index = index
+        while index < len(tokens) and _looks_like_assignment(tokens[index]):
+            index += 1
+        if index < len(tokens) and _command_basename(tokens[index]).lower() == "env":
+            index = _skip_options(tokens, index + 1, _ENV_VALUE_OPTIONS)
+            continue
+        if index < len(tokens):
+            wrapper_name = _command_basename(tokens[index]).lower()
+            if wrapper_name in {"sudo", "doas"}:
+                index = _skip_sudo_options(tokens, index + 1)
+                continue
+            if wrapper_name == "command":
+                index = _skip_command_options(tokens, index + 1)
+                continue
+        if index == start_index:
+            break
+    return tokens[index:]
+
+
+def _split_shell_tokens(command: str) -> list[str]:
+    command = command.replace("\r\n", ";").replace("\n", ";").replace("\r", ";")
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        return list(lexer)
+    except ValueError:
+        return command.split()
+
+
+def _unwrap_shell_tokens(tokens: list[str]) -> str | None:
+    if not tokens or _command_basename(tokens[0]).lower() not in {"bash", "sh", "zsh"}:
+        return None
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if not token.startswith("-") or token == "-":
+            return None
+        if token == "--":
+            index += 1
+            continue
+        if token == "-c":
+            return tokens[index + 1] if index + 1 < len(tokens) else None
+        if token.startswith("--"):
+            option = token.split("=", 1)[0]
+            index += 1
+            if option in _SHELL_LONG_VALUE_OPTIONS and "=" not in token and index < len(tokens):
+                index += 1
+            continue
+        flags = token[1:]
+        if "c" in flags:
+            return tokens[index + 1] if index + 1 < len(tokens) else None
+        index += 1
+        if ("o" in flags or "O" in flags) and index < len(tokens):
+            index += 1
+    return None
+
+
+def _unwrap_shell_command(command: str) -> str | None:
+    return _unwrap_shell_tokens(_split_shell_tokens(command))
+
+
+def _shell_command_tokens(command: str) -> list[list[str]]:
+    if not command:
+        return []
+    tokens = _split_shell_tokens(command)
+    unwrapped = _unwrap_shell_tokens(tokens)
+    if unwrapped is not None:
+        return _shell_command_tokens(unwrapped)
+    commands: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token in _SHELL_COMMAND_SEPARATORS:
+            normalized = _normalize_command_tokens(current)
+            unwrapped_current = _unwrap_shell_tokens(normalized)
+            if unwrapped_current is not None:
+                commands.extend(_shell_command_tokens(unwrapped_current))
+            elif normalized:
+                commands.append(normalized)
+            current = []
+            continue
+        current.append(token)
+    normalized = _normalize_command_tokens(current)
+    unwrapped_current = _unwrap_shell_tokens(normalized)
+    if unwrapped_current is not None:
+        commands.extend(_shell_command_tokens(unwrapped_current))
+    elif normalized:
+        commands.append(normalized)
+    return commands
+
+
+def _has_unsafe_unwrapped_shell_payload(command: str) -> bool:
+    if not command:
+        return False
+    tokens = _split_shell_tokens(command)
+    unwrapped = _unwrap_shell_tokens(tokens)
+    if unwrapped is not None:
+        return _has_unquoted_shell_operator(unwrapped) or _has_unsafe_unwrapped_shell_payload(
+            unwrapped
+        )
+    current: list[str] = []
+    for token in tokens:
+        if token in _SHELL_COMMAND_SEPARATORS:
+            if _normalized_command_has_unsafe_unwrapped_shell_payload(current):
+                return True
+            current = []
+            continue
+        current.append(token)
+    return _normalized_command_has_unsafe_unwrapped_shell_payload(current)
+
+
+def _normalized_command_has_unsafe_unwrapped_shell_payload(tokens: list[str]) -> bool:
+    normalized = _normalize_command_tokens(tokens)
+    unwrapped = _unwrap_shell_tokens(normalized)
+    return unwrapped is not None and (
+        _has_unquoted_shell_operator(unwrapped)
+        or _has_unsafe_unwrapped_shell_payload(unwrapped)
+    )
+
+
+def _skip_options(tokens: list[str], start: int, value_options: set[str]) -> int:
+    index = start
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            return index + 1
+        if not token.startswith("-") or token == "-":
+            return index
+        option = token.split("=", 1)[0]
+        index += 1
+        if option in value_options and "=" not in token and index < len(tokens):
+            index += 1
+    return index
+
+
+def _skip_sudo_options(tokens: list[str], start: int) -> int:
+    value_short_options = {"C", "D", "g", "h", "p", "r", "t", "T", "u"}
+    index = start
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            return index + 1
+        if not token.startswith("-") or token == "-":
+            return index
+        option = token.split("=", 1)[0]
+        index += 1
+        if option in _SUDO_VALUE_OPTIONS and "=" not in token and index < len(tokens):
+            index += 1
+            continue
+        if option.startswith("--"):
+            continue
+        flags = option[1:]
+        for position, flag in enumerate(flags):
+            if flag not in value_short_options:
+                continue
+            if position == len(flags) - 1 and index < len(tokens):
+                index += 1
+            break
+    return index
+
+
+def _skip_command_options(tokens: list[str], start: int) -> int:
+    index = start
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            return index + 1
+        if not token.startswith("-") or token == "-":
+            return index
+        index += 1
+    return index
+
+
+def _python_module_index(tokens: list[str], python_index: int) -> int | None:
+    index = python_index + 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-m":
+            return index + 1 if index + 1 < len(tokens) else None
+        if token.startswith("-m") and len(token) > 2:
+            return index
+        if not token.startswith("-") or token == "-":
+            return None
+        option = token.split("=", 1)[0]
+        index += 1
+        if option in _PYTHON_VALUE_OPTIONS and "=" not in token and index < len(tokens):
+            index += 1
+    return None
+
+
+def _python_module_name(tokens: list[str], module_index: int) -> str:
+    token = tokens[module_index]
+    if token.startswith("-m") and len(token) > 2:
+        return token[2:]
+    return token
+
+
+def _is_python_launcher(token: str) -> bool:
+    executable = _command_basename(token).lower()
+    return executable == "py" or re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable) is not None
+
+
+def _runner_payload_tokens(tokens: list[str]) -> list[str] | None:
+    if not tokens or _command_basename(tokens[0]).lower() not in _PYTHON_RUNNER_COMMANDS:
+        return None
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "run" and index + 1 < len(tokens):
+            payload = tokens[index + 1 :]
+            if payload and payload[0] == "--":
+                payload = payload[1:]
+            return payload or None
+        if token == "--":
+            index += 1
+            continue
+        if not token.startswith("-") or token == "-":
+            return None
+        option = token.split("=", 1)[0]
+        index += 1
+        if option in _PYTHON_RUNNER_VALUE_OPTIONS and "=" not in token and index < len(tokens):
+            index += 1
+    return None
+
+
+def _coverage_payload_tokens(tokens: list[str]) -> list[str] | None:
+    if not tokens or _command_basename(tokens[0]).lower() != "coverage":
+        return None
+    index = _skip_options(tokens, 1, set())
+    if index >= len(tokens) or tokens[index].lower() != "run":
+        return None
+    payload_index = _skip_options(tokens, index + 1, _COVERAGE_RUN_VALUE_OPTIONS)
+    return tokens[payload_index:] or None
+
+
+def _is_pytest_tokens(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    command_name = _command_basename(tokens[0]).lower()
+    if command_name in {"pytest", "py.test"}:
+        return True
+    if _is_python_launcher(tokens[0]):
+        module_index = _python_module_index(tokens, 0)
+        return module_index is not None and _python_module_name(tokens, module_index).lower() in {
+            "pytest",
+            "py.test",
+        }
+    if command_name == "uv":
+        index = _skip_options(tokens, 1, _UV_GLOBAL_VALUE_OPTIONS)
+        if index + 1 < len(tokens) and tokens[index].lower() == "run":
+            index = _skip_options(tokens, index + 1, _UV_RUN_VALUE_OPTIONS)
+            if (
+                index < len(tokens)
+                and _command_basename(tokens[index]).lower() in {"pytest", "py.test"}
+            ):
+                return True
+            if index < len(tokens) and _is_python_launcher(tokens[index]):
+                module_index = _python_module_index(tokens, index)
+                return module_index is not None and _python_module_name(
+                    tokens,
+                    module_index,
+                ).lower() in {
+                    "pytest",
+                    "py.test",
+                }
+    runner_payload = _runner_payload_tokens(tokens)
+    if runner_payload and _is_pytest_tokens(runner_payload):
+        return True
+    coverage_payload = _coverage_payload_tokens(tokens)
+    return _is_pytest_tokens(coverage_payload) if coverage_payload else False
+
+
+def _is_pytest_command(command: str, sample: str) -> bool:
+    if "=== failures ===" in sample:
+        return True
+    return any(_is_pytest_tokens(tokens) for tokens in _shell_command_tokens(command))
+
+
+def _has_os_package_failure_signal(sample: str) -> bool:
+    return bool(
+        re.search(
+            r"^\s*[ew]:|unable to locate package|could not get lock|gpg error|"
+            r"hash sum mismatch|failed to fetch|not signed|no_pubkey|"
+            r"sub-process .* returned an error code|dpkg.*error|404\s+not found",
+            sample,
+            re.IGNORECASE | re.MULTILINE,
+        )
+    )
+
+
+def _has_dependency_failure_signal(sample: str) -> bool:
+    return bool(
+        re.search(
+            r"^\s*error:|resolutionimpossible|no solution found|resolution failed|"
+            r"dependency conflict|conflicting dependencies|failed to prepare distributions|"
+            r"could not find a version|no matching distribution|failed to build|caused by:",
+            sample,
+            re.IGNORECASE | re.MULTILINE,
+        )
+    )
+
+
+def _has_node_failure_signal(sample: str) -> bool:
+    return bool(
+        re.search(
+            r"npm err!|pnpm err!|yn\d{4}: error|err_pnpm|eresolve|elifecycle|"
+            r"failed with errors|test failed|could not resolve|unable to resolve",
+            sample,
+            re.IGNORECASE | re.MULTILINE,
+        )
+    )
+
+
+def _is_os_package_command(command: str) -> bool:
+    for tokens in _shell_command_tokens(command):
+        if _is_search_tokens(tokens):
+            continue
+        for index, token in enumerate(tokens):
+            command_name = _command_basename(token).lower()
+            if command_name not in {"apt", "apt-get"}:
+                continue
+            subcommand_index = _skip_options(tokens, index + 1, _APT_VALUE_OPTIONS)
+            if (
+                subcommand_index < len(tokens)
+                and tokens[subcommand_index].lower() in _APT_OPERATIONS
+            ):
+                return True
+    return False
+
+
+def _is_python_package_command(command: str) -> bool:
+    for tokens in _shell_command_tokens(command):
+        if _is_search_tokens(tokens) or _is_pytest_tokens(tokens):
+            continue
+        for index, token in enumerate(tokens):
+            command_name = _command_basename(token).lower()
+            if command_name == "uv":
+                subcommand_index = _skip_options(tokens, index + 1, _UV_GLOBAL_VALUE_OPTIONS)
+                if subcommand_index >= len(tokens):
+                    continue
+                subcommand = tokens[subcommand_index].lower()
+                if subcommand in {"sync", "add", "lock"}:
+                    return True
+                if subcommand == "pip":
+                    pip_index = _skip_options(
+                        tokens,
+                        subcommand_index + 1,
+                        _UV_PIP_VALUE_OPTIONS,
+                    )
+                    if pip_index < len(tokens) and tokens[pip_index].lower() == "install":
+                        return True
+            if command_name in {"pip", "pip3"} or re.fullmatch(r"pip\d+(?:\.\d+)?", command_name):
+                install_index = _skip_options(tokens, index + 1, _PIP_VALUE_OPTIONS)
+                if install_index < len(tokens) and tokens[install_index].lower() == "install":
+                    return True
+            if _is_python_launcher(token):
+                module_index = _python_module_index(tokens, index)
+                if (
+                    module_index is not None
+                    and _python_module_name(tokens, module_index).lower() == "pip"
+                ):
+                    install_index = _skip_options(tokens, module_index + 1, _PIP_VALUE_OPTIONS)
+                    if install_index < len(tokens) and tokens[install_index].lower() == "install":
+                        return True
+    return False
+
+
 def _is_node_command(command: str, sample: str) -> bool:
-    if re.search(r"(^|[\s;&|])(npm|pnpm|yarn)\s+", command):
-        return True
-    if re.search(r"(^|[\s;&|])(node|npx|vitest|jest|tsx|mocha)\b", command):
-        return True
+    for tokens in _shell_command_tokens(command):
+        if not tokens:
+            continue
+        command_name = _command_basename(tokens[0]).lower()
+        if command_name in {"npm", "pnpm", "yarn"}:
+            return True
+        if command_name in {"node", "npx", "vitest", "jest", "tsx", "mocha"}:
+            return True
     return "npm err!" in sample or "err_pnpm" in sample or "yarn run" in sample
 
 
+def _is_docker_build_command(command: str) -> bool:
+    for tokens in _shell_command_tokens(command):
+        if not tokens or _command_basename(tokens[0]).lower() != "docker":
+            continue
+        index = _skip_options(tokens, 1, _DOCKER_GLOBAL_VALUE_OPTIONS)
+        if index >= len(tokens):
+            continue
+        subcommand = tokens[index].lower()
+        if subcommand == "build":
+            return True
+        if [token.lower() for token in tokens[index : index + 2]] in (
+            ["buildx", "build"],
+            ["image", "build"],
+        ):
+            return True
+        if subcommand == "compose":
+            compose_index = _skip_options(
+                tokens,
+                index + 1,
+                _DOCKER_COMPOSE_VALUE_OPTIONS,
+            )
+            if compose_index >= len(tokens):
+                continue
+            compose_command = tokens[compose_index].lower()
+            if compose_command == "build":
+                return True
+            if compose_command == "up" and any(
+                token == "--build" or token.startswith("--build=")
+                for token in tokens[compose_index + 1 :]
+            ):
+                return True
+    return False
+
+
+def _is_inventory_command(command: str) -> bool:
+    for tokens in _shell_command_tokens(command):
+        if not tokens:
+            continue
+        command_name = _command_basename(tokens[0]).lower()
+        if command_name == "ls":
+            return any(
+                token.startswith("-") and ("R" in token or "r" in token)
+                for token in tokens[1:]
+            )
+        if command_name == "tree":
+            return True
+        if command_name == "fd":
+            return not any(token in {"-x", "--exec", "-X", "--exec-batch"} for token in tokens[1:])
+        if command_name == "git":
+            index = 1
+            while index + 1 < len(tokens) and tokens[index].lower() == "-c":
+                index += 2
+            if index < len(tokens) and tokens[index].lower() == "ls-files":
+                return True
+        if command_name == "find" and not {"-exec", "-execdir"}.intersection(tokens):
+            return True
+    return False
+
+
+def _is_search_tokens(tokens: list[str]) -> bool:
+    return bool(tokens) and _command_basename(tokens[0]).lower() in {"rg", "grep", "ag", "ack"}
+
+
 def _is_search_command(command: str) -> bool:
-    return bool(re.search(r"(^|[\s;&|])(rg|grep|ag|ack)(\s|$)", command))
+    return any(_is_search_tokens(tokens) for tokens in _shell_command_tokens(command))
 
 
 def _option_key(key: str) -> str:
