@@ -311,11 +311,17 @@ class ArtifactStore:
     def _ensure_root(self) -> Path:
         if self.root.is_symlink():
             raise ArtifactSecurityError("artifact root must not be a symlink")
-        if self.root.exists() and not self.root.is_dir():
+        existed = self.root.exists()
+        if existed and not self.root.is_dir():
             raise ArtifactSecurityError("artifact root must be a directory")
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        # Private raw-output artifact directory: owner-only access is intentional.
-        os.chmod(self.root, 0o700)  # nosemgrep
+        if existed:
+            mode = stat.S_IMODE(self.root.stat().st_mode)
+            if mode & 0o077:
+                raise ArtifactSecurityError("artifact root permissions must be owner-only")
+        else:
+            # Private raw-output artifact directory: owner-only access is intentional.
+            os.chmod(self.root, 0o700)  # nosemgrep
         return self.root.resolve(strict=True)
 
     def _path_for(self, artifact_id: str, *, root: Path | None = None) -> Path:

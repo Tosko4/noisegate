@@ -65,14 +65,51 @@ def transform_tool_result(
         call_args = args or arguments or {}
 
         if isinstance(parsed, str):
+            command = _extract_command({}, call_args)
+            reduce_options = replace(options, artifact_enabled=False)
             reduced = reduce_text(
                 parsed,
-                command=_extract_command({}, call_args),
+                command=command,
                 tool_name=tool_name,
                 source="json_string",
-                options=options,
+                options=reduce_options,
             )
-            return json.dumps(reduced.text, ensure_ascii=False) if reduced.changed else None
+            if not reduced.changed:
+                return None
+            metadata = dict(reduced.metadata)
+            text = reduced.text
+            preserve_patterns = _preserve_patterns_for(command, parsed)
+            if options.artifact_enabled:
+                metadata["artifact"] = _plan_artifact(parsed, options)
+                _drop_artifact_if_notice_cannot_fit(
+                    metadata,
+                    options,
+                    artifact_dir=options.artifact_dir,
+                )
+                text = _append_recovery_notices(
+                    text,
+                    metadata,
+                    artifact_dir=options.artifact_dir,
+                    options=options,
+                    preserve_patterns=preserve_patterns,
+                )
+                _mark_artifact_notice_dropped_if_missing(metadata, text)
+            candidate = json.dumps(text, ensure_ascii=False)
+            if len(candidate) >= len(result):
+                return None
+            if options.artifact_enabled:
+                artifact = metadata.get("artifact")
+                if isinstance(artifact, dict) and artifact.get("stored") is True:
+                    metadata["artifact"] = _store_artifact(parsed, options)
+                    text = _append_recovery_notices(
+                        reduced.text,
+                        metadata,
+                        artifact_dir=options.artifact_dir,
+                        options=options,
+                        preserve_patterns=preserve_patterns,
+                    )
+                    candidate = json.dumps(text, ensure_ascii=False)
+            return candidate if len(candidate) < len(result) else None
 
         if not isinstance(parsed, dict):
             return None
@@ -84,6 +121,7 @@ def transform_tool_result(
         field_metadata: dict[str, JsonValue] = {}
         original_values: dict[str, str] = {}
         reduced_values: dict[str, str] = {}
+        preserve_patterns_by_field: dict[str, tuple[re.Pattern[str], ...] | None] = {}
         reduce_options = replace(options, artifact_enabled=False)
 
         for field in fields:
@@ -101,8 +139,9 @@ def transform_tool_result(
             if reduced.changed:
                 metadata = dict(reduced.metadata)
                 text = reduced.text
+                preserve_patterns: tuple[re.Pattern[str], ...] | None = None
                 if options.artifact_enabled:
-                    preserve_patterns = _preserve_patterns_for(command, text)
+                    preserve_patterns = _preserve_patterns_for(command, value)
                     metadata["artifact"] = _plan_artifact(value, options)
                     _drop_artifact_if_notice_cannot_fit(
                         metadata,
@@ -125,6 +164,7 @@ def transform_tool_result(
                 field_metadata[field] = metadata
                 original_values[field] = value
                 reduced_values[field] = reduced.text
+                preserve_patterns_by_field[field] = preserve_patterns
 
         if not field_metadata:
             return None
@@ -156,7 +196,7 @@ def transform_tool_result(
                         notice_metadata,
                         artifact_dir=options.artifact_dir,
                         options=options,
-                        preserve_patterns=_preserve_patterns_for(command, reduced_text),
+                        preserve_patterns=preserve_patterns_by_field.get(field),
                     )
             candidate = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         return candidate if len(candidate) < len(result) else None

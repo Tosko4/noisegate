@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -148,6 +149,8 @@ def env_diagnostics(environ: Mapping[str, str] | None = None) -> list[str]:
     bool_vars = (
         ("NOISEGATE", "controls whether compaction is enabled"),
         ("NOISEGATE_DISABLE", "disables compaction when true"),
+        ("NOISEGATE_BYPASS", "disables compaction when true"),
+        ("NOISEGATE_RAW", "disables compaction when true"),
         ("NOISEGATE_ARTIFACTS", "enables private artifact storage when true"),
     )
     accepted = ", ".join(sorted(TRUE_VALUES | FALSE_VALUES))
@@ -531,9 +534,7 @@ def _line_budgeted_important_excerpt(
         for context in range(max_context, -1, -1):
             start = max(0, anchor - context)
             end = min(len(lines), anchor + context + 1)
-            candidate = _lines_with_markers(lines, list(range(start, end)))
-            if end < len(lines) and _line_count(candidate) < options.max_lines:
-                candidate = f"{candidate}\n[noisegate: omitted {len(lines) - end} lines]"
+            candidate = _lines_with_surrounding_omission_markers(lines, start, end - 1)
             if _line_count(candidate) <= options.max_lines:
                 return candidate
     return None
@@ -638,39 +639,7 @@ def _char_head_tail_preserving_patterns(
     line_excerpt = _line_centered_excerpt(text, options, match)
     if line_excerpt is not None:
         return line_excerpt
-
-    budget = max(0, options.max_chars)
-    if budget == 0:
-        return None
-    marker_a = "\n[noisegate: omitted before important output]\n"
-    marker_b = "\n[noisegate: omitted after important output]\n"
-    available = budget - len(marker_a) - len(marker_b)
-    if available <= 0:
-        return _match_centered_excerpt(text, options, match)
-
-    head_chars = max(1, available // 5)
-    tail_chars = max(1, available // 5)
-    focus_chars = max(1, available - head_chars - tail_chars)
-    match_len = match.end() - match.start()
-    if match_len > focus_chars:
-        return _match_centered_excerpt(text, options, match)
-
-    focus_start = match.start() - max(0, (focus_chars - match_len) // 2)
-    if match.end() > focus_start + focus_chars:
-        focus_start = match.end() - focus_chars
-    focus_start = max(head_chars, focus_start)
-    focus_start = min(focus_start, max(head_chars, len(text) - tail_chars - focus_chars))
-    focus_end = min(len(text) - tail_chars, focus_start + focus_chars)
-    if focus_start >= focus_end or focus_start > match.start() or focus_end < match.end():
-        return _match_centered_excerpt(text, options, match)
-    compacted = (
-        f"{text[:head_chars]}{marker_a}"
-        f"{text[focus_start:focus_end]}{marker_b}"
-        f"{text[-tail_chars:]}"
-    )
-    if not _fits_budget(compacted, options):
-        return _match_centered_excerpt(text, options, match)
-    return compacted
+    return None
 
 
 def _match_centered_excerpt(
@@ -719,29 +688,48 @@ def _line_centered_excerpt(
     if len(line) > options.max_chars:
         return None
 
-    start_line = end_line = match_line
-    best = line
-    if not _fits_budget(best, options):
+    if not _fits_budget(line, options):
         return None
 
-    expanded = True
-    while expanded:
-        expanded = False
+    start_line = end_line = match_line
+    while True:
         if end_line + 1 < len(lines):
             candidate = "\n".join(lines[start_line : end_line + 2])
             if _fits_budget(candidate, options):
                 end_line += 1
-                best = candidate
-                expanded = True
                 continue
         if start_line > 0:
             candidate = "\n".join(lines[start_line - 1 : end_line + 1])
             if _fits_budget(candidate, options):
                 start_line -= 1
-                best = candidate
-                expanded = True
-    return best
+                continue
+        break
 
+    while True:
+        candidate = _lines_with_surrounding_omission_markers(lines, start_line, end_line)
+        if _fits_budget(candidate, options):
+            return candidate
+        if start_line == match_line and end_line == match_line:
+            return None
+        if end_line > match_line and (end_line - match_line) >= (match_line - start_line):
+            end_line -= 1
+        elif start_line < match_line:
+            start_line += 1
+        elif end_line > match_line:
+            end_line -= 1
+        else:
+            return None
+
+
+def _lines_with_surrounding_omission_markers(
+    lines: list[str],
+    start_line: int,
+    end_line: int,
+) -> str:
+    selected = _lines_with_markers(lines, list(range(start_line, end_line + 1)))
+    if end_line + 1 < len(lines):
+        selected = f"{selected}\n[noisegate: omitted {len(lines) - end_line - 1} lines]"
+    return selected
 
 def _match_centered_slice(
     text: str,
@@ -1101,10 +1089,14 @@ def _recovery_notices(
     if isinstance(artifact, dict):
         if artifact.get("stored") is True:
             artifact_id = artifact.get("id")
-            sha256 = str(artifact.get("sha256") or "")[:12]
+            sha256 = str(artifact.get("sha256") or "")[:16]
+            command = f"noisegate cat {artifact_id}"
+            if artifact_dir is not None:
+                quoted_dir = shlex.quote(str(artifact_dir))
+                command = f"noisegate cat --artifact-dir {quoted_dir} {artifact_id}"
             notices.append(
                 "[noisegate artifact: "
-                f"id={artifact_id}; sha256={sha256}; cat {artifact_id}]"
+                f"id={artifact_id}; sha256={sha256}; {command}]"
             )
         else:
             reason = artifact.get("reason", "not_stored")
@@ -1188,6 +1180,8 @@ def _looks_like_file_read_command(command: str) -> bool:
 
 def _is_node_command(command: str, sample: str) -> bool:
     if re.search(r"(^|[\s;&|])(npm|pnpm|yarn)\s+", command):
+        return True
+    if re.search(r"(^|[\s;&|])(node|npx|vitest|jest|tsx|mocha)\b", command):
         return True
     return "npm err!" in sample or "err_pnpm" in sample or "yarn run" in sample
 

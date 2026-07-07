@@ -291,6 +291,52 @@ def test_transform_tool_result_skips_json_rewrite_when_metadata_would_grow_resul
     assert transformed is None
 
 
+def test_transform_tool_result_skips_top_level_json_string_when_rewrite_would_grow() -> None:
+    raw = json.dumps("A" * 34)
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        noisegate_max_chars=33,
+        noisegate_max_lines=10,
+        noisegate_head_lines=1,
+        noisegate_tail_lines=1,
+    )
+
+    assert transformed is None
+
+
+def test_transform_tool_result_does_not_store_top_level_string_artifact_on_no_gain(
+    monkeypatch,
+) -> None:
+    store_calls: list[str] = []
+
+    def fake_store(text: str, _options) -> dict[str, object]:
+        store_calls.append(text)
+        return {
+            "stored": True,
+            "id": "ng_" + ("a" * 24),
+            "sha256": "b" * 64,
+            "size_bytes": len(text.encode()),
+        }
+
+    monkeypatch.setattr(plugin, "_store_artifact", fake_store)
+    raw = json.dumps("A" * 200)
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        noisegate_max_chars=197,
+        noisegate_max_lines=10,
+        noisegate_head_lines=1,
+        noisegate_tail_lines=1,
+        noisegate_artifacts=True,
+    )
+
+    assert transformed is None
+    assert store_calls == []
+
+
 def test_transform_tool_result_does_not_write_artifact_when_json_candidate_is_dropped(
     tmp_path: Path,
 ) -> None:
@@ -370,11 +416,42 @@ def test_transform_tool_result_artifact_notice_does_not_replace_failure(
         noisegate_artifact_dir=str(tmp_path / "artifacts"),
     )
 
+    if transformed is None:
+        return
     payload = parse_hook_result(transformed)
     stdout = payload["stdout"]
     assert isinstance(stdout, str)
     assert len(stdout) <= 90
     assert "FAILED" in stdout
+
+
+def test_transform_tool_result_artifact_notice_uses_original_output_for_preservation(
+    tmp_path: Path,
+) -> None:
+    original_stdout = "\n".join(
+        [
+            "=== FAILURES ===",
+            *["setup noise " + ("x" * 80) for _ in range(12)],
+            "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+            *["post noise " + ("z" * 80) for _ in range(12)],
+        ]
+    )
+    raw = json.dumps({"stdout": original_stdout, "exit_code": 1})
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        noisegate_max_chars=140,
+        noisegate_max_lines=10,
+        noisegate_artifacts=True,
+        noisegate_artifact_dir=str(tmp_path / "artifacts"),
+    )
+
+    payload = parse_hook_result(transformed)
+    stdout = payload["stdout"]
+    assert isinstance(stdout, str)
+    assert "FAILED tests/test_middle.py::test_breaks - AssertionError: boom" in stdout
+    assert "FAILED tests/test_middle\n" not in stdout
 
 
 def test_transform_tool_result_does_not_store_artifact_when_recovery_notice_drops(
@@ -418,7 +495,7 @@ def test_transform_tool_result_does_not_store_artifact_when_recovery_notice_drop
     metadata = payload["noisegate"]["fields"]["stdout"]["artifact"]
     assert metadata == {
         "stored": False,
-        "reason": "recovery_notice_dropped",
+        "reason": "recovery_notice_too_long",
         "size_bytes": len(original_stdout.encode()),
     }
     assert store_calls == []

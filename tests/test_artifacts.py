@@ -66,10 +66,22 @@ def test_artifact_store_uses_private_directory_and_file_modes(tmp_path: Path) ->
     assert store.read(artifact.artifact_id) == "raw terminal output"
 
 
+def test_artifact_store_refuses_permissive_existing_root_without_chmod(tmp_path: Path) -> None:
+    root = tmp_path / "shared"
+    root.mkdir(mode=0o755)
+    os.chmod(root, 0o755)
+
+    store = ArtifactStore(root, size_cap=1024)
+
+    with pytest.raises(ArtifactSecurityError, match="owner-only"):
+        store.store("raw terminal output")
+    assert mode(root) == 0o755
+
+
 def test_reduce_text_records_artifact_metadata_when_enabled(tmp_path: Path) -> None:
     raw = numbered("line", 100)
     options = NoisegateOptions(
-        max_chars=120,
+        max_chars=220,
         artifact_enabled=True,
         artifact_dir=tmp_path / "store",
     )
@@ -82,6 +94,7 @@ def test_reduce_text_records_artifact_metadata_when_enabled(tmp_path: Path) -> N
     assert artifact["sha256"]
     assert str(artifact["id"]) in result.text
     assert str(artifact["sha256"])[:16] in result.text
+    assert f"noisegate cat --artifact-dir {tmp_path / 'store'} {artifact['id']}" in result.text
     assert ArtifactStore(tmp_path / "store").read(str(artifact["id"])) == raw
 
 

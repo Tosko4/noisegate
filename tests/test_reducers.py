@@ -462,6 +462,18 @@ def test_artifact_size_cap_env_rejects_negative_and_invalid_values(monkeypatch) 
     assert NoisegateOptions.from_env().artifact_size_cap == 123
 
 
+def test_env_diagnostics_warns_on_invalid_raw_and_bypass_values() -> None:
+    diagnostics = engine.env_diagnostics(
+        {
+            "NOISEGATE_RAW": "maybe",
+            "NOISEGATE_BYPASS": "not-sure",
+        }
+    )
+
+    assert any("NOISEGATE_RAW='maybe' is not recognized" in item for item in diagnostics)
+    assert any("NOISEGATE_BYPASS='not-sure' is not recognized" in item for item in diagnostics)
+
+
 def test_reducers_enforce_max_chars_after_line_selection() -> None:
     raw = "\n".join("A" * 2_000 for _ in range(50))
     opts = NoisegateOptions(max_chars=4_000, max_lines=160, head_lines=24, tail_lines=16)
@@ -541,13 +553,34 @@ def test_important_pattern_focus_does_not_split_full_match() -> None:
     result = reduce_text(
         raw,
         command="pytest -q",
+        options=options(max_chars=130, max_lines=10, head_lines=1, tail_lines=1),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 130
+    assert "FAILED" in result.text
+    assert "FAILE\n" not in result.text
+
+
+def test_centered_failure_excerpt_keeps_omission_markers_when_they_fit() -> None:
+    raw = "\n".join(
+        [
+            "setup noise " + ("x" * 80),
+            "FAILED short_case",
+            "post noise " + ("z" * 80),
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
         options=options(max_chars=100, max_lines=10, head_lines=1, tail_lines=1),
     )
 
     assert result.changed is True
     assert len(result.text) <= 100
-    assert "FAILED" in result.text
-    assert "FAILE\n" not in result.text
+    assert "FAILED short_case" in result.text
+    assert "[noisegate: omitted" in result.text
 
 
 def test_recovery_notices_fail_open_when_important_line_cannot_fit() -> None:
@@ -705,11 +738,9 @@ def test_tight_recovery_notice_is_dropped_instead_of_failure_line() -> None:
         ),
     )
 
-    assert result.changed is True
-    assert len(result.text) <= 80
-    assert len(result.text.splitlines()) <= 3
-    assert "FAILED tests/test_middle.py::test_breaks - AssertionError: boom" in result.text
-    assert "exit_code=1" not in result.text
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reason"] == "no_gain"
 
 
 def test_tight_important_excerpt_does_not_slice_omission_marker() -> None:
@@ -765,12 +796,9 @@ def test_tight_important_excerpt_does_not_slice_marker_suffix_lines() -> None:
         ),
     )
 
-    assert result.changed is True
-    assert len(result.text) <= 80
-    assert len(result.text.splitlines()) <= 4
-    assert "FAILED tests/test_middle.py::test_breaks - AssertionError: boom" in result.text
-    assert "lines]" not in result.text
-    assert "exit_code=1" not in result.text
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reason"] == "no_gain"
 
 
 def test_tight_important_excerpt_does_not_slice_numeric_marker_suffixes() -> None:
@@ -795,13 +823,9 @@ def test_tight_important_excerpt_does_not_slice_numeric_marker_suffixes() -> Non
         ),
     )
 
-    assert result.changed is True
-    assert len(result.text) <= 84
-    assert len(result.text.splitlines()) <= 5
-    assert "FAILED tests/test_middle.py::test_breaks - AssertionError: boom" in result.text
-    assert "lines]" not in result.text
-    assert "chars]" not in result.text
-    assert "exit_code=1" not in result.text
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reason"] == "no_gain"
 
 
 def test_node_reducer_tight_budget_fails_open_when_node_error_line_cannot_fit() -> None:
@@ -823,6 +847,52 @@ def test_node_reducer_tight_budget_fails_open_when_node_error_line_cannot_fit() 
     assert result.changed is False
     assert result.text == raw
     assert result.metadata["reason"] == "no_gain"
+
+
+def test_direct_node_command_preserves_error_line() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(20)],
+            "Error: direct node failure",
+            "    at test.js:12:3",
+            *[f"tail {index}" for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="node test.js",
+        exit_code=1,
+        options=options(max_chars=120, max_lines=6, head_lines=1, tail_lines=1),
+    )
+
+    assert result.metadata["command_class"] == "node"
+    if result.changed:
+        assert "Error: direct node failure" in result.text
+        assert "[noisegate: omitted" in result.text
+
+
+def test_vitest_command_preserves_error_line() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(20)],
+            "Error: vitest failure",
+            "    at src/example.test.ts:4:1",
+            *[f"tail {index}" for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="npx vitest run",
+        exit_code=1,
+        options=options(max_chars=120, max_lines=6, head_lines=1, tail_lines=1),
+    )
+
+    assert result.metadata["command_class"] == "node"
+    if result.changed:
+        assert "Error: vitest failure" in result.text
+        assert "[noisegate: omitted" in result.text
 
 
 def test_nonrecoverable_artifact_notice_only_does_not_replace_generic_output() -> None:
@@ -873,15 +943,9 @@ def test_nonrecoverable_artifact_notice_does_not_fragment_preserved_failure() ->
         ),
     )
 
-    assert result.changed is True
-    assert len(result.text) <= 110
-    assert "FAILED tests/test_x.py::test_y - AssertionError: boom" in result.text
-    assert "[noisegate artifact: not stored" not in result.text
-    assert result.metadata["artifact"] == {
-        "stored": False,
-        "reason": "recovery_notice_too_long",
-        "size_bytes": len(raw.encode()),
-    }
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reason"] == "no_gain"
 
 
 def test_artifact_notice_only_does_not_replace_preserved_failure(
@@ -919,15 +983,9 @@ def test_artifact_notice_only_does_not_replace_preserved_failure(
         ),
     )
 
-    assert result.changed is True
-    assert len(result.text) <= 110
-    assert "FAILED" in result.text
-    assert "noisegate artifact:" not in result.text
-    assert result.metadata["artifact"] == {
-        "stored": False,
-        "reason": "recovery_notice_dropped",
-        "size_bytes": len(raw.encode()),
-    }
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reason"] == "no_gain"
     assert store_calls == []
 
 
