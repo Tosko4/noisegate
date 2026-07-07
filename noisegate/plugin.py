@@ -210,7 +210,7 @@ def transform_tool_result(
         if not field_metadata:
             return None
 
-        metadata_key = "_noisegate" if "noisegate" in payload else "noisegate"
+        metadata_key = _metadata_key(payload)
         payload[metadata_key] = {
             "version": __version__,
             "compacted": True,
@@ -262,6 +262,15 @@ def _mark_artifact_notice_dropped_if_missing(
     }
 
 
+def _metadata_key(payload: Mapping[str, JsonValue]) -> str:
+    if "noisegate" not in payload:
+        return "noisegate"
+    candidate = "_noisegate"
+    while candidate in payload:
+        candidate = f"_{candidate}"
+    return candidate
+
+
 def _preserve_patterns_for(
     command: str,
     text: str,
@@ -273,7 +282,7 @@ def _preserve_patterns_for(
 
 
 def transform_terminal_output(
-    *,
+    *positional: Any,
     command: str = "",
     output: str = "",
     exit_code: int = 0,
@@ -281,6 +290,19 @@ def transform_terminal_output(
     **kwargs: Any,
 ) -> str | None:
     try:
+        if positional:
+            if len(positional) >= 1 and not command and isinstance(positional[0], str):
+                command = positional[0]
+            if len(positional) >= 2 and not output and isinstance(positional[1], str):
+                output = positional[1]
+            if (
+                len(positional) >= 3
+                and isinstance(positional[2], int)
+                and not isinstance(positional[2], bool)
+            ):
+                exit_code = positional[2]
+        if not isinstance(output, str):
+            return None
         options = NoisegateOptions.from_env().with_mapping(kwargs)
         # Hermes calls transform_terminal_output before its built-in terminal
         # redaction pass. Inline compaction is still safe because Hermes redacts
@@ -383,6 +405,20 @@ def _command_evidence_text(text: str) -> str:
         if values:
             return "\n".join(values)
     return text
+def _extract_command(payload: Mapping[str, JsonValue], args: Mapping[str, Any]) -> str:
+    for source in (args, payload):
+        for key in ("command", "cmd", "shell_command", "code"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        argv = source.get("argv")
+        if (
+            isinstance(argv, list)
+            and argv
+            and all(isinstance(item, str) for item in argv)
+        ):
+            return shlex.join([str(item) for item in argv])
+    return ""
 
 
 def _extract_exit_code(payload: Mapping[str, JsonValue], tool_name: str) -> int | None:

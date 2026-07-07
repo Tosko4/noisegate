@@ -241,6 +241,425 @@ def test_reduce_json_metadata_reports_plain_result_reducer_details() -> None:
     assert metadata["field_omitted_lines"] > 0
 
 
+def test_reduce_json_rewrites_result_dict_payload() -> None:
+    envelope = {
+        "tool_name": "process",
+        "command": "pytest",
+        "result": {"output": numbered("line", 100), "status": "failed"},
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+    assert proc.returncode == 0, proc.stderr
+    outer = json.loads(proc.stdout)
+    result = outer["result"]
+    assert isinstance(result, dict)
+    assert "[noisegate: omitted" in result["output"]
+    assert "[noisegate: exit_code=1]" in result["output"]
+    assert result["noisegate"]["compacted"] is True
+
+
+def test_reduce_json_nested_result_object_uses_envelope_status() -> None:
+    payload = {
+        "tool_name": "process",
+        "status": "failed",
+        "result": {"output": numbered("inner", 100)},
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    parsed = json.loads(proc.stdout)
+    assert "status" not in parsed["result"]
+    assert "[noisegate: omitted" in parsed["result"]["output"]
+    assert "[noisegate: exit_code=1]" in parsed["result"]["output"]
+    assert parsed["result"]["noisegate"]["fields"]["output"]["exit_code"] == 1
+
+
+def test_reduce_json_nested_json_string_uses_envelope_status() -> None:
+    nested = {"output": numbered("inner", 100)}
+    payload = {
+        "tool_name": "process",
+        "status": "failed",
+        "result": json.dumps(nested),
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    parsed = json.loads(proc.stdout)
+    nested_result = json.loads(parsed["result"])
+    assert "status" not in nested_result
+    assert "[noisegate: omitted" in nested_result["output"]
+    assert "[noisegate: exit_code=1]" in nested_result["output"]
+    assert nested_result["noisegate"]["fields"]["output"]["exit_code"] == 1
+
+
+def test_reduce_json_nested_result_object_prefers_envelope_failed_status_over_exit_zero() -> None:
+    payload = {
+        "tool_name": "process",
+        "status": "failed",
+        "exit_code": 0,
+        "result": {"output": numbered("inner", 100)},
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    parsed = json.loads(proc.stdout)
+    assert "status" not in parsed["result"]
+    assert "exit_code" not in parsed["result"]
+    assert "[noisegate: omitted" in parsed["result"]["output"]
+    assert "[noisegate: exit_code=1]" in parsed["result"]["output"]
+    assert parsed["result"]["noisegate"]["fields"]["output"]["exit_code"] == 1
+
+
+def test_reduce_json_nested_result_object_keeps_nested_status_over_envelope_exit_code() -> None:
+    payload = {
+        "tool_name": "process",
+        "exit_code": 0,
+        "result": {"status": "failed", "output": numbered("inner", 100)},
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    parsed = json.loads(proc.stdout)
+    assert parsed["result"]["status"] == "failed"
+    assert "[noisegate: omitted" in parsed["result"]["output"]
+    assert "[noisegate: exit_code=1]" in parsed["result"]["output"]
+    assert parsed["result"]["noisegate"]["fields"]["output"]["exit_code"] == 1
+
+
+def test_reduce_json_nested_json_string_keeps_nested_status_over_envelope_exit_code() -> None:
+    nested = {"status": "failed", "output": numbered("inner", 100)}
+    payload = {
+        "tool_name": "process",
+        "exit_code": 0,
+        "result": json.dumps(nested),
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    parsed = json.loads(proc.stdout)
+    nested_result = json.loads(parsed["result"])
+    assert nested_result["status"] == "failed"
+    assert "[noisegate: omitted" in nested_result["output"]
+    assert "[noisegate: exit_code=1]" in nested_result["output"]
+    assert nested_result["noisegate"]["fields"]["output"]["exit_code"] == 1
+
+
+def test_reduce_json_leaves_result_list_and_null_valid() -> None:
+    for result in ([numbered("line", 5)], None):
+        envelope = {"tool_name": "terminal", "result": result, "noisegate": {"max_chars": 120}}
+        proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(proc.stdout) == envelope
+
+
+def test_reduce_json_plain_result_string_falls_back_from_empty_args_argv() -> None:
+    envelope = {
+        "tool_name": "terminal",
+        "args": {"argv": []},
+        "arguments": {"command": "cat important.txt"},
+        "result": numbered("exact line", 100),
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == envelope
+
+
+def test_reduce_json_direct_payload_with_non_text_result_still_compacts_output() -> None:
+    payload = {
+        "tool_name": "terminal",
+        "command": "pytest",
+        "stdout": numbered("line", 100),
+        "result": None,
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    parsed = json.loads(proc.stdout)
+    assert parsed["result"] is None
+    assert "[noisegate: omitted" in parsed["stdout"]
+    assert parsed["_noisegate"]["compacted"] is True
+
+
+def test_reduce_json_plain_result_string_honors_command_aliases_for_protection() -> None:
+    envelope = {
+        "tool_name": "terminal",
+        "cmd": "cat important.txt",
+        "result": numbered("exact line", 100),
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == envelope
+
+
+def test_reduce_json_plain_result_string_ignores_invalid_nested_command() -> None:
+    envelope = {
+        "tool_name": "terminal",
+        "args": {"command": None},
+        "command": "cat important.txt",
+        "result": numbered("exact line", 100),
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == envelope
+
+
+def test_reduce_json_plain_result_string_honors_top_level_argv_for_protection() -> None:
+    envelope = {
+        "tool_name": "terminal",
+        "argv": ["cat", "important.txt"],
+        "result": numbered("exact line", 100),
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == envelope
+
+
+def test_reduce_json_plain_result_with_direct_payload_preserves_args_command() -> None:
+    envelope = {
+        "tool_name": "terminal",
+        "args": {"command": "cat important.txt"},
+        "result": "ok",
+        "stdout": numbered("exact line", 100),
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == envelope
+
+
+def test_reduce_json_direct_payload_preserves_args_command_without_result() -> None:
+    payload = {
+        "tool_name": "terminal",
+        "args": {"command": "cat important.txt"},
+        "stdout": numbered("exact line", 100),
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+
+def test_reduce_json_direct_payload_preserves_arguments_command_without_result() -> None:
+    payload = {
+        "tool_name": "terminal",
+        "arguments": {"command": "cat important.txt"},
+        "stdout": numbered("exact line", 100),
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+
+def test_reduce_json_direct_payload_compacts_args_command_without_result_or_exit() -> None:
+    payload = {
+        "args": {"command": "pytest"},
+        "stdout": numbered("line", 100),
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    parsed = json.loads(proc.stdout)
+    assert "[noisegate: omitted" in parsed["stdout"]
+    assert parsed["_noisegate"]["compacted"] is True
+
+
+def test_reduce_json_direct_payload_with_dict_result_still_compacts_top_level_output() -> None:
+    payload = {
+        "tool_name": "terminal",
+        "command": "pytest",
+        "stdout": numbered("line", 100),
+        "result": {"value": "ok"},
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    parsed = json.loads(proc.stdout)
+    assert parsed["result"] == {"value": "ok"}
+    assert "[noisegate: omitted" in parsed["stdout"]
+    assert parsed["_noisegate"]["compacted"] is True
+
+
+def test_reduce_json_mixed_result_dict_and_top_level_output_compacts_both() -> None:
+    payload = {
+        "tool_name": "terminal",
+        "command": "pytest",
+        "stdout": numbered("outer", 100),
+        "result": {"output": numbered("inner", 100), "exit_code": 1},
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    parsed = json.loads(proc.stdout)
+    assert "[noisegate: omitted" in parsed["stdout"]
+    assert "[noisegate: omitted" in parsed["result"]["output"]
+    assert parsed["result"]["noisegate"]["compacted"] is True
+    assert parsed["_noisegate"]["compacted"] is True
+
+
+def test_reduce_json_mixed_terminal_like_payload_without_tool_name_compacts_both() -> None:
+    payload = {
+        "stdout": numbered("outer", 100),
+        "returncode": 1,
+        "result": {"output": numbered("inner", 100), "exit_code": 1},
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    parsed = json.loads(proc.stdout)
+    assert "[noisegate: omitted" in parsed["stdout"]
+    assert "[noisegate: omitted" in parsed["result"]["output"]
+    assert parsed["result"]["noisegate"]["compacted"] is True
+    assert parsed["_noisegate"]["compacted"] is True
+
+
+def test_reduce_json_nested_result_object_without_tool_name_compacts_from_command() -> None:
+    payload = {
+        "command": "pytest",
+        "result": {"output": numbered("inner", 100), "exit_code": 1},
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    parsed = json.loads(proc.stdout)
+    assert "[noisegate: omitted" in parsed["result"]["output"]
+    assert "[noisegate: exit_code=1]" in parsed["result"]["output"]
+    assert parsed["result"]["noisegate"]["compacted"] is True
+
+
+def test_reduce_json_nested_json_string_without_tool_name_compacts_from_command() -> None:
+    nested = {"output": numbered("inner", 100), "exit_code": 1}
+    payload = {
+        "command": "pytest",
+        "result": json.dumps(nested),
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    parsed = json.loads(proc.stdout)
+    nested_result = json.loads(parsed["result"])
+    assert "[noisegate: omitted" in nested_result["output"]
+    assert "[noisegate: exit_code=1]" in nested_result["output"]
+    assert nested_result["noisegate"]["compacted"] is True
+
+
+def test_reduce_json_nested_result_object_without_tool_name_compacts_from_args_command() -> None:
+    payload = {
+        "args": {"command": "pytest"},
+        "result": {"output": numbered("inner", 100)},
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    parsed = json.loads(proc.stdout)
+    assert "[noisegate: omitted" in parsed["result"]["output"]
+    assert parsed["result"]["noisegate"]["compacted"] is True
+
+
+def test_reduce_json_nested_json_string_without_tool_name_compacts_from_args_command() -> None:
+    nested = {"output": numbered("inner", 100)}
+    payload = {
+        "args": {"command": "pytest"},
+        "result": json.dumps(nested),
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    parsed = json.loads(proc.stdout)
+    nested_result = json.loads(parsed["result"])
+    assert "[noisegate: omitted" in nested_result["output"]
+    assert nested_result["noisegate"]["compacted"] is True
+
+
+def test_reduce_json_preserves_nested_protected_result_object_without_tool_name() -> None:
+    payload = {
+        "args": {"command": "pytest"},
+        "result": {
+            "tool_name": "read_file",
+            "output": numbered("exact", 100),
+            "status": "ok",
+        },
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+
+def test_reduce_json_preserves_nested_protected_json_string_without_tool_name() -> None:
+    nested = {
+        "tool_name": "read_file",
+        "output": numbered("exact", 100),
+        "status": "ok",
+    }
+    payload = {
+        "args": {"command": "pytest"},
+        "result": json.dumps(nested),
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+
+def test_reduce_json_direct_payload_with_returncode_is_terminal_like() -> None:
+    payload = {
+        "stdout": numbered("line", 100),
+        "returncode": 1,
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    parsed = json.loads(proc.stdout)
+    assert "[noisegate: omitted" in parsed["stdout"]
+    assert "[noisegate: exit_code=1]" in parsed["stdout"]
+
+
+def test_reduce_json_compacts_invalid_json_result_string_as_plain_output() -> None:
+    envelope = {
+        "tool_name": "terminal",
+        "args": {"command": "pytest"},
+        "result": "{not json\n" + numbered("line", 100),
+        "noisegate": {"max_chars": 120},
+    }
+    proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+    assert proc.returncode == 0, proc.stderr
+    outer = json.loads(proc.stdout)
+    assert outer["result"].startswith("{not json")
+    assert "[noisegate: omitted" in outer["result"]
+
+
 def test_reduce_json_preserves_plain_result_for_non_noisy_tool() -> None:
     envelope = {
         "tool_name": "web_extract",

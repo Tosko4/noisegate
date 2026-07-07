@@ -587,6 +587,16 @@ def test_bad_json_fails_open_for_tool_result_hook() -> None:
     assert transform_tool_result(raw, tool_name="terminal", noisegate_max_chars=100) is None
 
 
+def test_tool_result_hook_fail_open_catches_reducer_exceptions(monkeypatch) -> None:
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("host adapter should never see this")
+
+    monkeypatch.setattr(plugin, "reduce_text", boom)
+    raw = terminal_result(numbered("line", 100), command="pytest")
+
+    assert transform_tool_result(raw, tool_name="terminal", noisegate_max_chars=100) is None
+
+
 def test_noisy_generic_json_string_field_can_be_compacted() -> None:
     raw = json.dumps({"logs": numbered("console log", 100), "ok": True})
 
@@ -857,6 +867,30 @@ def test_transform_tool_result_does_not_treat_http_status_code_as_exit_code() ->
     assert "exit_code" not in payload["noisegate"]["fields"]["content"]
 
 
+def test_terminal_status_failed_is_treated_as_error_exit_code() -> None:
+    raw = json.dumps({"status": "failed", "output": numbered("line", 100)})
+
+    transformed = transform_tool_result(raw, tool_name="process", noisegate_max_chars=120)
+
+    payload = parse_hook_result(transformed)
+    output = payload["output"]
+    assert isinstance(output, str)
+    assert "[noisegate: exit_code=1]" in output
+    assert payload["noisegate"]["fields"]["output"]["exit_code"] == 1
+
+
+def test_transform_tool_result_uses_command_alias_when_command_is_blank() -> None:
+    raw = json.dumps({"command": "", "cmd": "cat important.txt", "stdout": numbered("exact", 100)})
+
+    assert transform_tool_result(raw, tool_name="terminal", noisegate_max_chars=120) is None
+
+
+def test_transform_tool_result_uses_top_level_argv_for_command_intent() -> None:
+    raw = json.dumps({"argv": ["cat", "important.txt"], "stdout": numbered("exact", 100)})
+
+    assert transform_tool_result(raw, tool_name="terminal", noisegate_max_chars=120) is None
+
+
 def test_transform_tool_result_preserves_existing_noisegate_key() -> None:
     raw = json.dumps({"noisegate": {"tool": "data"}, "stdout": numbered("line", 100)})
 
@@ -865,6 +899,23 @@ def test_transform_tool_result_preserves_existing_noisegate_key() -> None:
     payload = parse_hook_result(transformed)
     assert payload["noisegate"] == {"tool": "data"}
     assert payload["_noisegate"]["compacted"] is True
+
+
+def test_transform_tool_result_preserves_existing_noisegate_fallback_key() -> None:
+    raw = json.dumps(
+        {
+            "noisegate": {"tool": "data"},
+            "_noisegate": {"prior": "metadata"},
+            "stdout": numbered("line", 100),
+        }
+    )
+
+    transformed = transform_tool_result(raw, tool_name="terminal", noisegate_max_chars=200)
+
+    payload = parse_hook_result(transformed)
+    assert payload["noisegate"] == {"tool": "data"}
+    assert payload["_noisegate"] == {"prior": "metadata"}
+    assert payload["__noisegate"]["compacted"] is True
 
 
 def test_noisegate_mode_off_returns_none() -> None:
@@ -890,6 +941,18 @@ def test_transform_terminal_output_accepts_hermes_returncode_kwarg() -> None:
         command="pytest",
         output=numbered("line", 100),
         returncode=7,
+        noisegate_max_chars=120,
+    )
+
+    assert isinstance(transformed, str)
+    assert "[noisegate: exit_code=7]" in transformed
+
+
+def test_transform_terminal_output_accepts_positional_host_call() -> None:
+    transformed = transform_terminal_output(
+        "pytest",
+        numbered("line", 100),
+        7,
         noisegate_max_chars=120,
     )
 
