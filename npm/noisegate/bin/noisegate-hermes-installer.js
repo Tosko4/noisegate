@@ -16,8 +16,8 @@ This npm package is a thin installer for the Python package noisegate-hermes.
 The Python package remains the canonical Noisegate implementation.
 
 Usage:
-  npx noisegate install-hermes [--dry-run] [noisegate install-hermes options]
-  npx -p noisegate noisegate-hermes-installer install-hermes [options]
+  npx -p noisegate-hermes noisegate install-hermes [--dry-run] [noisegate install-hermes options]
+  npx -p noisegate-hermes noisegate-hermes-installer install-hermes [options]
 
 Security model:
   - no postinstall scripts

@@ -1,4 +1,4 @@
-# noisegate on npm
+# noisegate-hermes on npm
 
 This npm package is only a thin installer wrapper for the Python package [`noisegate-hermes`](https://github.com/Tosko4/noisegate).
 
@@ -7,13 +7,13 @@ Noisegate itself is a Python Hermes Agent plugin and CLI. The Python package is 
 ## Install Noisegate for Hermes
 
 ```bash
-npx noisegate install-hermes
+npx -p noisegate-hermes noisegate install-hermes
 ```
 
 If your npm client does not resolve the single-bin shortcut, use the explicit bin name:
 
 ```bash
-npx -p noisegate noisegate-hermes-installer install-hermes
+npx -p noisegate-hermes noisegate-hermes-installer install-hermes
 ```
 
 The wrapper delegates to:
@@ -28,4 +28,4 @@ uvx --from noisegate-hermes==<this npm package version> noisegate install-hermes
 - No bundled Python implementation.
 - No long-lived npm token is required when published through npm trusted publishing.
 - Publish provenance should be enabled in CI.
-- The package exists to reserve the public `noisegate` npm name and provide a safe install entrypoint.
+- The package exists as the public `noisegate-hermes` npm installer wrapper and provides a safe install entrypoint.
