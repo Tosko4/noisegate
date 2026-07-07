@@ -172,6 +172,18 @@ def test_standalone_publish_workflows_checkout_requested_tag() -> None:
         assert expected_ref in text
 
 
+def test_manual_release_workflow_respects_protected_main() -> None:
+    root = Path(__file__).resolve().parents[1]
+    text = (root / ".github" / "workflows" / "release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Prepare release metadata for manual release" not in text
+    assert "git push origin HEAD:main" not in text
+    assert "Manual releases must be prepared through a PR before dispatch." in text
+    assert "git push origin \"$TAG\"" in text
+
+
 def test_git_contributor_names_requires_resolved_git(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("scripts.release_tools.shutil.which", lambda _name: None)
 

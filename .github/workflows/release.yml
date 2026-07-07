@@ -59,14 +59,6 @@ jobs:
           set -euo pipefail
           echo "tag=v${RELEASE_REF#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Prepare release metadata for manual release
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          RELEASE_VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          uv run python scripts/prepare_release.py "$RELEASE_VERSION"
-
       - name: Validate release metadata
         env:
           RELEASE_REF: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
@@ -96,7 +88,7 @@ jobs:
             dist/*.tar.gz
           if-no-files-found: error
 
-      - name: Commit version bump and tag for manual release
+      - name: Create release tag for manual release
         if: github.event_name == 'workflow_dispatch'
         env:
           RELEASE_VERSION: ${{ inputs.version }}
@@ -107,15 +99,9 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           if ! git diff --quiet; then
-            git add \
-              pyproject.toml \
-              noisegate/_version.py \
-              noisegate/plugin.yaml \
-              CHANGELOG.md \
-              uv.lock \
-              npm/noisegate/package.json \
-              npm/noisegate/package-lock.json
-            git commit -m "release: $TAG"
+            echo "Manual releases must be prepared through a PR before dispatch." >&2
+            git diff --stat >&2
+            exit 1
           fi
           if git rev-parse "$TAG" >/dev/null 2>&1; then
             echo "Tag $TAG already exists locally"
@@ -126,7 +112,6 @@ jobs:
           else
             git tag -a "$TAG" -m "Noisegate $TAG"
           fi
-          git push origin HEAD:main
           git push origin "$TAG"
 
       - name: Build release notes

@@ -1,6 +1,6 @@
 [project]
 name = "noisegate-hermes"
-version = "0.1.0"
+version = "0.1.1"
 description = "Standalone Hermes Agent plugin and CLI for deterministic terminal/tool-output compaction."
 readme = "README.md"
 requires-python = ">=3.11"
