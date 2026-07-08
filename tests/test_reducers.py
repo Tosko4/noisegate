@@ -998,7 +998,8 @@ def test_important_pattern_tight_budget_fails_open_when_match_line_cannot_fit() 
 
     assert result.changed is False
     assert result.text == raw
-    assert result.metadata["reason"] == "no_gain"
+    assert result.metadata["reason"] == "reducer_no_output"
+    assert result.metadata["attempted_reducer"] == "pytest"
 
 
 def test_important_pattern_focus_does_not_split_full_match() -> None:
@@ -1061,7 +1062,7 @@ def test_recovery_notices_fail_open_when_important_line_cannot_fit() -> None:
 
     assert result.changed is False
     assert result.text == raw
-    assert result.metadata["reason"] == "no_gain"
+    assert result.metadata["reason"] == "reducer_no_output"
 
 
 def test_artifact_enabled_failure_line_that_cannot_fit_fails_open() -> None:
@@ -1088,7 +1089,7 @@ def test_artifact_enabled_failure_line_that_cannot_fit_fails_open() -> None:
 
     assert result.changed is False
     assert result.text == raw
-    assert result.metadata["reason"] == "no_gain"
+    assert result.metadata["reason"] == "reducer_no_output"
 
 
 def test_important_line_reducer_tight_line_cap_preserves_middle_failure() -> None:
@@ -1200,7 +1201,7 @@ def test_tight_recovery_notice_is_dropped_instead_of_failure_line() -> None:
 
     assert result.changed is False
     assert result.text == raw
-    assert result.metadata["reason"] == "no_gain"
+    assert result.metadata["reason"] == "reducer_no_output"
 
 
 def test_tight_important_excerpt_does_not_slice_omission_marker() -> None:
@@ -1258,7 +1259,7 @@ def test_tight_important_excerpt_does_not_slice_marker_suffix_lines() -> None:
 
     assert result.changed is False
     assert result.text == raw
-    assert result.metadata["reason"] == "no_gain"
+    assert result.metadata["reason"] == "reducer_no_output"
 
 
 def test_tight_important_excerpt_does_not_slice_numeric_marker_suffixes() -> None:
@@ -1285,7 +1286,7 @@ def test_tight_important_excerpt_does_not_slice_numeric_marker_suffixes() -> Non
 
     assert result.changed is False
     assert result.text == raw
-    assert result.metadata["reason"] == "no_gain"
+    assert result.metadata["reason"] == "reducer_no_output"
 
 
 def test_char_budget_fails_open_instead_of_count_only_pytest_summary() -> None:
@@ -1306,7 +1307,8 @@ def test_char_budget_fails_open_instead_of_count_only_pytest_summary() -> None:
 
     assert result.changed is False
     assert result.text == raw
-    assert result.metadata["reason"] == "no_gain"
+    assert result.metadata["reason"] == "reducer_no_output"
+    assert result.metadata["attempted_reducer"] == "pytest"
 
 
 def test_node_reducer_tight_budget_fails_open_when_node_error_line_cannot_fit() -> None:
@@ -1327,7 +1329,7 @@ def test_node_reducer_tight_budget_fails_open_when_node_error_line_cannot_fit() 
 
     assert result.changed is False
     assert result.text == raw
-    assert result.metadata["reason"] == "no_gain"
+    assert result.metadata["reason"] == "reducer_no_output"
 
 
 def test_node_char_budget_preserves_python_exception_over_warning() -> None:
@@ -1397,7 +1399,8 @@ def test_node_char_budget_fails_open_instead_of_warning_when_error_cannot_fit() 
 
     assert result.changed is False
     assert result.text == raw
-    assert result.metadata["reason"] == "no_gain"
+    assert result.metadata["reason"] == "reducer_no_output"
+    assert result.metadata["attempted_reducer"] == "node"
 
 
 def test_node_line_budget_prefers_error_detail_over_count_summary() -> None:
@@ -1601,7 +1604,7 @@ def test_nonrecoverable_artifact_notice_does_not_fragment_preserved_failure() ->
 
     assert result.changed is False
     assert result.text == raw
-    assert result.metadata["reason"] == "no_gain"
+    assert result.metadata["reason"] == "reducer_no_output"
 
 
 def test_artifact_notice_only_does_not_replace_preserved_failure(
@@ -1641,7 +1644,7 @@ def test_artifact_notice_only_does_not_replace_preserved_failure(
 
     assert result.changed is False
     assert result.text == raw
-    assert result.metadata["reason"] == "no_gain"
+    assert result.metadata["reason"] == "reducer_no_output"
     assert store_calls == []
 
 

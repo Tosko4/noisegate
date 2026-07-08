@@ -198,8 +198,10 @@ noisegate wrap --full -- ./another-exact-command
 
 ```bash
 noisegate reduce --command "pytest" < noisy.log
-noisegate reduce-json < hermes-tool-result.json
+noisegate reduce --command "pytest" --metadata < noisy.log  # reducer diagnostics on stderr
+noisegate reduce-json --metadata < hermes-tool-result.json  # envelope diagnostics on stderr
 noisegate wrap -- pytest -q
+noisegate wrap --metadata -- pytest -q
 noisegate wrap --store-artifact -- pytest -q
 noisegate wrap --raw -- cat exact-output.txt
 noisegate install-hermes --dry-run
@@ -220,6 +222,10 @@ If capture is truncated, Noisegate adds this marker:
 ```
 
 `reduce-json` accepts either a Hermes-like envelope with a `result` string or a direct JSON tool result. Bad JSON fails open and is written back unchanged.
+
+Use `--metadata` (or `--debug`) on `reduce`, `reduce-json`, or `wrap` when you need to explain a compaction decision without changing stdout. Diagnostics are written as one JSON object on stderr. `reduce` and `wrap` include the chosen `command_class`, reducer or attempted reducer, unchanged reason code, and chars/lines saved. `reduce-json` reports envelope-level size metrics, includes reducer details when it directly reduces a plain `result` string, exposes that field's sizes under `field_*` keys, and leaves field-level reducer details in the transformed JSON metadata when compaction happens inside nested tool-result JSON.
+
+`doctor` prints the effective config as well as environment warnings, so ignored or fallback values such as `NOISEGATE_ARTIFACTS=maybe` are visible before they cause confusing artifact behavior.
 
 ## For AI agents
 
