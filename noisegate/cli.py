@@ -214,7 +214,10 @@ def cmd_install_hermes(args: argparse.Namespace) -> int:
         return 2
 
     if args.dry_run:
-        print("Noisegate Hermes install plan")
+        print(
+            "Noisegate Hermes install plan "
+            "(dry run; install/enable/doctor commands will not run)"
+        )
         for line in plan.as_lines():
             print(line)
     else:

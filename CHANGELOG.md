@@ -4,6 +4,13 @@ All notable changes to Noisegate are documented here. Release notes are generate
 
 ## [Unreleased]
 
+### Changed
+- `noisegate install-hermes --dry-run` now explicitly states that install/enable/doctor commands are not run and no Hermes restart/reload is performed.
+
+### Fixed
+- `install-hermes` now rejects non-Hermes Python launchers instead of trusting any virtualenv Python shebang, and it validates shell shims that exec Python are actually invoking `hermes_cli`.
+- The Hermes config helper now avoids rewriting an already-correct plugin config while still removing stale `noisegate` entries from `plugins.disabled`.
+
 ## [0.1.2] - 2026-07-07
 
 ### Changed

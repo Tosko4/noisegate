@@ -366,7 +366,8 @@ def _format_update_section() -> str:
             "uvx --from noisegate-hermes noisegate install-hermes",
             "```",
             "",
-            "Preview the exact commands first:",
+            "Preview the exact commands first. Dry-run mode does not run the "
+            "install/enable/doctor commands and does not restart or reload Hermes:",
             "",
             "```bash",
             "uvx --from noisegate-hermes noisegate install-hermes --dry-run",
@@ -378,9 +379,11 @@ def _format_update_section() -> str:
             "npx -p noisegate-hermes noisegate install-hermes",
             "```",
             "",
-            "The installer finds `hermes` on `PATH`, resolves the Python environment "
-            "that runs Hermes, installs `noisegate-hermes` there, enables the "
-            "`noisegate` plugin, and runs `noisegate doctor`.",
+            "The installer finds `hermes` on `PATH`, verifies that the launcher "
+            "points at a Hermes Python console script or supported Hermes shim "
+            "inside a virtual environment, installs `noisegate-hermes` there, "
+            "enables the `noisegate` plugin, removes any stale `plugins.disabled` "
+            "entry for `noisegate`, and runs `noisegate doctor`.",
             "",
             "If Hermes is running as a long-lived gateway/service, restart or reload "
             "that Hermes process through your normal maintenance flow after "

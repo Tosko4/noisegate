@@ -79,9 +79,9 @@ uvx --from noisegate-hermes noisegate install-hermes
 
 Use the same command for first install and updates.
 
-It finds `hermes` on `PATH`, resolves the Python environment that actually runs Hermes, installs `noisegate-hermes` there, enables the `noisegate` plugin, and runs `noisegate doctor`.
+It finds `hermes` on `PATH`, verifies that the launcher points at a Hermes Python console script or supported Hermes shim inside a virtual environment, installs `noisegate-hermes` there, enables the `noisegate` plugin, removes any stale `plugins.disabled` entry for `noisegate`, and runs `noisegate doctor`. Native Windows launchers are opaque binaries, so Noisegate validates those by requiring an adjacent virtual-environment Python.
 
-Preview the exact commands first:
+Preview the exact commands first. Dry-run mode does not run the install/enable/doctor commands and does not restart or reload Hermes:
 
 ```bash
 uvx --from noisegate-hermes noisegate install-hermes --dry-run
@@ -139,13 +139,22 @@ uv pip install --python "$HERMES_PYTHON" noisegate-hermes
 from hermes_cli.config import load_config, save_config
 cfg = load_config()
 plugins = cfg.setdefault("plugins", {})
-enabled = plugins.get("enabled") if isinstance(plugins.get("enabled"), list) else []
-disabled = plugins.get("disabled") if isinstance(plugins.get("disabled"), list) else []
+changed = False
+raw_enabled = plugins.get("enabled")
+enabled = list(raw_enabled) if isinstance(raw_enabled, list) else []
 if "noisegate" not in enabled:
     enabled.append("noisegate")
-plugins["enabled"] = enabled
-plugins["disabled"] = [name for name in disabled if name != "noisegate"]
-save_config(cfg)
+if raw_enabled != enabled:
+    plugins["enabled"] = enabled
+    changed = True
+raw_disabled = plugins.get("disabled")
+if isinstance(raw_disabled, list):
+    disabled = [name for name in raw_disabled if name != "noisegate"]
+    if raw_disabled != disabled:
+        plugins["disabled"] = disabled
+        changed = True
+if changed:
+    save_config(cfg)
 PY
 "$HERMES_PYTHON" -m noisegate.cli doctor
 ```
