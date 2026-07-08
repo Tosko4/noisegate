@@ -296,7 +296,7 @@ def _reduce_text(
     options: NoisegateOptions | None = None,
 ) -> ReducedOutput:
     options = options or NoisegateOptions.from_env()
-    command_class = classify_command(command, text)
+    command_class = classify_command(command, text, exit_code=exit_code)
 
     if not options.enabled or options.mode == "off":
         return _unchanged(text, "disabled", command_class, reason="disabled")
@@ -443,21 +443,24 @@ def _reduce_text(
                     )
     return ReducedOutput(compacted, True, metadata)
 
-def classify_command(command: str | None, text: str) -> str:
+def classify_command(command: str | None, text: str, *, exit_code: int | None = None) -> str:
     command_l = (command or "").strip().lower()
     sample_l = text[:4_000].lower()
     text_l = text.lower()
 
-    source_consumer_class = _source_consumer_command_class(
+    if _looks_like_file_read_command(
         command_l,
-        sample_l,
-        text_l,
-    )
-    if source_consumer_class is not None:
-        return source_consumer_class
-    if _looks_like_file_read_command(command_l):
+        sample=sample_l,
+        text=text_l,
+        exit_code=exit_code,
+    ):
         return "file_read"
-    if _is_source_search_command(command_l):
+    if _is_source_search_command(
+        command_l,
+        sample=sample_l,
+        text=text_l,
+        exit_code=exit_code,
+    ):
         return "source_search"
     if _looks_like_v4a_patch(text):
         return "patch"
@@ -467,6 +470,16 @@ def classify_command(command: str | None, text: str) -> str:
         or _looks_like_unified_diff(text)
     ):
         return "git_diff"
+
+    source_consumer_class = _source_consumer_command_class(
+        command_l,
+        sample_l,
+        text_l,
+        exit_code=exit_code,
+    )
+    if source_consumer_class is not None:
+        return source_consumer_class
+
     if "git status" in command_l or ("on branch " in sample_l and "working tree" in sample_l):
         return "git_status"
     if "git log" in command_l:
@@ -476,9 +489,16 @@ def classify_command(command: str | None, text: str) -> str:
         return "apt"
     if any(_is_python_package_command(variant) for variant in command_variants):
         return "python_package"
-    if _contains_command(command_l, ("pytest", "py.test")) or "=== failures ===" in sample_l:
+    if (
+        any(_is_pytest_command(variant) for variant in command_variants)
+        or _contains_process_substitution_pytest(command_l)
+        or "=== failures ===" in sample_l
+    ):
         return "pytest"
-    if "unittest" in command_l or re.search(r"ran \d+ tests?", sample_l):
+    if any(_is_unittest_command(variant) for variant in command_variants) or re.search(
+        r"ran \d+ tests?",
+        sample_l,
+    ):
         return "unittest"
     if any(_is_docker_log_command(variant) for variant in command_variants):
         return "docker_logs"
@@ -1006,12 +1026,22 @@ def _line_budgeted_important_excerpt(
                     and _contains_full_line(char_capped, lines[anchor])
                 ):
                     return char_capped
+                recovery_suffix_reserve = len("\n[noisegate: exit_code=1]")
+                if (
+                    len(lines[anchor]) + recovery_suffix_reserve <= options.max_chars
+                    and _fits_budget(lines[anchor], options)
+                ):
+                    return lines[anchor]
                 continue
     return None
 
 
 def _failure_detail_rank(line: str) -> int:
     """Prefer diagnostic detail over progress/status lines when budgets are tight."""
+    if re.search(r"resolutionimpossible|because .*conflicts? with", line, re.IGNORECASE):
+        return 0
+    if re.search(r"^\s*error:\s+.*\b(?:generic|transient|noise)\b", line, re.IGNORECASE):
+        return 6
     if _is_diagnostic_detail_line(line):
         return 0
     if re.search(r"npm err!|pnpm err!|err_pnpm|elifecycle|yarn.*error", line, re.IGNORECASE):
@@ -1426,7 +1456,12 @@ def _dropped_preserved_line(
     if preserve_patterns is None:
         return False
     for line in before.splitlines():
-        if any(pattern.search(line) for pattern in preserve_patterns) and line not in after:
+        if (
+            any(pattern.search(line) for pattern in preserve_patterns)
+            and line not in after
+            and _failure_detail_rank(line) <= 1
+            and not re.match(r"\s*(?:e|err|error):\s", line, re.IGNORECASE)
+        ):
             return True
     return False
 
@@ -1736,7 +1771,19 @@ def _append_recovery_notices(
             preserve_patterns=preserve_patterns,
         )
     ):
-        return text
+        shortened = _single_preserved_line_excerpt(
+            text,
+            reserved_options,
+            preserve_patterns,
+        )
+        if shortened is None:
+            return text
+    if shortened is None:
+        shortened = _single_preserved_line_excerpt(
+            text,
+            reserved_options,
+            preserve_patterns,
+        )
     if shortened is None:
         notice_only = suffix.lstrip("\n")
         if (
@@ -1750,6 +1797,30 @@ def _append_recovery_notices(
     if not _fits_budget(candidate, options):
         return text
     return candidate
+
+
+def _single_preserved_line_excerpt(
+    text: str,
+    options: NoisegateOptions,
+    preserve_patterns: tuple[re.Pattern[str], ...] | None,
+) -> str | None:
+    if preserve_patterns is None:
+        return None
+    matches = _ranked_pattern_line_matches(text, preserve_patterns)
+    if not matches:
+        return None
+    layout = _line_layout(text)
+    for match in matches:
+        excerpt = _line_centered_excerpt(text, options, match, layout=layout)
+        if excerpt is not None:
+            return excerpt
+        line_index = match.line_index
+        if line_index is None or line_index < 0 or line_index >= len(layout.lines):
+            continue
+        line = layout.lines[line_index]
+        if _fits_budget(line, options):
+            return line
+    return None
 
 
 def _has_nonrecoverable_artifact(metadata: dict[str, JsonValue]) -> bool:
@@ -1833,6 +1904,45 @@ def _contains_command(command: str, names: tuple[str, ...]) -> bool:
     return any(name in tokens for name in names)
 
 
+def _is_pytest_command(command: str) -> bool:
+    if _starts_command_name(command, {"pytest", "py.test"}):
+        return True
+    for tokens in _command_token_segments(command):
+        stripped = _strip_command_wrappers(tokens)
+        if len(stripped) < 3:
+            continue
+        executable = Path(stripped[0]).name
+        module = stripped[2]
+        if (
+            re.fullmatch(r"python\d*(?:\.\d+)?", executable)
+            and stripped[1] == "-m"
+            and module in {"pytest", "py.test"}
+        ):
+            return True
+    return False
+
+
+def _contains_process_substitution_pytest(command: str) -> bool:
+    return bool(re.search(r"<\(\s*(?:[\w./-]+/)?(?:pytest|py\.test)(?:\s|\))", command))
+
+
+def _is_unittest_command(command: str) -> bool:
+    return "unittest" in command or _starts_command_name(command, {"unittest"})
+
+
+def _starts_command_name(command: str, names: set[str]) -> bool:
+    if not command:
+        return False
+    for tokens in _command_token_segments(command):
+        stripped = _strip_command_wrappers(tokens)
+        if not stripped:
+            continue
+        command_name = Path(stripped[0]).name
+        if command_name in names:
+            return True
+    return False
+
+
 def _looks_like_diff_command(command: str) -> bool:
     if not command:
         return False
@@ -1861,23 +1971,75 @@ def _looks_like_v4a_patch(text: str) -> bool:
     return len(lines) >= 2 and lines[0] == "*** Begin Patch" and lines[-1] == "*** End Patch"
 
 
-def _looks_like_file_read_command(command: str) -> bool:
-    if not command or _has_unsafe_shell_expansion(command):
+def _looks_like_file_read_command(
+    command: str,
+    *,
+    sample: str = "",
+    text: str = "",
+    exit_code: int | None = None,
+) -> bool:
+    if (
+        not command
+        or _has_unsafe_shell_expansion(command)
+        or _has_suspicious_shell_quote_escape(command)
+    ):
         return False
-    segments = _command_token_segments(command)
-    for index, tokens in enumerate(segments):
+    segments = _background_segments(command)
+    if _pipeline_compactable_class(command, sample, text) is not None:
+        return False
+    prior_compactable = False
+    for index, (separator, tokens) in enumerate(segments):
         if _is_setup_segment(tokens):
             continue
+        stripped_tokens = _strip_command_wrappers(tokens)
+        if stripped_tokens and Path(stripped_tokens[0]).name in {"bash", "sh", "zsh"}:
+            shell_command = _shell_c_argument(stripped_tokens[1:])
+            if shell_command is not None:
+                if _looks_like_file_read_command(
+                    shell_command,
+                    sample=sample,
+                    text=text,
+                    exit_code=exit_code,
+                ):
+                    if separator == "&&" and prior_compactable and exit_code not in {None, 0}:
+                        continue
+                    if separator == "||" and prior_compactable and exit_code not in {None, 0}:
+                        continue
+                    later_segments = [
+                        (later_separator, segment)
+                        for later_separator, segment in segments[index + 1 :]
+                        if segment and not _is_setup_segment(segment)
+                    ]
+                    if later_segments:
+                        return not any(
+                            (later_separator == "&" or prior_compactable)
+                            and _compactable_class_for_tokens(segment, sample, text) is not None
+                            for later_separator, segment in later_segments
+                        )
+                    return True
+                if _compactable_class_for_tokens(tokens, sample, text) is not None:
+                    prior_compactable = True
+                continue
         if not _tokens_start_file_read(tokens):
+            if _compactable_class_for_tokens(tokens, sample, text) is not None:
+                prior_compactable = True
+            continue
+        if separator == "&&" and prior_compactable and exit_code not in {None, 0}:
+            continue
+        if separator == "||" and prior_compactable and exit_code not in {None, 0}:
             continue
         later_segments = [
-            segment
-            for segment in segments[index + 1 :]
+            (later_separator, segment)
+            for later_separator, segment in segments[index + 1 :]
             if segment and not _is_setup_segment(segment)
         ]
-        return not any(
-            _tokens_start_compactable_command(segment) for segment in later_segments
-        )
+        if later_segments:
+            return not any(
+                (later_separator == "&" or prior_compactable)
+                and _compactable_class_for_tokens(segment, sample, text) is not None
+                for later_separator, segment in later_segments
+            )
+        return True
     return False
 
 
@@ -1911,6 +2073,10 @@ def _has_unsafe_shell_expansion(command: str) -> bool:
         if char in "><`\n\r" or (char == "$" and command[index + 1 : index + 2] == "("):
             return True
     return quote is not None
+
+
+def _has_suspicious_shell_quote_escape(command: str) -> bool:
+    return bool(re.search(r"['\"][^'\"]*\\['\"]\s*[;&|]", command))
 
 
 def _looks_like_sed_print_script(token: str) -> bool:
@@ -2147,14 +2313,72 @@ def _is_node_command(command: str, sample: str) -> bool:
     return "npm err!" in sample or "err_pnpm" in sample or "yarn run" in sample
 
 
-def _is_source_search_command(command: str) -> bool:
+def _is_source_search_command(
+    command: str,
+    *,
+    sample: str = "",
+    text: str = "",
+    exit_code: int | None = None,
+) -> bool:
     if not command:
         return False
-    for tokens in _command_token_segments(command):
+    if _pipeline_compactable_class(command, sample, text) is not None:
+        return False
+    if _pipeline_xargs_compactable_class(command, sample, text) is not None:
+        return False
+    segments = _background_segments(command)
+    prior_compactable = False
+    for index, (separator, tokens) in enumerate(segments):
         if _is_setup_segment(tokens):
             continue
+        stripped_tokens = _strip_command_wrappers(tokens)
+        if stripped_tokens and Path(stripped_tokens[0]).name in {"bash", "sh", "zsh"}:
+            shell_command = _shell_c_argument(stripped_tokens[1:])
+            if shell_command is not None:
+                if _is_source_search_command(
+                    shell_command,
+                    sample=sample,
+                    text=text,
+                    exit_code=exit_code,
+                ):
+                    if separator == "&&" and prior_compactable and exit_code not in {None, 0}:
+                        continue
+                    if separator == "||" and prior_compactable and exit_code not in {None, 0}:
+                        continue
+                    later_segments = [
+                        (later_separator, segment)
+                        for later_separator, segment in segments[index + 1 :]
+                        if segment and not _is_setup_segment(segment)
+                    ]
+                    if later_segments:
+                        return not any(
+                            (later_separator == "&" or prior_compactable)
+                            and _compactable_class_for_tokens(segment, sample, text) is not None
+                            for later_separator, segment in later_segments
+                        )
+                    return True
+                if _compactable_class_for_tokens(tokens, sample, text) is not None:
+                    prior_compactable = True
+                continue
         if _tokens_start_source_search(tokens) or _tokens_pipe_to_source_search(tokens):
+            if separator == "&&" and prior_compactable and exit_code not in {None, 0}:
+                continue
+            if separator == "||" and prior_compactable and exit_code not in {None, 0}:
+                continue
+            later_segments = [
+                (later_separator, segment)
+                for later_separator, segment in segments[index + 1 :]
+                if segment and not _is_setup_segment(segment)
+            ]
+            if later_segments:
+                return not any(
+                    (later_separator == "&" or prior_compactable)
+                    and _compactable_class_for_tokens(segment, sample, text) is not None
+                    for later_separator, segment in later_segments
+                )
             return True
+        if _compactable_class_for_tokens(tokens, sample, text) is not None:
+            prior_compactable = True
     return False
 
 
@@ -2162,9 +2386,20 @@ def _source_consumer_command_class(
     command: str,
     sample: str,
     text: str,
+    *,
+    exit_code: int | None = None,
 ) -> str | None:
     for variant in _command_intent_variants(command):
-        command_class = _background_tail_command_class(variant, sample, text)
+        command_class = _background_tail_command_class(
+            variant,
+            sample,
+            text,
+            exit_code=exit_code,
+        )
+        if command_class is not None:
+            return command_class
+    for variant in _command_intent_variants(command):
+        command_class = _pipeline_compactable_class(variant, sample, text)
         if command_class is not None:
             return command_class
     for variant in _command_intent_variants(command):
@@ -2174,7 +2409,13 @@ def _source_consumer_command_class(
     return None
 
 
-def _background_tail_command_class(command: str, sample: str, text: str) -> str | None:
+def _background_tail_command_class(
+    command: str,
+    sample: str,
+    text: str,
+    *,
+    exit_code: int | None = None,
+) -> str | None:
     segments = _background_segments(command)
     for index, (separator, tokens) in enumerate(segments):
         if separator != "&" or not tokens:
@@ -2185,6 +2426,14 @@ def _background_tail_command_class(command: str, sample: str, text: str) -> str 
             return later_compactable_class or exact_class
         compactable_class = _compactable_class_for_tokens(tokens, sample, text)
         if compactable_class is not None:
+            later_exact_class = _later_exact_tail_class(
+                segments[index + 1 :],
+                sample,
+                text,
+                exit_code=exit_code,
+            )
+            if later_exact_class is not None:
+                return later_exact_class
             return compactable_class
     return None
 
@@ -2220,6 +2469,32 @@ def _later_compactable_class(
     return None
 
 
+def _later_exact_tail_class(
+    segments: list[tuple[str | None, list[str]]],
+    sample: str,
+    text: str,
+    *,
+    exit_code: int | None = None,
+) -> str | None:
+    for index, (separator, tokens) in enumerate(segments):
+        if not tokens or _is_setup_segment(tokens):
+            continue
+        exact_class = _exact_class_for_tokens(tokens)
+        if exact_class is None:
+            continue
+        if separator == "&&" and exit_code not in {None, 0}:
+            continue
+        later_compactable_class = _later_compactable_class(
+            segments[index + 1 :],
+            sample,
+            text,
+        )
+        if later_compactable_class is None:
+            return exact_class
+        return None
+    return None
+
+
 def _exact_class_for_tokens(tokens: list[str]) -> str | None:
     if _tokens_have_unsafe_shell_expansion(tokens):
         return None
@@ -2234,6 +2509,21 @@ def _tokens_have_unsafe_shell_expansion(tokens: list[str]) -> bool:
     return any(
         "<" in token or ">" in token or "`" in token or "$" in token for token in tokens
     )
+
+
+def _pipeline_compactable_class(command: str, sample: str, text: str) -> str | None:
+    for tokens in _command_token_segments(command):
+        for index, token in enumerate(tokens[:-1]):
+            if token != "|":
+                continue
+            upstream = tokens[:index]
+            if not (_tokens_start_source_search(upstream) or _tokens_start_file_read(upstream)):
+                continue
+            downstream = _strip_command_wrappers(tokens[index + 1 :])
+            command_class = _compactable_class_for_tokens(downstream, sample, text)
+            if command_class is not None:
+                return command_class
+    return None
 
 
 def _pipeline_xargs_compactable_class(command: str, sample: str, text: str) -> str | None:
@@ -2267,11 +2557,13 @@ def _compactable_class_for_tokens(
         return "apt"
     if any(_is_python_package_command(variant) for variant in command_variants):
         return "python_package"
-    if any(
-        _contains_command(variant, ("pytest", "py.test")) for variant in command_variants
-    ) or "=== failures ===" in sample:
+    if (
+        any(_is_pytest_command(variant) for variant in command_variants)
+        or _contains_process_substitution_pytest(command)
+        or "=== failures ===" in sample
+    ):
         return "pytest"
-    if any("unittest" in variant for variant in command_variants) or re.search(
+    if any(_is_unittest_command(variant) for variant in command_variants) or re.search(
         r"ran \d+ tests?",
         sample,
     ):
@@ -2288,9 +2580,99 @@ def _compactable_class_for_tokens(
     return None
 
 
+def _compactable_output_class_for_tokens(
+    tokens: list[str],
+    sample: str,
+    text: str,
+) -> str | None:
+    command_class = _compactable_class_for_tokens(tokens, sample, text)
+    if command_class is None:
+        return None
+    output = f"{sample}\n{text}"
+    if command_class in {"pytest", "unittest"}:
+        if _first_pattern_match(output, TEST_PATTERNS) or _first_pattern_match(
+            output,
+            CRITICAL_PATTERNS,
+        ):
+            return command_class
+        return None
+    if command_class in {"apt", "python_package"}:
+        if _first_pattern_match(output, PACKAGE_PATTERNS) or _first_pattern_match(
+            output,
+            CRITICAL_PATTERNS,
+        ):
+            return command_class
+        return None
+    if command_class == "node":
+        if _first_pattern_match(output, NODE_PATTERNS) or _first_pattern_match(
+            output,
+            CRITICAL_PATTERNS,
+        ):
+            return command_class
+        return None
+    if command_class == "docker_build":
+        if _first_pattern_match(
+            output,
+            DOCKER_BUILD_PRESERVATION_PATTERNS,
+        ) or _looks_like_docker_build_output(output):
+            return command_class
+        return None
+    if command_class == "docker_logs":
+        if _first_pattern_match(output, DOCKER_LOG_PATTERNS) or _first_pattern_match(
+            output,
+            CRITICAL_PATTERNS,
+        ):
+            return command_class
+        return None
+    return command_class
+
+
 def _is_setup_segment(tokens: list[str]) -> bool:
     setup_commands = {".", "cd", "export", "popd", "pushd", "pwd", "set", "source", "true"}
     return bool(tokens and Path(tokens[0]).name in setup_commands)
+
+
+def _text_has_exact_output_for_tokens(tokens: list[str], text: str) -> bool:
+    if _tokens_start_source_search(tokens):
+        return _contains_likely_source_search_output(text)
+    if _tokens_start_file_read(tokens):
+        return _contains_likely_file_read_output(text)
+    return False
+
+
+def _contains_likely_source_search_output(text: str) -> bool:
+    path_match = re.compile(
+        r"^[\w./~-]+\.(?:py|pyi|js|jsx|ts|tsx|md|txt|toml|ya?ml|json|sh|css|html)"
+        r"(?::\d+)?[:\t ]"
+    )
+    return any(
+        path_match.match(line)
+        for line in text.splitlines()
+    )
+
+
+def _contains_likely_file_read_output(text: str) -> bool:
+    code_markers = (
+        "#!",
+        "# ",
+        "// ",
+        "/*",
+        "def ",
+        "class ",
+        "import ",
+        "from ",
+        "export ",
+        "const ",
+        "let ",
+        "var ",
+        "function ",
+        "package ",
+        "module ",
+        "[",
+        "{",
+        "<",
+    )
+    return any(line.lstrip().startswith(code_markers) for line in text.splitlines())
 
 
 def _tokens_start_source_search(tokens: list[str]) -> bool:

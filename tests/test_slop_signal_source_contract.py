@@ -397,6 +397,74 @@ def test_package_conflicts_outrank_verbose_generic_errors_under_default_char_bud
     assert "conflicts with package-b" in result.text
 
 
+def test_tight_package_budget_preserves_exit_code_notice_with_priority_failure() -> None:
+    raw = "\n".join(
+        [
+            *[f"ERROR: transient resolver noise {index}" for index in range(160)],
+            "ResolutionImpossible: Because package-a conflicts with package-b",
+            *[f"ERROR: trailing resolver noise {index}" for index in range(160)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="uv sync",
+        tool_name="terminal",
+        exit_code=1,
+        options=opts(max_chars=170, max_lines=5, head_lines=1, tail_lines=1),
+    )
+
+    assert result.changed is True
+    assert "ResolutionImpossible" in result.text
+    assert "[noisegate: exit_code=1]" in result.text
+    assert len(result.text) <= 170
+
+    tighter_result = reduce_text(
+        raw.replace("transient resolver noise", "generic noisy line"),
+        command="uv sync",
+        tool_name="terminal",
+        exit_code=1,
+        options=opts(max_chars=97, max_lines=4, head_lines=1, tail_lines=1),
+    )
+
+    assert tighter_result.changed is True
+    assert "ResolutionImpossible" in tighter_result.text
+    assert "[noisegate: exit_code=1]" in tighter_result.text
+    assert len(tighter_result.text) <= 97
+
+    pytest_raw = "\n".join(
+        [
+            *[f"pytest noise before {index}" for index in range(80)],
+            "FAILED tests/test_demo.py::test_signal",
+            *[f"pytest noise after {index}" for index in range(80)],
+        ]
+    )
+
+    pytest_result = reduce_text(
+        pytest_raw,
+        command="pytest -q",
+        tool_name="terminal",
+        exit_code=1,
+        options=opts(max_chars=100, max_lines=4, head_lines=1, tail_lines=1),
+    )
+
+    assert pytest_result.changed is True
+    assert "FAILED tests/test_demo.py::test_signal" in pytest_result.text
+    assert "[noisegate: exit_code=1]" in pytest_result.text
+    assert len(pytest_result.text) <= 100
+
+    too_tight_result = reduce_text(
+        raw.replace("transient resolver noise", "generic noisy line"),
+        command="uv sync",
+        tool_name="terminal",
+        exit_code=1,
+        options=opts(max_chars=85, max_lines=4, head_lines=1, tail_lines=1),
+    )
+
+    assert too_tight_result.changed is False
+    assert "ResolutionImpossible" in too_tight_result.text
+
+
 def test_docker_log_tracebacks_outrank_early_generic_errors_under_tight_budget() -> None:
     raw = "\n".join(
         [
@@ -869,6 +937,15 @@ def test_background_jobs_use_later_compactable_command_class() -> None:
         "rg target src & pytest -q",
         "cat file.py & bash -lc 'pytest -q'",
         "rg target src & bash -lc 'pytest -q'",
+        "bash -lc 'pytest -q'",
+        "sh -c 'pytest -q'",
+        "python -m pytest -q",
+        "python3 -m pytest -q",
+        "uv run python -m pytest -q",
+        ".venv/bin/pytest -q",
+        "cat file.py | pytest -q",
+        "rg -l test tests | pytest -q",
+        "pytest -q || cat file.py",
     ):
         result = reduce_text(
             raw,
@@ -881,6 +958,25 @@ def test_background_jobs_use_later_compactable_command_class() -> None:
         assert result.changed is True
         assert result.metadata["command_class"] == "pytest"
         assert "FAILED tests/test_demo.py::test_signal" in result.text
+
+
+def test_pytest_arguments_do_not_override_primary_command_intent() -> None:
+    raw = "pytest is mentioned as an argument, not executed"
+
+    for command, expected_class in (
+        ("echo pytest", "generic"),
+        ("python script.py pytest", "generic"),
+        ("node tool.js pytest", "node"),
+    ):
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=opts(max_chars=20, max_lines=2),
+        )
+
+        assert result.metadata["command_class"] == expected_class, command
 
 
 def test_reverse_background_exact_tail_stays_byte_for_byte_unchanged() -> None:
@@ -908,6 +1004,27 @@ def test_reverse_background_exact_tail_stays_byte_for_byte_unchanged() -> None:
         if not expected_changed:
             assert result.text == raw
         assert result.metadata["command_class"] == expected_class
+
+
+def test_background_exact_tail_after_compactable_job_stays_byte_for_byte_unchanged() -> None:
+    raw_source = "\n".join(f"def function_{index}(): return {index}" for index in range(160))
+
+    for command in (
+        "true & pytest -q & cat b.py",
+        "cat a.py & pytest -q & cat b.py",
+        "true & pytest -q & bash -lc 'cat b.py'",
+    ):
+        result = reduce_text(
+            raw_source,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=opts(max_chars=400),
+        )
+
+        assert result.changed is False, command
+        assert result.text == raw_source, command
+        assert result.metadata["command_class"] == "file_read", command
 
 
 def test_source_search_feeding_xargs_uses_consumer_command_class() -> None:
@@ -965,6 +1082,88 @@ def test_source_search_feeding_xargs_uses_consumer_command_class() -> None:
         assert signal in result.text
 
 
+def test_later_chained_exact_source_commands_fail_open_instead_of_dropping_exact_output() -> None:
+    pytest_raw = "\n".join(
+        [
+            *[f"pytest noise before {index}" for index in range(80)],
+            "FAILED tests/test_demo.py::test_signal",
+            *[f"pytest noise after {index}" for index in range(80)],
+        ]
+    )
+    node_raw = "\n".join(
+        [
+            *[f"npm noise before {index}" for index in range(80)],
+            "npm ERR! code ERESOLVE",
+            *[f"npm noise after {index}" for index in range(80)],
+        ]
+    )
+
+    for command, raw, expected_class in (
+        ("rg -l test tests && pytest -q", pytest_raw, "source_search"),
+        ("rg target src; npm install", node_raw, "source_search"),
+        ("bash -lc 'rg -l test tests && pytest -q'", pytest_raw, "source_search"),
+        ("cat notes.txt; npm install", node_raw, "file_read"),
+    ):
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=opts(max_chars=500, max_lines=10),
+        )
+
+        assert result.changed is False, command
+        assert result.text == raw, command
+        assert result.metadata["command_class"] == expected_class, command
+
+
+def test_short_circuit_semantics_do_not_override_exact_reads_blindly() -> None:
+    raw_source = "\n".join(f"def function_{index}(): return {index}" for index in range(160))
+    pytest_raw = "\n".join(
+        [
+            *[f"pytest noise before {index}" for index in range(80)],
+            "FAILED tests/test_demo.py::test_signal",
+            *[f"pytest noise after {index}" for index in range(80)],
+        ]
+    )
+
+    successful_cat = reduce_text(
+        raw_source,
+        command="cat file.py || pytest -q",
+        tool_name="terminal",
+        exit_code=0,
+        options=opts(max_chars=400),
+    )
+
+    assert successful_cat.changed is False
+    assert successful_cat.text == raw_source
+    assert successful_cat.metadata["command_class"] == "file_read"
+
+    failed_pytest = reduce_text(
+        pytest_raw,
+        command="pytest -q && cat file.py",
+        tool_name="terminal",
+        exit_code=1,
+        options=opts(max_chars=500, max_lines=10),
+    )
+
+    assert failed_pytest.changed is True
+    assert failed_pytest.metadata["command_class"] == "pytest"
+    assert "FAILED tests/test_demo.py::test_signal" in failed_pytest.text
+
+    failed_pytest_wrapped = reduce_text(
+        pytest_raw,
+        command="bash -lc 'pytest -q && cat file.py'",
+        tool_name="terminal",
+        exit_code=1,
+        options=opts(max_chars=500, max_lines=10),
+    )
+
+    assert failed_pytest_wrapped.changed is True
+    assert failed_pytest_wrapped.metadata["command_class"] == "pytest"
+    assert "FAILED tests/test_demo.py::test_signal" in failed_pytest_wrapped.text
+
+
 def test_source_and_exact_terminal_commands_stay_byte_for_byte_unchanged() -> None:
     raw_source = "\n".join(f"def function_{index}(): return {index}" for index in range(160))
     diff = "\n".join(
@@ -1014,6 +1213,9 @@ def test_source_and_exact_terminal_commands_stay_byte_for_byte_unchanged() -> No
         "echo heading && cat file.py": raw_source,
         "make noop; cat file.py": raw_source,
         "bash -lc 'echo heading && cat file.py'": raw_source,
+        "bash -lc 'pytest -q' && cat file.py": raw_source,
+        "cat file.py; docker ps": raw_source,
+        "cat file.py; npm install": raw_source + "\nnpm ERR! code ERESOLVE",
         "pytest -q && cat file.py": raw_source,
         "apt install jq && cat file.py": raw_source,
         "docker build .; cat Dockerfile": raw_source,
@@ -1022,6 +1224,8 @@ def test_source_and_exact_terminal_commands_stay_byte_for_byte_unchanged() -> No
         "sh -c 'head -100 file.py'": raw_source,
         "zsh -lc 'tail -100 file.py'": raw_source,
         "git diff -- app.py": diff,
+        "git diff -- app.py & pytest -q": diff,
+        "git diff -- app.py & npm install": diff,
         "rg target src": search_output,
         "/usr/local/bin/rg target src": search_output,
         "grep -R target src": search_output,
@@ -1047,6 +1251,9 @@ def test_source_and_exact_terminal_commands_stay_byte_for_byte_unchanged() -> No
         "git -c color.grep=false grep target": search_output,
         "git -C repo grep target": search_output,
         "git --no-pager grep target": search_output,
+        "rg target src; docker ps": search_output,
+        "bash -lc 'npm install' && rg target src": search_output,
+        "rg target src; npm install": search_output + "\nnpm ERR! code ERESOLVE",
         "bash -lc 'rg target src'": search_output,
         "bash --noprofile --norc -c 'rg target src'": search_output,
         "bash --noprofile --norc -lc 'cd repo && rg target src'": search_output,

@@ -545,6 +545,35 @@ def test_transform_tool_result_artifact_notice_does_not_replace_failure(
     assert "FAILED" in stdout
 
 
+def test_transform_tool_result_artifact_notice_preserves_failure_for_failed_exact_tail(
+    tmp_path: Path,
+) -> None:
+    stdout = "\n".join(
+        [
+            *["setup noise " + ("x" * 80) for _ in range(30)],
+            "FAILED tests/test_middle.py::test_breaks - AssertionError: boom",
+            *["post noise " + ("z" * 80) for _ in range(30)],
+        ]
+    )
+    raw = terminal_result(stdout, command="pytest -q && cat file.py", exit_code=1)
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        noisegate_max_chars=140,
+        noisegate_max_lines=10,
+        noisegate_artifacts=True,
+        noisegate_artifact_dir=str(tmp_path / "artifacts"),
+    )
+
+    if transformed is None:
+        return
+    payload = parse_hook_result(transformed)
+    reduced_stdout = payload["stdout"]
+    assert isinstance(reduced_stdout, str)
+    assert "FAILED tests/test_middle.py::test_breaks - AssertionError: boom" in reduced_stdout
+
+
 def test_transform_tool_result_artifact_notice_uses_original_output_for_preservation(
     tmp_path: Path,
 ) -> None:

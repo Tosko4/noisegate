@@ -141,7 +141,7 @@ def transform_tool_result(
                 text = reduced.text
                 preserve_patterns: tuple[re.Pattern[str], ...] | None = None
                 if options.artifact_enabled:
-                    preserve_patterns = _preserve_patterns_for(command, value)
+                    preserve_patterns = _preserve_patterns_for(command, value, exit_code=exit_code)
                     metadata["artifact"] = _plan_artifact(value, options)
                     _drop_artifact_if_notice_cannot_fit(
                         metadata,
@@ -224,8 +224,10 @@ def _mark_artifact_notice_dropped_if_missing(
 def _preserve_patterns_for(
     command: str,
     text: str,
+    *,
+    exit_code: int | None = None,
 ) -> tuple[re.Pattern[str], ...] | None:
-    command_class = classify_command(command, text)
+    command_class = classify_command(command, text, exit_code=exit_code)
     return _preserve_patterns_for_output(command_class, text)
 
 
