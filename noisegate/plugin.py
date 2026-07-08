@@ -8,14 +8,13 @@ from typing import Any, Protocol, TypeAlias
 
 from ._version import __version__
 from .engine import (
-    CRITICAL_PATTERNS,
-    NODE_PATTERNS,
     JsonValue,
     NoisegateOptions,
     _append_recovery_notices,
     _drop_artifact_if_notice_cannot_fit,
     _is_compactable_tool_name,
     _plan_artifact,
+    _preserve_patterns_for_output,
     _store_artifact,
     classify_command,
     reduce_text,
@@ -226,11 +225,7 @@ def _preserve_patterns_for(
     text: str,
 ) -> tuple[re.Pattern[str], ...] | None:
     command_class = classify_command(command, text)
-    if command_class in {"pytest", "unittest"}:
-        return CRITICAL_PATTERNS
-    if command_class == "node":
-        return NODE_PATTERNS
-    return None
+    return _preserve_patterns_for_output(command_class, text)
 
 
 def transform_terminal_output(
