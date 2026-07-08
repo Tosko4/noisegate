@@ -53,7 +53,7 @@ LCM_EXTERNALIZED_PATTERNS = tuple(
         r"\bexternalized_ref\b\s*[:=]\s*[^,\s}\]]+",
     )
 )
-SHELL_SEPARATORS = {"|", "||", "&&", ";", "&"}
+SHELL_SEPARATORS = {"|", "||", "&&", ";", "&", "(", ")", "{", "}"}
 SOURCE_SEARCH_COMMANDS = {"rg", "grep", "ag", "ack"}
 OPTIONS_WITH_VALUES = {
     "-C",
@@ -81,11 +81,15 @@ OPTIONS_WITH_VALUES = {
     "--directory",
     "--dir",
     "--editable",
+    "--extra",
     "--env-file",
     "--extra-index-url",
     "--file",
     "--find-links",
     "--from",
+    "--group",
+    "--no-group",
+    "--only-group",
     "--host",
     "--index-url",
     "--log-level",
@@ -103,6 +107,7 @@ OPTIONS_WITH_VALUES = {
     "--proxy",
     "--project",
     "--python",
+    "--python-platform",
     "--replace",
     "--requirement",
     "--spec",
@@ -448,13 +453,7 @@ def classify_command(command: str | None, text: str, *, exit_code: int | None = 
     sample_l = text[:4_000].lower()
     text_l = text.lower()
 
-    if _looks_like_file_read_command(
-        command_l,
-        sample=sample_l,
-        text=text_l,
-        exit_code=exit_code,
-    ):
-        return "file_read"
+
     if _is_source_search_command(
         command_l,
         sample=sample_l,
@@ -462,6 +461,14 @@ def classify_command(command: str | None, text: str, *, exit_code: int | None = 
         exit_code=exit_code,
     ):
         return "source_search"
+    if _looks_like_file_read_command(
+        command_l,
+        sample=sample_l,
+        text=text_l,
+        exit_code=exit_code,
+    ):
+        return "file_read"
+
     if _looks_like_v4a_patch(text):
         return "patch"
     if (
@@ -583,6 +590,7 @@ def _apply_reducer(
             text,
             options,
             NODE_PRESERVATION_PATTERNS + lcm_patterns,
+            priority_patterns=NODE_HIGH_SIGNAL_PRIORITY_PATTERNS,
         )
     if command_class == "docker_build":
         return "docker_build", _important_lines(
@@ -615,6 +623,7 @@ TEST_PATTERNS = tuple(
         r"^(failed|error)\s+",
         r"\bFAILED\b|\bERROR\b",
         r"assertionerror|traceback|exception",
+        r"\b[a-z_]+(?:error|exception)\b(?=:|$)",
         r"^\s*E\s+",
         r"\d+\s+failed",
         r"tests?/.*::",
@@ -628,6 +637,8 @@ CRITICAL_PATTERNS = tuple(
         r"^(failed|error)\s+",
         r"^(e:|err:|error:)",
         r"assertionerror|traceback|exceptiongroup|baseexception|\bexception\b\s*:",
+        r"valueerror|typeerror|referenceerror|syntaxerror|rangeerror|runtimeerror",
+        r"\b[a-z_]+(?:error|exception)\b(?=:|$)",
         r"\bunhandled\s+exception\b",
         r"\bexception\s+in\b",
         r"^\s*E\s+",
@@ -645,6 +656,7 @@ PACKAGE_PATTERNS = tuple(
         r"^(e:|err:|error:)",
         r"unable to locate package|no matching distribution found|resolutionimpossible",
         r"\b(error|failed|failure|fail|conflict|conflicts|conflicting|traceback|exception)\b",
+        r"\b[a-z_]+(?:error|exception)\b(?=:|$)",
         r"hash sum mismatch|dependency problems|unmet dependencies|permission denied",
         r"npm err!|pnpm err!|yarn.*error|err_pnpm|elifecycle",
         r"^(warning:|warn:)",
@@ -679,7 +691,8 @@ DOCKER_LOG_PATTERNS = tuple(
     for pattern in (
         r"\berror\b|\bfailed\b|\bfail\b",
         r"traceback|exception|fatal|critical|panic|segmentation fault|segfault",
-        r"valueerror|typeerror|runtimeerror|assertionerror",
+        r"valueerror|typeerror|referenceerror|runtimeerror|assertionerror",
+        r"\b[a-z_]+(?:error|exception)\b(?=:|$)",
         r"unable to|denied|not found|permission denied",
     )
 )
@@ -687,7 +700,8 @@ DOCKER_LOG_PATTERNS = tuple(
 HIGH_SIGNAL_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
-        r"valueerror|typeerror|runtimeerror|assertionerror",
+        r"valueerror|typeerror|referenceerror|runtimeerror|assertionerror",
+        r"\b[a-z_]+(?:error|exception)\b(?=:|$)|^\s*exception:|unhandled\s+exception",
         r"traceback \(most recent call last\)",
         r"resolutionimpossible|because .*conflicts? with",
         r"no matching distribution found|unable to locate package",
@@ -702,7 +716,9 @@ HIGH_SIGNAL_PRIORITY_PATTERNS = tuple(
     for group in (
         (
             r"traceback \(most recent call last\)",
-            r"valueerror|typeerror|runtimeerror|assertionerror",
+            r"valueerror|typeerror|referenceerror|runtimeerror|assertionerror",
+            r"\b[a-z_]+(?:error|exception)\b(?=:|$)|^\s*exception:|unhandled\s+exception",
+            r"npm err!.*cannot find module",
         ),
         (
             r"resolutionimpossible",
@@ -724,6 +740,19 @@ HIGH_SIGNAL_PRIORITY_PATTERNS = tuple(
     )
 )
 
+NODE_HIGH_SIGNAL_PRIORITY_PATTERNS = (
+    tuple(
+        re.compile(pattern, re.IGNORECASE)
+        for pattern in (
+            r"^\s*error:",
+            r"cannot find module",
+            r"npm err!.*cannot find module",
+            r"valueerror|typeerror|referenceerror|syntaxerror|rangeerror|runtimeerror",
+        )
+    ),
+    *HIGH_SIGNAL_PRIORITY_PATTERNS,
+)
+
 PACKAGE_HIGH_SIGNAL_PRIORITY_PATTERNS = tuple(
     tuple(re.compile(pattern, re.IGNORECASE) for pattern in group)
     for group in (
@@ -737,7 +766,8 @@ PACKAGE_HIGH_SIGNAL_PRIORITY_PATTERNS = tuple(
         ),
         (
             r"traceback \(most recent call last\)",
-            r"valueerror|typeerror|runtimeerror|assertionerror",
+            r"valueerror|typeerror|referenceerror|runtimeerror|assertionerror",
+            r"\b[a-z_]+(?:error|exception)\b(?=:|$)",
         ),
         (
             r"fatal|critical|panic|segmentation fault|segfault",
@@ -760,7 +790,8 @@ DOCKER_BUILD_HIGH_SIGNAL_PRIORITY_PATTERNS = tuple(
             r"failed to solve",
             r"did not complete successfully",
             r"traceback \(most recent call last\)",
-            r"valueerror|typeerror|runtimeerror|assertionerror",
+            r"valueerror|typeerror|referenceerror|runtimeerror|assertionerror",
+            r"\b[a-z_]+(?:error|exception)\b(?=:|$)",
         ),
         (
             r"resolutionimpossible",
@@ -849,6 +880,15 @@ def _important_lines(
                 return budgeted
             return _head_tail(text, options)
         if len(text) > options.max_chars:
+            budgeted = _line_budgeted_important_excerpt(
+                lines,
+                important,
+                options,
+                patterns,
+                priority_patterns,
+            )
+            if budgeted is not None:
+                return budgeted
             return _char_head_tail_preserving_patterns(
                 text,
                 options,
@@ -868,16 +908,15 @@ def _important_lines(
             return None
         selected = budgeted
     if len(selected) > options.max_chars:
-        if priority_patterns is not HIGH_SIGNAL_PRIORITY_PATTERNS:
-            budgeted = _line_budgeted_important_excerpt(
-                lines,
-                important,
-                options,
-                patterns,
-                priority_patterns,
-            )
-            if budgeted is not None:
-                return budgeted
+        budgeted = _line_budgeted_important_excerpt(
+            lines,
+            important,
+            options,
+            patterns,
+            priority_patterns,
+        )
+        if budgeted is not None:
+            return budgeted
         return _char_head_tail_preserving_patterns(
             selected,
             options,
@@ -988,9 +1027,45 @@ def _line_budgeted_important_excerpt(
     # least one failure anchor together when the line budget allows it. If the
     # budget is too tight for both, the fallback below prioritizes the refs so
     # the externalized-payload recovery path stays intact.
+    best_ranked_priority = [
+        index
+        for index in ranked_priority
+        if _failure_detail_rank(lines[index]) == best_rank
+    ][:3]
     multi_anchor_priority = lcm_priority + [
-        index for index in ranked_priority[:1] if index not in lcm_priority
+        index for index in ranked_priority[:3] if index not in lcm_priority
     ]
+    if options.max_lines <= 5:
+        concrete_tight_priority = [
+            index
+            for index in ranked_priority + fallback_priority
+            if _failure_detail_rank(lines[index]) == best_rank
+        ][:3]
+        has_concrete_exception = any(
+            re.search(
+                r"\b[a-z0-9_]+error\b(?::|$)|^\s*(?:error|exception):\s*(?!.*\b(?:generic|transient|noise)\b)",
+                lines[index],
+                re.IGNORECASE,
+            )
+            for index in concrete_tight_priority
+        )
+        failed_test_id_pattern = r"\bFAILED\b.*tests?/.*::|tests?/.*::.*\bFAILED\b"
+        has_failed_test_id = any(
+            re.search(failed_test_id_pattern, lines[index], re.IGNORECASE)
+            for index in concrete_tight_priority
+        )
+        if has_concrete_exception and (has_failed_test_id or len(best_ranked_priority) == 1):
+            tight_indices = concrete_tight_priority if has_failed_test_id else best_ranked_priority
+            tight_anchor_candidate = "\n".join(
+                lines[index] for index in sorted(tight_indices)
+            )
+            exit_notice_reserve = len("\n[noisegate: exit_code=1]")
+            if (
+                _fits_budget(tight_anchor_candidate, options)
+                and len(tight_anchor_candidate) + exit_notice_reserve <= options.max_chars
+                and _line_count(tight_anchor_candidate) + 1 <= options.max_lines
+            ):
+                return tight_anchor_candidate
     if len(multi_anchor_priority) > 1:
         for context in range(max_context, -1, -1):
             keep: set[int] = set()
@@ -998,14 +1073,52 @@ def _line_budgeted_important_excerpt(
                 start = max(0, anchor - context)
                 end = min(len(lines), anchor + context + 1)
                 keep.update(range(start, end))
-            candidate = _lines_with_markers(lines, sorted(keep))
+            sorted_keep = sorted(keep)
+            candidate = _lines_with_markers(lines, sorted_keep)
+            if sorted_keep and sorted_keep[-1] < len(lines) - 1:
+                omitted_tail = len(lines) - sorted_keep[-1] - 1
+                candidate_with_tail_marker = (
+                    f"{candidate}\n[noisegate: omitted {omitted_tail} lines]"
+                )
+                if (
+                    _line_count(candidate_with_tail_marker) <= options.max_lines
+                    and len(candidate_with_tail_marker) < len("\n".join(lines))
+                ):
+                    candidate = candidate_with_tail_marker
             if _line_count(candidate) <= options.max_lines:
-                return candidate
+                if len(candidate) <= options.max_chars:
+                    return candidate
+                char_capped = _char_head_tail_preserving_patterns(
+                    candidate,
+                    options,
+                    _preservation_patterns(candidate, patterns),
+                )
+                if (
+                    char_capped is not None
+                    and _fits_budget(char_capped, options)
+                    and (
+                        "[noisegate: omitted" not in candidate
+                        or "[noisegate: omitted" in char_capped
+                    )
+                    and all(
+                        _contains_full_line(char_capped, lines[index])
+                        for index in best_ranked_priority
+                    )
+                ):
+                    return char_capped
+                if "[noisegate: omitted" in candidate:
+                    head_tail_capped = _head_tail(candidate, options)
+                    if head_tail_capped is not None and _fits_budget(head_tail_capped, options):
+                        return head_tail_capped
 
     for anchor in priority:
-        if anchor not in lcm_priority and _would_hide_better_failure_anchor(
-            best_rank,
-            _failure_detail_rank(lines[anchor]),
+        if (
+            anchor not in lcm_priority
+            and _would_hide_better_failure_anchor(
+                best_rank,
+                _failure_detail_rank(lines[anchor]),
+            )
+            and not re.search(r"tests?/.*::.*\bFAILED\b", lines[anchor], re.IGNORECASE)
         ):
             return None
         for context in range(max_context, -1, -1):
@@ -1027,6 +1140,22 @@ def _line_budgeted_important_excerpt(
                 ):
                     return char_capped
                 recovery_suffix_reserve = len("\n[noisegate: exit_code=1]")
+                omitted_before = anchor
+                omitted_after = len(lines) - anchor - 1
+                marked_anchor = "\n".join(
+                    part
+                    for part in (
+                        f"[noisegate: omitted {omitted_before} lines]" if omitted_before else "",
+                        lines[anchor],
+                        f"[noisegate: omitted {omitted_after} lines]" if omitted_after else "",
+                    )
+                    if part
+                )
+                if (
+                    len(marked_anchor) + recovery_suffix_reserve <= options.max_chars
+                    and _fits_budget(marked_anchor, options)
+                ):
+                    return marked_anchor
                 if (
                     len(lines[anchor]) + recovery_suffix_reserve <= options.max_chars
                     and _fits_budget(lines[anchor], options)
@@ -1042,14 +1171,20 @@ def _failure_detail_rank(line: str) -> int:
         return 0
     if re.search(r"^\s*error:\s+.*\b(?:generic|transient|noise)\b", line, re.IGNORECASE):
         return 6
+    if re.fullmatch(r"\s*unhandled\s+exception\s*", line, re.IGNORECASE):
+        return 2
+    if re.search(r"failed to solve|did not complete successfully", line, re.IGNORECASE):
+        return 2
     if _is_diagnostic_detail_line(line):
         return 0
     if re.search(r"npm err!|pnpm err!|err_pnpm|elifecycle|yarn.*error", line, re.IGNORECASE):
         return 0
     if re.search(r"\btraceback\b", line, re.IGNORECASE):
-        return 0
-    if re.search(r"\bFAILED\b.*tests?/.*::|tests?/.*::.*\bFAILED\b", line, re.IGNORECASE):
         return 1
+    if re.search(r"tests?/.*::.*\bFAILED\b\s*\[\s*\d+%\]", line, re.IGNORECASE):
+        return 2
+    if re.search(r"\bFAILED\b.*tests?/.*::|tests?/.*::.*\bFAILED\b", line, re.IGNORECASE):
+        return 0
     if re.search(r"^failed\s+|^error\s+tests?/.*::", line, re.IGNORECASE):
         return 1
     if re.search(r"={2,}.*(failures|errors|short test summary)", line, re.IGNORECASE):
@@ -1066,11 +1201,13 @@ def _failure_detail_rank(line: str) -> int:
 def _is_diagnostic_detail_line(line: str) -> bool:
     if re.search(r"^\s*E\s+", line):
         return True
+    if re.search(r"^\s*(?:e:|err:|error:)", line, re.IGNORECASE):
+        return True
     if _is_incidental_exception_line(line):
         return False
     return bool(
         re.search(
-            r"\b(assertionerror|[a-z0-9_]*error|exceptiongroup|baseexception)\b(?::|$)"
+            r"\b(assertionerror|[a-z0-9_]+error|exceptiongroup|baseexception)\b(?::|$)"
             r"|\bexception\b\s*:"
             r"|\bunhandled\s+exception\b"
             r"|\bexception\s+in\b",
@@ -1709,6 +1846,78 @@ def _store_artifact(text: str, options: NoisegateOptions) -> dict[str, JsonValue
         return {"stored": False, "reason": "artifact_error", "error": str(exc)}
 
 
+def _concrete_failure_excerpt_for_notices(
+    text: str,
+    options: NoisegateOptions,
+) -> str | None:
+    lines = text.splitlines()
+    if options.max_lines < 2:
+        return None
+    concrete_indices = [
+        index
+        for index, line in enumerate(lines)
+        if re.search(
+            r"\b[a-z0-9_]+error\b(?::|$)|^\s*(?:error|exception):\s*(?!.*\b(?:generic|transient|noise)\b)",
+            line,
+            re.IGNORECASE,
+        )
+    ]
+    failed_indices = [
+        index
+        for index, line in enumerate(lines)
+        if re.search(r"\bFAILED\b.*tests?/.*::|tests?/.*::.*\bFAILED\b", line, re.IGNORECASE)
+    ]
+    if not concrete_indices:
+        return None
+
+    rich_keep: set[int] = set()
+    for index in concrete_indices[:2]:
+        if index > 0 and re.search(
+            r"\btraceback\b|\bunhandled\s+exception\b|Externalized tool output",
+            lines[index - 1],
+            re.IGNORECASE,
+        ):
+            rich_keep.add(index - 1)
+        elif index > 1 and re.search(r"\btraceback\b", lines[index - 2], re.IGNORECASE):
+            rich_keep.add(index - 2)
+        rich_keep.add(index)
+    if failed_indices:
+        rich_keep.add(failed_indices[0])
+    for index, line in enumerate(lines):
+        if any(pattern.search(line) for pattern in LCM_EXTERNALIZED_PATTERNS):
+            rich_keep.add(index)
+    if len(rich_keep) > 1:
+        rich_candidate = "\n".join(lines[index] for index in sorted(rich_keep))
+        if _fits_budget(rich_candidate, options):
+            return rich_candidate
+
+    keep = [concrete_indices[0]]
+    if failed_indices:
+        keep.append(failed_indices[0])
+    keep = sorted(set(keep))
+    if len(keep) == 1:
+        index = keep[0]
+        marked_candidate = "\n".join(
+            part
+            for part in (
+                f"[noisegate: omitted {index} lines]" if index else "",
+                lines[index],
+                (
+                    f"[noisegate: omitted {len(lines) - index - 1} lines]"
+                    if index < len(lines) - 1
+                    else ""
+                ),
+            )
+            if part
+        )
+        if _fits_budget(marked_candidate, options):
+            return marked_candidate
+    candidate = "\n".join(lines[index] for index in keep)
+    if _fits_budget(candidate, options):
+        return candidate
+    return None
+
+
 def _append_recovery_notices(
     text: str,
     metadata: dict[str, JsonValue],
@@ -1740,7 +1949,6 @@ def _append_recovery_notices(
         candidate = f"{text}{suffix}"
         if _fits_budget(candidate, options):
             return candidate
-        return text
     if len(suffix) >= budget:
         return _enforce_final_budget(
             text,
@@ -1754,12 +1962,39 @@ def _append_recovery_notices(
         max_chars=text_budget,
         max_lines=max(1, options.max_lines - _line_count(suffix)),
     )
-    shortened = _enforce_final_budget(
+    reserved_tight_excerpt = _concrete_failure_excerpt_for_notices(
         text,
         reserved_options,
-        preserve_patterns=preserve_patterns,
     )
-    if shortened is not None and (
+    if reserved_tight_excerpt is None and reserved_options.max_lines < 2 and re.search(
+        r"\bunhandled\s+exception\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return text
+    used_reserved_tight_excerpt = reserved_tight_excerpt is not None
+    if used_reserved_tight_excerpt:
+        shortened = reserved_tight_excerpt
+    else:
+        shortened = _enforce_final_budget(
+            text,
+            reserved_options,
+            preserve_patterns=preserve_patterns,
+        )
+    if shortened is not None and not used_reserved_tight_excerpt:
+        marked_shortened = _single_preserved_line_excerpt(
+            text,
+            reserved_options,
+            preserve_patterns,
+        )
+        if (
+            marked_shortened is not None
+            and "[noisegate: omitted" in marked_shortened
+            and "[noisegate: omitted" not in shortened
+            and _fits_budget(f"{marked_shortened}{suffix}", options)
+        ):
+            shortened = marked_shortened
+    if shortened is not None and not used_reserved_tight_excerpt and (
         _dropped_preserved_match(
             before=text,
             after=shortened,
@@ -1811,13 +2046,35 @@ def _single_preserved_line_excerpt(
         return None
     layout = _line_layout(text)
     for match in matches:
-        excerpt = _line_centered_excerpt(text, options, match, layout=layout)
-        if excerpt is not None:
-            return excerpt
         line_index = match.line_index
         if line_index is None or line_index < 0 or line_index >= len(layout.lines):
             continue
         line = layout.lines[line_index]
+        excerpt_lines = [line]
+        omitted_before = line_index
+        if (
+            line_index > 0
+            and re.search(r"\btraceback\b", layout.lines[line_index - 1], re.IGNORECASE)
+            and re.search(r"\b[a-z0-9_]+error\b(?::|$)", line, re.IGNORECASE)
+        ):
+            excerpt_lines = [layout.lines[line_index - 1], line]
+            omitted_before = line_index - 1
+        omitted_after = len(layout.lines) - line_index - 1
+        if omitted_before or omitted_after:
+            marked_line = "\n".join(
+                part
+                for part in (
+                    f"[noisegate: omitted {omitted_before} lines]" if omitted_before else "",
+                    *excerpt_lines,
+                    f"[noisegate: omitted {omitted_after} lines]" if omitted_after else "",
+                )
+                if part
+            )
+            if _fits_budget(marked_line, options):
+                return marked_line
+        excerpt = _line_centered_excerpt(text, options, match, layout=layout)
+        if excerpt is not None:
+            return excerpt
         if _fits_budget(line, options):
             return line
     return None
@@ -1978,16 +2235,22 @@ def _looks_like_file_read_command(
     text: str = "",
     exit_code: int | None = None,
 ) -> bool:
-    if (
-        not command
-        or _has_unsafe_shell_expansion(command)
-        or _has_suspicious_shell_quote_escape(command)
-    ):
+    if not command or _has_suspicious_shell_quote_escape(command):
         return False
     segments = _background_segments(command)
+    if (
+        _has_unsafe_shell_expansion(command)
+        and not _has_only_safe_file_read_redirection(command)
+        and len(segments) <= 1
+    ):
+        return False
     if _pipeline_compactable_class(command, sample, text) is not None:
         return False
+    if _pipeline_xargs_compactable_class(command, sample, text) is not None:
+        return False
     prior_compactable = False
+    prior_compactable_output = False
+    prior_compactable_signal = False
     for index, (separator, tokens) in enumerate(segments):
         if _is_setup_segment(tokens):
             continue
@@ -2003,14 +2266,32 @@ def _looks_like_file_read_command(
                 ):
                     if separator == "&&" and prior_compactable and exit_code not in {None, 0}:
                         continue
-                    if separator == "||" and prior_compactable and exit_code not in {None, 0}:
+                    if _prior_compactable_output_blocks_exact_tail(
+                        separator,
+                        prior_compactable,
+                        prior_compactable_output,
+                        prior_compactable_signal,
+                        exit_code,
+                    ) and not _text_has_exact_owner_output_for_tokens(tokens, text):
                         continue
+                    if separator == "||" and prior_compactable:
+                        if exit_code not in {None, 0}:
+                            continue
+                        if prior_compactable_output or prior_compactable_signal:
+                            continue
                     later_segments = [
                         (later_separator, segment)
                         for later_separator, segment in segments[index + 1 :]
                         if segment and not _is_setup_segment(segment)
                     ]
                     if later_segments:
+                        if _later_compactable_output_dominates(
+                            later_segments,
+                            sample,
+                            text,
+                            exit_code,
+                        ) and not _text_has_exact_owner_output_for_tokens(tokens, text):
+                            return False
                         return not any(
                             (later_separator == "&" or prior_compactable)
                             and _compactable_class_for_tokens(segment, sample, text) is not None
@@ -2019,21 +2300,61 @@ def _looks_like_file_read_command(
                     return True
                 if _compactable_class_for_tokens(tokens, sample, text) is not None:
                     prior_compactable = True
+                    if _compactable_output_class_for_tokens(tokens, sample, text) is not None:
+                        prior_compactable_signal = True
+                    if _compactable_output_dominates_for_tokens(tokens, sample, text):
+                        prior_compactable_output = True
                 continue
+        if _tokens_have_unsafe_shell_expansion(tokens):
+            if _compactable_class_for_tokens(tokens, sample, text) is not None:
+                prior_compactable = True
+                if _compactable_output_class_for_tokens(tokens, sample, text) is not None:
+                    prior_compactable_signal = True
+                if _compactable_output_dominates_for_tokens(tokens, sample, text):
+                    prior_compactable_output = True
+            continue
         if not _tokens_start_file_read(tokens):
             if _compactable_class_for_tokens(tokens, sample, text) is not None:
                 prior_compactable = True
+                if _compactable_output_class_for_tokens(tokens, sample, text) is not None:
+                    prior_compactable_signal = True
+                if _compactable_output_dominates_for_tokens(tokens, sample, text):
+                    prior_compactable_output = True
             continue
         if separator == "&&" and prior_compactable and exit_code not in {None, 0}:
             continue
-        if separator == "||" and prior_compactable and exit_code not in {None, 0}:
+        if _prior_compactable_output_blocks_exact_tail(
+            separator,
+            prior_compactable,
+            prior_compactable_output,
+            prior_compactable_signal,
+            exit_code,
+        ) and not _text_has_exact_owner_output_for_tokens(tokens, text):
             continue
+        if separator == "||" and prior_compactable:
+            if exit_code not in {None, 0}:
+                continue
+            if prior_compactable_output:
+                continue
         later_segments = [
             (later_separator, segment)
             for later_separator, segment in segments[index + 1 :]
             if segment and not _is_setup_segment(segment)
         ]
         if later_segments:
+            if any(
+                _compactable_class_for_tokens(segment, sample, text) is not None
+                and _tokens_redirect_stdout(segment)
+                for _, segment in later_segments
+            ):
+                return True
+            if _later_compactable_output_dominates(
+                later_segments,
+                sample,
+                text,
+                exit_code,
+            ) and not _text_has_exact_owner_output_for_tokens(tokens, text):
+                return False
             return not any(
                 (later_separator == "&" or prior_compactable)
                 and _compactable_class_for_tokens(segment, sample, text) is not None
@@ -2073,6 +2394,51 @@ def _has_unsafe_shell_expansion(command: str) -> bool:
         if char in "><`\n\r" or (char == "$" and command[index + 1 : index + 2] == "("):
             return True
     return quote is not None
+
+
+def _has_only_safe_file_read_redirection(command: str) -> bool:
+    """Allow read-only/diagnostic redirections that preserve stdout payloads."""
+
+    if (
+        "$" in command
+        or "`" in command
+        or "\n" in command
+        or "\r" in command
+        or "<(" in command
+        or ">(" in command
+    ):
+        return False
+    tokens = _shell_tokens(command)
+    index = 0
+    saw_safe_redirection = False
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {">", "1>", ">>", "1>>"} or re.match(r"^(?:[01]?>|[01]>>|>>|>)", token):
+            return False
+        if token in {"<", "0<"}:
+            if index + 1 >= len(tokens) or tokens[index + 1].startswith("-"):
+                return False
+            saw_safe_redirection = True
+            index += 2
+            continue
+        if token.startswith("<") or token.startswith("0<"):
+            saw_safe_redirection = True
+            index += 1
+            continue
+        if token in {"2>", "2>>"}:
+            if index + 1 >= len(tokens) or tokens[index + 1] != "/dev/null":
+                return False
+            saw_safe_redirection = True
+            index += 2
+            continue
+        if token in {"2>/dev/null", "2>>/dev/null"}:
+            saw_safe_redirection = True
+            index += 1
+            continue
+        if "<" in token or ">" in token:
+            return False
+        index += 1
+    return saw_safe_redirection
 
 
 def _has_suspicious_shell_quote_escape(command: str) -> bool:
@@ -2328,6 +2694,8 @@ def _is_source_search_command(
         return False
     segments = _background_segments(command)
     prior_compactable = False
+    prior_compactable_output = False
+    prior_compactable_signal = False
     for index, (separator, tokens) in enumerate(segments):
         if _is_setup_segment(tokens):
             continue
@@ -2341,16 +2709,44 @@ def _is_source_search_command(
                     text=text,
                     exit_code=exit_code,
                 ):
+                    if (
+                        separator == "&&"
+                        and prior_compactable
+                        and (prior_compactable_output or prior_compactable_signal)
+                        and not (
+                            _tokens_source_search_hides_filenames(tokens)
+                            or _contains_likely_source_search_output(text)
+                        )
+                    ):
+                        continue
                     if separator == "&&" and prior_compactable and exit_code not in {None, 0}:
                         continue
-                    if separator == "||" and prior_compactable and exit_code not in {None, 0}:
+                    if _prior_compactable_output_blocks_exact_tail(
+                        separator,
+                        prior_compactable,
+                        prior_compactable_output,
+                        prior_compactable_signal,
+                        exit_code,
+                    ) and not _text_has_exact_owner_output_for_tokens(tokens, text):
                         continue
+                    if separator == "||" and prior_compactable:
+                        if exit_code not in {None, 0}:
+                            continue
+                        if prior_compactable_output or prior_compactable_signal:
+                            continue
                     later_segments = [
                         (later_separator, segment)
                         for later_separator, segment in segments[index + 1 :]
                         if segment and not _is_setup_segment(segment)
                     ]
                     if later_segments:
+                        if _later_compactable_output_dominates(
+                            later_segments,
+                            sample,
+                            text,
+                            exit_code,
+                        ) and not _text_has_exact_owner_output_for_tokens(tokens, text):
+                            return False
                         return not any(
                             (later_separator == "&" or prior_compactable)
                             and _compactable_class_for_tokens(segment, sample, text) is not None
@@ -2359,18 +2755,60 @@ def _is_source_search_command(
                     return True
                 if _compactable_class_for_tokens(tokens, sample, text) is not None:
                     prior_compactable = True
+                    if _compactable_output_class_for_tokens(tokens, sample, text) is not None:
+                        prior_compactable_signal = True
+                    if _compactable_output_dominates_for_tokens(tokens, sample, text):
+                        prior_compactable_output = True
                 continue
+        if _tokens_have_unsafe_shell_expansion(tokens):
+            if _compactable_class_for_tokens(tokens, sample, text) is not None:
+                prior_compactable = True
+                if _compactable_output_class_for_tokens(tokens, sample, text) is not None:
+                    prior_compactable_signal = True
+                if _compactable_output_dominates_for_tokens(tokens, sample, text):
+                    prior_compactable_output = True
+            continue
         if _tokens_start_source_search(tokens) or _tokens_pipe_to_source_search(tokens):
+            if (
+                separator == "&&"
+                and prior_compactable
+                and (prior_compactable_output or prior_compactable_signal)
+                and not (
+                    _tokens_source_search_hides_filenames(tokens)
+                    or _contains_likely_source_search_output(text)
+                )
+            ):
+                continue
             if separator == "&&" and prior_compactable and exit_code not in {None, 0}:
                 continue
-            if separator == "||" and prior_compactable and exit_code not in {None, 0}:
+            if _prior_compactable_output_blocks_exact_tail(
+                separator,
+                prior_compactable,
+                prior_compactable_output,
+                prior_compactable_signal,
+                exit_code,
+            ) and not _text_has_exact_owner_output_for_tokens(tokens, text):
                 continue
+            if separator == "||" and prior_compactable:
+                if exit_code not in {None, 0}:
+                    continue
+                if prior_compactable_output or prior_compactable_signal:
+                    continue
+                if not _text_has_exact_output_for_tokens(tokens, text):
+                    continue
             later_segments = [
                 (later_separator, segment)
                 for later_separator, segment in segments[index + 1 :]
                 if segment and not _is_setup_segment(segment)
             ]
             if later_segments:
+                if _later_compactable_output_dominates(
+                    later_segments,
+                    sample,
+                    text,
+                    exit_code,
+                ) and not _text_has_exact_owner_output_for_tokens(tokens, text):
+                    return False
                 return not any(
                     (later_separator == "&" or prior_compactable)
                     and _compactable_class_for_tokens(segment, sample, text) is not None
@@ -2379,6 +2817,10 @@ def _is_source_search_command(
             return True
         if _compactable_class_for_tokens(tokens, sample, text) is not None:
             prior_compactable = True
+            if _compactable_output_class_for_tokens(tokens, sample, text) is not None:
+                prior_compactable_signal = True
+            if _compactable_output_dominates_for_tokens(tokens, sample, text):
+                prior_compactable_output = True
     return False
 
 
@@ -2455,6 +2897,20 @@ def _background_segments(command: str) -> list[tuple[str | None, list[str]]]:
     return segments
 
 
+def _prior_compactable_output_blocks_exact_tail(
+    separator: str | None,
+    prior_compactable: bool,
+    prior_compactable_output: bool,
+    prior_compactable_signal: bool,
+    exit_code: int | None,
+) -> bool:
+    if separator != "&&" or not prior_compactable:
+        return False
+    if exit_code not in {None, 0}:
+        return True
+    return exit_code is None and (prior_compactable_output or prior_compactable_signal)
+
+
 def _later_compactable_class(
     segments: list[tuple[str | None, list[str]]],
     sample: str,
@@ -2467,6 +2923,45 @@ def _later_compactable_class(
         if command_class is not None:
             return command_class
     return None
+
+
+def _later_compactable_output_ran(
+    segments: list[tuple[str | None, list[str]]],
+    sample: str,
+    text: str,
+    exit_code: int | None,
+) -> bool:
+    for separator, tokens in segments:
+        if not tokens or _is_setup_segment(tokens):
+            continue
+        if separator == "&":
+            continue
+        if separator == "||" and exit_code == 0:
+            continue
+        command_class = _compactable_output_class_for_tokens(tokens, sample, text)
+        if command_class is not None:
+            return True
+    return False
+
+
+def _later_compactable_output_dominates(
+    segments: list[tuple[str | None, list[str]]],
+    sample: str,
+    text: str,
+    exit_code: int | None,
+) -> bool:
+    for separator, tokens in segments:
+        if not tokens or _is_setup_segment(tokens):
+            continue
+        if separator == "&":
+            continue
+        if separator == "||" and exit_code == 0:
+            continue
+        if _exact_class_for_tokens(tokens) is not None:
+            continue
+        if _compactable_output_dominates_for_tokens(tokens, sample, text):
+            return True
+    return False
 
 
 def _later_exact_tail_class(
@@ -2498,28 +2993,74 @@ def _later_exact_tail_class(
 def _exact_class_for_tokens(tokens: list[str]) -> str | None:
     if _tokens_have_unsafe_shell_expansion(tokens):
         return None
-    if _tokens_start_file_read(tokens):
-        return "file_read"
     if _tokens_start_source_search(tokens) or _tokens_pipe_to_source_search(tokens):
         return "source_search"
+    if _tokens_start_file_read(tokens):
+        return "file_read"
     return None
 
 
+def _tokens_redirect_stdout(tokens: list[str]) -> bool:
+    for index, token in enumerate(tokens):
+        if token in {">", ">>", "1>", ">|"}:
+            return True
+        if token.startswith((">", "1>")) and token not in {"2>", "2>>"}:
+            return True
+        if token == "&>":
+            return True
+        if token.startswith("&>"):
+            return True
+        if token in {"2>", "2>>"}:
+            continue
+        if token == "2" and index + 1 < len(tokens) and tokens[index + 1] in {">", ">>"}:
+            continue
+    return False
+
+
 def _tokens_have_unsafe_shell_expansion(tokens: list[str]) -> bool:
+    for index, token in enumerate(tokens):
+        if token == "<" and index + 1 < len(tokens) and tokens[index + 1] == "(":
+            return True
+        if (
+            "`" in token
+            or token.startswith(("<(", ">("))
+            or token in {">", ">>", "1>", "&>", ">|"}
+            or token.startswith((">", "1>", "&>"))
+        ):
+            return True
+    return False
+
+
+def _tokens_start_exact_output_producer(tokens: list[str]) -> bool:
+    if _tokens_start_source_search(tokens) or _tokens_start_file_read(tokens):
+        return True
+    if _tokens_pipe_to_source_search(tokens):
+        return True
+    if _tokens_start_find_path_list(tokens):
+        return True
+    command = shlex.join(tokens)
     return any(
-        "<" in token or ">" in token or "`" in token or "$" in token for token in tokens
+        _tokens_start_source_search(segment)
+        or _tokens_start_file_read(segment)
+        or _tokens_pipe_to_source_search(segment)
+        for segment in _command_execution_segments(command)
+        if segment
     )
 
 
 def _pipeline_compactable_class(command: str, sample: str, text: str) -> str | None:
-    for tokens in _command_token_segments(command):
+    token_variants = [_shell_tokens(variant) for variant in _command_intent_variants(command)]
+    token_variants.extend(_command_token_segments(command))
+    for tokens in token_variants:
         for index, token in enumerate(tokens[:-1]):
             if token != "|":
                 continue
             upstream = tokens[:index]
-            if not (_tokens_start_source_search(upstream) or _tokens_start_file_read(upstream)):
+            if not _tokens_start_exact_output_producer(upstream):
                 continue
             downstream = _strip_command_wrappers(tokens[index + 1 :])
+            if _tokens_start_exact_output_producer(downstream):
+                continue
             command_class = _compactable_class_for_tokens(downstream, sample, text)
             if command_class is not None:
                 return command_class
@@ -2527,16 +3068,20 @@ def _pipeline_compactable_class(command: str, sample: str, text: str) -> str | N
 
 
 def _pipeline_xargs_compactable_class(command: str, sample: str, text: str) -> str | None:
-    for tokens in _command_token_segments(command):
+    token_variants = [_shell_tokens(variant) for variant in _command_intent_variants(command)]
+    token_variants.extend(_command_token_segments(command))
+    for tokens in token_variants:
         for index, token in enumerate(tokens[:-1]):
             if token != "|":
                 continue
             upstream = tokens[:index]
-            if not (_tokens_start_source_search(upstream) or _tokens_start_file_read(upstream)):
+            if not _tokens_start_exact_output_producer(upstream):
                 continue
             downstream = _strip_command_wrappers(tokens[index + 1 :])
             payload = _command_runner_payload(downstream)
             if payload is None:
+                continue
+            if _tokens_start_exact_output_producer(payload):
                 continue
             command_class = _compactable_class_for_tokens(payload, sample, text)
             if command_class is not None:
@@ -2627,26 +3172,268 @@ def _compactable_output_class_for_tokens(
     return command_class
 
 
+def _compactable_output_dominates_for_tokens(
+    tokens: list[str],
+    sample: str,
+    text: str,
+) -> bool:
+    command_class = _compactable_class_for_tokens(tokens, sample, text)
+    if command_class is None:
+        return False
+    output = f"{sample}\n{text}"
+    if command_class in {"pytest", "unittest"}:
+        has_pytest_summary = bool(
+            re.search(r"(?im)^={2,}.*(?:failures|errors|short test summary)", output)
+            or re.search(r"(?im)^tests?/.*::.*\b(?:failed|error)\b", output)
+            or len(re.findall(r"(?im)^pytest\b", output)) >= 3
+        )
+        has_traceback_detail = bool(
+            re.search(r"(?im)^traceback \(most recent call last\):", output)
+            and (
+                re.search(r"(?im)^\s*file \".+\", line \d+", output)
+                or re.search(r"(?im)^\s*e\s+", output)
+                or re.search(
+                    r"(?i)\b(?:assertionerror|modulenotfounderror|importerror|typeerror|referenceerror|runtimeerror):",
+                    output,
+                )
+            )
+        )
+        return has_pytest_summary or has_traceback_detail
+    if command_class in {"apt", "python_package"}:
+        return bool(
+            re.search(r"(?im)^(?:e:|err:|error:)", output)
+            or re.search(
+                r"(?i)resolutionimpossible|no matching distribution found|unable to locate package",
+                output,
+            )
+        )
+    if command_class == "node":
+        return bool(
+            len(re.findall(r"(?im)^(?:npm err!|pnpm err!|yarn.*error|err_pnpm)", output)) >= 2
+            or re.search(r"(?i)\b(?:typeerror|referenceerror|syntaxerror|rangeerror):", output)
+            or re.search(r"(?im)^\s*error:\s+cannot find module\b", output)
+        )
+    if command_class == "docker_build":
+        return bool(
+            re.search(r"(?im)^(?:#\d+\s+error\b|failed to solve\b|error: failed\b)", output)
+            or _looks_like_docker_build_output(output)
+        )
+    return _compactable_output_class_for_tokens(tokens, sample, text) is not None
+
+
 def _is_setup_segment(tokens: list[str]) -> bool:
     setup_commands = {".", "cd", "export", "popd", "pushd", "pwd", "set", "source", "true"}
     return bool(tokens and Path(tokens[0]).name in setup_commands)
 
 
 def _text_has_exact_output_for_tokens(tokens: list[str], text: str) -> bool:
-    if _tokens_start_source_search(tokens):
-        return _contains_likely_source_search_output(text)
+    if _tokens_start_source_search(tokens) or _tokens_pipe_to_source_search(tokens):
+        return (
+            _tokens_source_search_hides_filenames(tokens)
+            or _contains_likely_source_search_output(text)
+            or _source_search_pattern_appears_in_text(tokens, text)
+        )
     if _tokens_start_file_read(tokens):
         return _contains_likely_file_read_output(text)
     return False
 
 
+def _text_has_exact_owner_output_for_tokens(tokens: list[str], text: str) -> bool:
+    if _tokens_start_source_search(tokens) or _tokens_pipe_to_source_search(tokens):
+        if _looks_like_test_failure_output(text) and not _source_search_pattern_appears_in_text(
+            tokens,
+            text,
+        ):
+            return False
+        return _contains_likely_source_search_output(
+            text,
+        ) or _source_search_pattern_appears_in_text(tokens, text)
+    if _tokens_start_file_read(tokens):
+        return (
+            _contains_likely_dominant_file_read_output(text)
+            or _starts_like_file_read_output(text)
+            or _tokens_read_plain_text_file(tokens)
+        )
+    return False
+
+
+def _looks_like_test_failure_output(text: str) -> bool:
+    lowered = text.lower()
+    return (
+        "=== failures ===" in lowered
+        or "failed tests/" in lowered
+        or re.search(r"^tests/.+:\d+:\s*(?:assertionerror|error|failed)", text, re.MULTILINE)
+        is not None
+    )
+
+
+def _tokens_read_plain_text_file(tokens: list[str]) -> bool:
+    tokens = _strip_command_wrappers(tokens)
+    runner_tokens = _command_runner_payload(tokens)
+    if runner_tokens is not None:
+        tokens = runner_tokens
+    return any(
+        Path(token).suffix.lower() in {".txt", ".log"}
+        for token in tokens[1:]
+        if token and not token.startswith("-")
+    )
+
+
+def _text_has_dominant_exact_output_for_tokens(tokens: list[str], text: str) -> bool:
+    if _tokens_start_source_search(tokens) or _tokens_pipe_to_source_search(tokens):
+        return (
+            _tokens_source_search_hides_filenames(tokens)
+            or _contains_likely_source_search_output(text)
+            or _source_search_pattern_appears_in_text(tokens, text)
+        )
+    if _tokens_start_file_read(tokens):
+        return _contains_likely_dominant_file_read_output(text)
+    return False
+
+
+def _tokens_source_search_hides_filenames(tokens: list[str]) -> bool:
+    tokens = _strip_command_wrappers(tokens)
+    if tokens and Path(tokens[0]).name in {"bash", "sh", "zsh"}:
+        shell_command = _shell_c_argument(tokens[1:])
+        if shell_command is None:
+            return False
+        return any(
+            _tokens_source_search_hides_filenames(segment)
+            for segment in _command_token_segments(shell_command)
+            if segment
+        )
+    runner_tokens = _command_runner_payload(tokens)
+    if runner_tokens is not None:
+        return _tokens_source_search_hides_filenames(runner_tokens)
+    return any(
+        token == "--no-filename"
+        or (token.startswith("-") and not token.startswith("--") and "h" in token[1:])
+        for token in tokens
+    )
+
+
+def _source_search_pattern_appears_in_text(tokens: list[str], text: str) -> bool:
+    tokens = _strip_command_wrappers(tokens)
+    if tokens and Path(tokens[0]).name in {"bash", "sh", "zsh"}:
+        shell_command = _shell_c_argument(tokens[1:])
+        if shell_command is None:
+            return False
+        return any(
+            _source_search_pattern_appears_in_text(segment, text)
+            for segment in _command_token_segments(shell_command)
+            if segment
+        )
+    runner_tokens = _command_runner_payload(tokens)
+    if runner_tokens is not None:
+        return _source_search_pattern_appears_in_text(runner_tokens, text)
+    if not tokens or Path(tokens[0]).name not in SOURCE_SEARCH_COMMANDS | {"git"}:
+        return False
+    if Path(tokens[0]).name == "git":
+        for index, token in enumerate(tokens[1:], start=1):
+            if token == "grep":
+                return _source_search_pattern_appears_in_text(tokens[index:], text)
+        return False
+
+    if any(
+        (
+            token == "-l"
+            or (token.startswith("-") and not token.startswith("--") and "l" in token[1:])
+            or token in {"--files-with-matches", "--files-without-match"}
+        )
+        for token in tokens[1:]
+    ):
+        return False
+
+    for index, token in enumerate(tokens[1:], start=1):
+        if token in {"-e", "--regexp"} and index + 1 < len(tokens):
+            pattern = tokens[index + 1].strip()
+            return len(pattern) >= 3 and pattern.lower() in text.lower()
+        if token.startswith("-e") and not token.startswith("--") and len(token) > 2:
+            pattern = token[2:].strip()
+            return len(pattern) >= 3 and pattern.lower() in text.lower()
+        if token.startswith("--regexp="):
+            pattern = token.split("=", 1)[1].strip()
+            return len(pattern) >= 3 and pattern.lower() in text.lower()
+
+    source_options_with_values = {
+        "-A",
+        "-B",
+        "-C",
+        "-f",
+        "-g",
+        "-m",
+        "--after-context",
+        "--before-context",
+        "--colors",
+        "--context",
+        "--encoding",
+        "--engine",
+        "--field-context-separator",
+        "--field-match-separator",
+        "--glob",
+        "--iglob",
+        "--include",
+        "--exclude",
+        "--exclude-dir",
+        "--exclude-from",
+        "--label",
+        "--max-count",
+        "--path-separator",
+        "--replace",
+        "--sort",
+        "--sort-files",
+        "--type",
+        "--type-add",
+    }
+
+    option_value_next = False
+    for token in tokens[1:]:
+        if option_value_next:
+            option_value_next = False
+            continue
+        if token == "--":
+            continue
+        if token in source_options_with_values or token in {"-e", "--regexp"}:
+            option_value_next = True
+            continue
+        if token.startswith("--") and "=" in token:
+            continue
+        if token.startswith("--") and "=" not in token:
+            continue
+        if token.startswith("-") and not token.startswith("--"):
+            continue
+        pattern = token.strip()
+        if len(pattern) < 3 or pattern in {".", "*"}:
+            continue
+        return pattern.lower() in text.lower()
+    return False
+
+
 def _contains_likely_source_search_output(text: str) -> bool:
     path_match = re.compile(
-        r"^[\w./~-]+\.(?:py|pyi|js|jsx|ts|tsx|md|txt|toml|ya?ml|json|sh|css|html)"
-        r"(?::\d+)?[:\t ]"
+        r"^(?:"
+        r"[\w./~-]+\."
+        r"(?:py|pyi|js|jsx|ts|tsx|md|txt|toml|ya?ml|json|sh|css|html|go|rs|java|"
+        r"c|cc|cpp|cxx|h|hpp|rb|php|kt|kts|swift|scala|cs|sql|mod|sum|lock)"
+        r"|[\w./~-]*/[\w.~+-]+"
+        r"|[\w.~+-]+:\d+"
+        r"|(?:Makefile|Dockerfile|Containerfile|Rakefile|Gemfile|Procfile|BUILD|WORKSPACE)"
+        r")(?::\d+)?[:\t ]",
+        re.IGNORECASE,
+    )
+    path_only_match = re.compile(
+        r"^(?:"
+        r"[\w./~-]+\."
+        r"(?:py|pyi|js|jsx|ts|tsx|md|txt|toml|ya?ml|json|sh|css|html|go|rs|java|"
+        r"c|cc|cpp|cxx|h|hpp|rb|php|kt|kts|swift|scala|cs|sql|mod|sum|lock)"
+        r"|[\w./~-]*/[\w.~+-]+"
+        r"|[\w.~+-]+"
+        r"|(?:Makefile|Dockerfile|Containerfile|Rakefile|Gemfile|Procfile|BUILD|WORKSPACE)"
+        r")$",
+        re.IGNORECASE,
     )
     return any(
-        path_match.match(line)
+        path_match.match(line) or path_only_match.match(line.strip())
         for line in text.splitlines()
     )
 
@@ -2673,6 +3460,62 @@ def _contains_likely_file_read_output(text: str) -> bool:
         "<",
     )
     return any(line.lstrip().startswith(code_markers) for line in text.splitlines())
+
+
+def _starts_like_file_read_output(text: str) -> bool:
+    code_markers = (
+        "#!",
+        "# ",
+        "// ",
+        "/*",
+        "def ",
+        "class ",
+        "import ",
+        "from ",
+        "export ",
+        "const ",
+        "let ",
+        "var ",
+        "function ",
+        "package ",
+        "module ",
+        "[",
+        "{",
+        "<",
+    )
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if not stripped:
+            continue
+        return stripped.startswith(code_markers)
+    return False
+
+
+def _contains_likely_dominant_file_read_output(text: str) -> bool:
+    code_markers = (
+        "#!",
+        "# ",
+        "// ",
+        "/*",
+        "def ",
+        "class ",
+        "import ",
+        "from ",
+        "export ",
+        "const ",
+        "let ",
+        "var ",
+        "function ",
+        "package ",
+        "module ",
+        "[",
+        "{",
+        "<",
+    )
+    marker_lines = [
+        line for line in text.splitlines() if line.lstrip().startswith(code_markers)
+    ]
+    return len(marker_lines) >= 3
 
 
 def _tokens_start_source_search(tokens: list[str]) -> bool:
@@ -2704,6 +3547,8 @@ def _tokens_start_file_read(tokens: list[str]) -> bool:
     runner_tokens = _command_runner_payload(tokens)
     if runner_tokens is not None:
         return _tokens_start_file_read(runner_tokens)
+    if _tokens_pipe_to_file_read(tokens):
+        return True
     if not tokens:
         return False
     token_name = Path(tokens[0]).name
@@ -2730,6 +3575,39 @@ def _tokens_start_compactable_command(tokens: list[str]) -> bool:
     return bool(python_module is not None and python_module[0] == "pip")
 
 
+def _tokens_start_find_path_list(tokens: list[str]) -> bool:
+    tokens = _strip_command_wrappers(tokens)
+    if not tokens or Path(tokens[0]).name != "find":
+        return False
+    return "-exec" not in tokens
+
+
+def _tokens_pipe_to_file_read(tokens: list[str]) -> bool:
+    tokens = _strip_command_wrappers(tokens)
+    for index, token in enumerate(tokens[:-1]):
+        if token == "|":
+            downstream = _strip_command_wrappers(tokens[index + 1 :])
+            upstream = tokens[:index]
+            if _tokens_start_compactable_command(upstream):
+                continue
+            if not (
+                _tokens_start_file_read(upstream)
+                or _tokens_start_find_path_list(upstream)
+                or _tokens_start_source_search(upstream)
+            ):
+                continue
+            payload = _command_runner_payload(downstream)
+            if payload is not None:
+                downstream = payload
+            if _tokens_start_file_read(downstream):
+                return True
+        if Path(tokens[0]).name == "find" and token == "-exec":
+            exec_tokens = tokens[index + 1 :]
+            if _tokens_start_file_read(exec_tokens):
+                return True
+    return False
+
+
 def _tokens_pipe_to_source_search(tokens: list[str]) -> bool:
     tokens = _strip_command_wrappers(tokens)
     for index, token in enumerate(tokens[:-1]):
@@ -2740,12 +3618,10 @@ def _tokens_pipe_to_source_search(tokens: list[str]) -> bool:
                 if _tokens_start_compactable_command(upstream):
                     continue
                 return True
-        if (
-            Path(tokens[0]).name == "find"
-            and token == "-exec"
-            and Path(tokens[index + 1]).name in SOURCE_SEARCH_COMMANDS
-        ):
-            return True
+        if Path(tokens[0]).name == "find" and token == "-exec":
+            exec_tokens = tokens[index + 1 :]
+            if _tokens_start_source_search(exec_tokens):
+                return True
     return False
 
 
@@ -2761,7 +3637,7 @@ def _command_runner_payload(tokens: list[str]) -> list[str] | None:
             return _skip_option_tokens(rest[1:])
         return None
     if command == "npx":
-        shell_command = _shell_c_argument(tokens[1:])
+        shell_command = _runner_shell_call_argument(tokens[1:])
         if shell_command is not None:
             return _shell_tokens(shell_command)
         return _skip_option_tokens(tokens[1:])
@@ -2770,10 +3646,39 @@ def _command_runner_payload(tokens: list[str]) -> list[str] | None:
     if command in {"npm", "pnpm", "yarn"}:
         rest = _skip_option_tokens(tokens[1:])
         if rest and rest[0] in {"dlx", "exec"}:
-            shell_command = _shell_c_argument(rest[1:])
+            shell_command = _runner_shell_call_argument(rest[1:])
             if shell_command is not None:
                 return _shell_tokens(shell_command)
             return _skip_option_tokens(rest[1:])
+    return None
+
+
+def _runner_shell_call_argument(tokens: list[str]) -> str | None:
+    value_options = {
+        "-p",
+        "--package",
+        "-w",
+        "--workspace",
+        "--workspace-root",
+        "--prefix",
+        "--dir",
+        "--filter",
+    }
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            return None
+        if not token.startswith("-"):
+            return None
+        option_name = token.split("=", 1)[0]
+        if token.startswith("--call="):
+            return token.split("=", 1)[1]
+        if token in {"-c", "--call"} and index + 1 < len(tokens):
+            return tokens[index + 1]
+        index += 1
+        if option_name in value_options and "=" not in token and index < len(tokens):
+            index += 1
     return None
 
 
@@ -2832,8 +3737,18 @@ def _command_intent_variants(command: str) -> tuple[str, ...]:
     return tuple(variants)
 
 
+def _strip_grouping_tokens(tokens: list[str]) -> list[str]:
+    while tokens and tokens[0] in {"(", "{"}:
+        tokens = tokens[1:]
+    while tokens and tokens[-1] in {")",
+        "}",
+    }:
+        tokens = tokens[:-1]
+    return tokens
+
+
 def _strip_command_wrappers(tokens: list[str]) -> list[str]:
-    tokens = _strip_assignment_tokens(tokens)
+    tokens = _strip_assignment_tokens(_strip_grouping_tokens(tokens))
     while tokens:
         command = Path(tokens[0]).name
         command_name = Path(command).name
@@ -2998,7 +3913,7 @@ def _skip_option_tokens(tokens: list[str]) -> list[str]:
 
 def _shell_tokens(command: str) -> list[str]:
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="();&|{}")
         lexer.whitespace_split = True
         return list(lexer)
     except ValueError:

@@ -162,10 +162,21 @@ def test_build_metadata_includes_product_contract_docs() -> None:
     wheel_force_include = pyproject["tool"]["hatch"]["build"]["targets"]["wheel"][
         "force-include"
     ]
+    npm_package = json.loads(
+        (root / "npm" / "noisegate" / "package.json").read_text(encoding="utf-8")
+    )
+    product_contract = (root / "docs" / "product-contract.md").read_text(
+        encoding="utf-8"
+    )
+    npm_product_contract = (
+        root / "npm" / "noisegate" / "docs" / "product-contract.md"
+    ).read_text(encoding="utf-8")
 
     assert "/npm" in include
     assert "/docs" in include
     assert wheel_force_include["docs/product-contract.md"] == "docs/product-contract.md"
+    assert "docs/product-contract.md" in npm_package["files"]
+    assert npm_product_contract == product_contract
 
 
 def test_standalone_publish_workflows_checkout_requested_tag() -> None:

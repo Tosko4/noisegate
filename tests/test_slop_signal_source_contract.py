@@ -825,6 +825,62 @@ def test_runner_wrapped_compactable_commands_keep_their_specific_reducers() -> N
         assert signal in result.text, command
 
 
+def test_node_reducer_keeps_late_js_exception_under_tight_budget() -> None:
+    raw = "\n".join(
+        [
+            *[f"npm ERR! lifecycle noise before {index}" for index in range(120)],
+            "TypeError: Cannot read properties of undefined (reading 'value')",
+            "ReferenceError: missingValue is not defined",
+            *[f"npm ERR! lifecycle noise after {index}" for index in range(120)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="npm test",
+        tool_name="terminal",
+        exit_code=1,
+        options=opts(max_chars=260, max_lines=8, head_lines=1, tail_lines=1),
+    )
+
+    assert result.changed is True
+    assert result.metadata["command_class"] == "node"
+    assert "TypeError: Cannot read properties" in result.text
+    assert "ReferenceError: missingValue" in result.text
+
+
+def test_node_reducer_keeps_late_plain_error_root_cause_under_tight_budget() -> None:
+    raw = "\n".join(
+        [
+            *[f"npm ERR! lifecycle noise before {index}" for index in range(120)],
+            "Error: Cannot find module 'left-pad'",
+            "    at Object.<anonymous> (app.js:1:1)",
+            *[f"npm ERR! lifecycle noise after {index}" for index in range(120)],
+        ]
+    )
+
+    for command in (
+        "npm test",
+        "cat package.json && npm test",
+        "cat package.json; npm test",
+        "bash -lc 'cat package.json && npm test'",
+    ):
+        for max_chars, max_lines in ((220, 3), (220, 4), (220, 5), (260, 8)):
+            result = reduce_text(
+                raw,
+                command=command,
+                tool_name="terminal",
+                exit_code=1,
+                options=opts(max_chars=max_chars, max_lines=max_lines, head_lines=1, tail_lines=1),
+            )
+
+            case = f"{command} max_chars={max_chars} max_lines={max_lines}"
+            assert result.changed is True, case
+            assert result.metadata["command_class"] == "node", case
+            assert "Error: Cannot find module 'left-pad'" in result.text, case
+            assert "[noisegate: exit_code=1]" in result.text, case
+
+
 def test_path_qualified_command_mentions_in_arguments_do_not_drive_classification() -> None:
     raw = package_progress("ordinary output")
     cases = {
@@ -944,6 +1000,7 @@ def test_background_jobs_use_later_compactable_command_class() -> None:
         "uv run python -m pytest -q",
         ".venv/bin/pytest -q",
         "cat file.py | pytest -q",
+        "{ cat file.py; } | pytest -q",
         "rg -l test tests | pytest -q",
         "pytest -q || cat file.py",
     ):
@@ -1051,6 +1108,18 @@ def test_source_search_feeding_xargs_uses_consumer_command_class() -> None:
             "FAILED tests/test_demo.py::test_signal",
         ),
         (
+            "{ rg -l test tests; } | xargs pytest -q",
+            pytest_raw,
+            "pytest",
+            "FAILED tests/test_demo.py::test_signal",
+        ),
+        (
+            "find src -name '*.py' -exec rg target {} + | xargs pytest -q",
+            pytest_raw,
+            "pytest",
+            "FAILED tests/test_demo.py::test_signal",
+        ),
+        (
             "rg -l test tests | xargs bash -lc 'pytest -q'",
             pytest_raw,
             "pytest",
@@ -1080,9 +1149,20 @@ def test_source_search_feeding_xargs_uses_consumer_command_class() -> None:
         assert result.changed is True
         assert result.metadata["command_class"] == expected_class
         assert signal in result.text
+    swallowed_exit = reduce_text(
+        pytest_raw,
+        command="find tests -name '*.py' -print0 | xargs -0 -r pytest -q || true",
+        tool_name="terminal",
+        exit_code=0,
+        options=opts(max_chars=500, max_lines=10),
+    )
+
+    assert swallowed_exit.changed is True
+    assert swallowed_exit.metadata["command_class"] == "pytest"
+    assert "FAILED tests/test_demo.py::test_signal" in swallowed_exit.text
 
 
-def test_later_chained_exact_source_commands_fail_open_instead_of_dropping_exact_output() -> None:
+def test_later_chained_compactable_commands_override_exact_passthrough() -> None:
     pytest_raw = "\n".join(
         [
             *[f"pytest noise before {index}" for index in range(80)],
@@ -1097,12 +1177,49 @@ def test_later_chained_exact_source_commands_fail_open_instead_of_dropping_exact
             *[f"npm noise after {index}" for index in range(80)],
         ]
     )
+    realistic_pytest_with_frame = "\n".join(
+        [
+            "=================================== FAILURES ===================================",
+            "____________________________ test_writes_config ____________________________",
+            "E       AssertionError: expected private mode",
+            "tests/test_artifacts.py:37: AssertionError",
+            *[f"pytest noise after {index}" for index in range(80)],
+            "FAILED tests/test_artifacts.py::test_writes_config - AssertionError",
+        ]
+    )
 
-    for command, raw, expected_class in (
-        ("rg -l test tests && pytest -q", pytest_raw, "source_search"),
-        ("rg target src; npm install", node_raw, "source_search"),
-        ("bash -lc 'rg -l test tests && pytest -q'", pytest_raw, "source_search"),
-        ("cat notes.txt; npm install", node_raw, "file_read"),
+    for command, raw, expected_class, signal in (
+        (
+            "rg -l test tests && pytest -q",
+            pytest_raw,
+            "pytest",
+            "FAILED tests/test_demo.py::test_signal",
+        ),
+        (
+            "rg -h target src && pytest -q",
+            pytest_raw,
+            "pytest",
+            "FAILED tests/test_demo.py::test_signal",
+        ),
+        (
+            "grep -h target src && pytest -q",
+            pytest_raw,
+            "pytest",
+            "FAILED tests/test_demo.py::test_signal",
+        ),
+        (
+            "rg target src && pytest -q",
+            realistic_pytest_with_frame,
+            "pytest",
+            "FAILED tests/test_artifacts.py::test_writes_config",
+        ),
+        ("rg target src; npm install", node_raw, "node", "npm ERR! code ERESOLVE"),
+        (
+            "bash -lc 'rg -l test tests && pytest -q'",
+            pytest_raw,
+            "pytest",
+            "FAILED tests/test_demo.py::test_signal",
+        ),
     ):
         result = reduce_text(
             raw,
@@ -1112,9 +1229,9 @@ def test_later_chained_exact_source_commands_fail_open_instead_of_dropping_exact
             options=opts(max_chars=500, max_lines=10),
         )
 
-        assert result.changed is False, command
-        assert result.text == raw, command
+        assert result.changed is True, command
         assert result.metadata["command_class"] == expected_class, command
+        assert signal in result.text, command
 
 
 def test_short_circuit_semantics_do_not_override_exact_reads_blindly() -> None:
@@ -1138,6 +1255,66 @@ def test_short_circuit_semantics_do_not_override_exact_reads_blindly() -> None:
     assert successful_cat.changed is False
     assert successful_cat.text == raw_source
     assert successful_cat.metadata["command_class"] == "file_read"
+
+    source_with_test_words = "\n".join(
+        [
+            "FAILED tests/test_demo.py::test_signal literal in source",
+            "const message = 'npm ERR! code ERESOLVE literal in source';",
+            *[f"export const value_{index} = {index};" for index in range(120)],
+        ]
+    )
+    plain_text_fixture_with_failure_words = "\n".join(
+        [
+            "Traceback (most recent call last):",
+            "npm ERR! code ERESOLVE literal in fixture",
+            "FAILED tests/test_demo.py::test_signal literal in fixture",
+            *[f"literal fixture prose line {index:03d} ERROR failed" for index in range(80)],
+        ]
+    )
+    readme_package_literal = "\n".join(
+        [
+            "# Notes",
+            "ERROR: No matching distribution found for missing-package",
+            *[f"literal prose failed line {index}" for index in range(100)],
+        ]
+    )
+    readme_pytest_literal = "\n".join(
+        [
+            "# Notes",
+            "Traceback (most recent call last):",
+            '  File "tests/test_demo.py", line 3, in test_signal',
+            "ModuleNotFoundError: No module named missing_package",
+            "FAILED tests/test_demo.py::test_signal",
+            *[f"literal prose line {index}" for index in range(100)],
+        ]
+    )
+    for command, raw, exit_code in (
+        ("pytest -q || cat file.py", source_with_test_words, 0),
+        ("pytest -q || cat file.py", source_with_test_words, None),
+        ("cat file.py && pytest -q", source_with_test_words, 0),
+        ("cat file.py && pytest -q > pytest.log", source_with_test_words, 1),
+        ("cat file.py; uv sync > uv.log", source_with_test_words, 1),
+        ("cat README.md && uv sync", readme_package_literal, 1),
+        ("pytest -q && cat README.md", readme_pytest_literal, None),
+        ("bash -lc 'cat file.py && pytest -q > pytest.log'", source_with_test_words, 1),
+        ("cat fixture.txt && pytest -q", plain_text_fixture_with_failure_words, 1),
+        ("cat fixture.txt && pytest -q > pytest.log", plain_text_fixture_with_failure_words, 1),
+        ("cat fixture.txt; pytest -q", plain_text_fixture_with_failure_words, 1),
+        ("pytest -q && cat fixture.txt", plain_text_fixture_with_failure_words, None),
+        ("bash -lc 'cat fixture.txt && pytest -q'", plain_text_fixture_with_failure_words, 1),
+        ("pytest -q || cat fixture.txt", plain_text_fixture_with_failure_words, 0),
+    ):
+        literal_exact = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=exit_code,
+            options=opts(max_chars=400),
+        )
+
+        assert literal_exact.changed is False, command
+        assert literal_exact.text == raw, command
+        assert literal_exact.metadata["command_class"] == "file_read", command
 
     failed_pytest = reduce_text(
         pytest_raw,
@@ -1163,6 +1340,255 @@ def test_short_circuit_semantics_do_not_override_exact_reads_blindly() -> None:
     assert failed_pytest_wrapped.metadata["command_class"] == "pytest"
     assert "FAILED tests/test_demo.py::test_signal" in failed_pytest_wrapped.text
 
+    failed_pytest_after_cat = reduce_text(
+        pytest_raw,
+        command="cat file.py && pytest -q",
+        tool_name="terminal",
+        exit_code=1,
+        options=opts(max_chars=500, max_lines=10),
+    )
+
+    assert failed_pytest_after_cat.changed is True
+    assert failed_pytest_after_cat.metadata["command_class"] == "pytest"
+    assert "FAILED tests/test_demo.py::test_signal" in failed_pytest_after_cat.text
+
+    failed_pytest_after_cat_semicolon = reduce_text(
+        pytest_raw,
+        command="cat file.py; pytest -q",
+        tool_name="terminal",
+        exit_code=1,
+        options=opts(max_chars=500, max_lines=10),
+    )
+
+    assert failed_pytest_after_cat_semicolon.changed is True
+    assert failed_pytest_after_cat_semicolon.metadata["command_class"] == "pytest"
+    assert "FAILED tests/test_demo.py::test_signal" in failed_pytest_after_cat_semicolon.text
+
+    failed_pytest_after_wrapped_cat = reduce_text(
+        pytest_raw,
+        command="bash -lc 'cat file.py && pytest -q'",
+        tool_name="terminal",
+        exit_code=1,
+        options=opts(max_chars=500, max_lines=10),
+    )
+
+    assert failed_pytest_after_wrapped_cat.changed is True
+    assert failed_pytest_after_wrapped_cat.metadata["command_class"] == "pytest"
+    assert "FAILED tests/test_demo.py::test_signal" in failed_pytest_after_wrapped_cat.text
+
+    for command, exit_code in (
+        ("pytest -q || cat failure.log", 0),
+        ("pytest -q || cat failure.log", None),
+        ("pytest -q || rg FAILED .", 0),
+        ("pytest -q || rg FAILED .", None),
+        ("bash -lc 'pytest -q || cat failure.log'", 0),
+    ):
+        successful_pytest_with_unrun_fallback = reduce_text(
+            pytest_raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=exit_code,
+            options=opts(max_chars=500, max_lines=10),
+        )
+
+        assert successful_pytest_with_unrun_fallback.changed is True, command
+        assert successful_pytest_with_unrun_fallback.metadata["command_class"] == "pytest", command
+        assert (
+            "FAILED tests/test_demo.py::test_signal"
+            in successful_pytest_with_unrun_fallback.text
+        )
+
+    realistic_pytest_raw = "\n".join(
+        [
+            *[f"pytest noise before {index}" for index in range(80)],
+            "Traceback (most recent call last):",
+            "  File \"tests/test_demo.py\", line 3, in test_signal",
+            "    import missing_package",
+            "ModuleNotFoundError: No module named 'missing_package'",
+            "FAILED tests/test_demo.py::test_signal",
+            *[f"pytest noise after {index}" for index in range(80)],
+        ]
+    )
+    for command, exit_code in (
+        ("pytest -q || cat failure.log", 0),
+        ("pytest -q || cat failure.log", None),
+        ("bash -lc 'pytest -q || cat failure.log'", 0),
+        ("cat file.py; pytest -q", None),
+        ("pytest -q && cat file.py", None),
+        ("pytest -q && rg FAILED .", None),
+        ("bash -lc 'pytest -q && cat file.py'", None),
+        ("cat file.py; pytest -q || true", 0),
+        ("bash -lc 'cat file.py; pytest -q || true'", 0),
+    ):
+        compacted = reduce_text(
+            realistic_pytest_raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=exit_code,
+            options=opts(max_chars=800, max_lines=20),
+        )
+
+        assert compacted.changed is True, command
+        assert compacted.metadata["command_class"] == "pytest", command
+        assert "FAILED tests/test_demo.py::test_signal" in compacted.text
+
+    source_with_failure_words = "\n".join(
+        [
+            "def test_name():",
+            "    return 'FAILED tests/test_demo.py::test_signal npm ERR!'",
+            *[f"def function_{index}(): return {index}" for index in range(80)],
+        ]
+    )
+    successful_exact_then_pytest = reduce_text(
+        source_with_failure_words,
+        command="cat file.py && pytest -q",
+        tool_name="terminal",
+        exit_code=0,
+        options=opts(max_chars=400),
+    )
+
+    assert successful_exact_then_pytest.changed is False
+    assert successful_exact_then_pytest.text == source_with_failure_words
+    assert successful_exact_then_pytest.metadata["command_class"] == "file_read"
+
+    extensionless_search_hits = "\n".join(
+        [
+            "Makefile:10:FAILED tests/test_demo.py::test_signal",
+            "Dockerfile:5:npm ERR! code ERESOLVE",
+            *[f"src/package_{index}/BUILD:{index}:exact search hit" for index in range(80)],
+        ]
+    )
+    exact_search_then_pytest = reduce_text(
+        extensionless_search_hits,
+        command="rg FAILED . && pytest -q",
+        tool_name="terminal",
+        exit_code=1,
+        options=opts(max_chars=400),
+    )
+
+    assert exact_search_then_pytest.changed is False
+    assert exact_search_then_pytest.text == extensionless_search_hits
+    assert exact_search_then_pytest.metadata["command_class"] == "source_search"
+
+    rg_json_with_failure_words = "\n".join(
+        [
+            '{"type":"match","data":{"path":{"text":"src/app.py"},'
+            '"lines":{"text":"Traceback (most recent call last):\\n"}}}',
+            '{"type":"match","data":{"path":{"text":"src/app.py"},'
+            '"lines":{"text":"FAILED tests/test_demo.py::test_signal npm ERR!\\n"}}}',
+            *[
+                '{"type":"match","data":{"path":{"text":"src/file_'
+                f'{index}.py"}},"lines":{{"text":"literal ERROR failed {index}\\n"}}}}}}'
+                for index in range(80)
+            ],
+        ]
+    )
+    for command in (
+        "rg --json ERROR src && pytest -q",
+        "rg --json ERROR src; pytest -q",
+        "bash -lc 'rg --json ERROR src && pytest -q'",
+    ):
+        exact_json_search = reduce_text(
+            rg_json_with_failure_words,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=opts(max_chars=400),
+        )
+
+        assert exact_json_search.changed is False, command
+        assert exact_json_search.text == rg_json_with_failure_words, command
+        assert exact_json_search.metadata["command_class"] == "source_search", command
+
+    structured_search_with_literal_error = "\n".join(
+        [
+            "src/app.py",
+            "ERROR: literal source string, not uv sync output",
+            *[f"src/module_{index}.py:{index}:exact search hit" for index in range(80)],
+        ]
+    )
+    exact_search_then_package_command = reduce_text(
+        structured_search_with_literal_error,
+        command="rg --heading --no-line-number ERROR src && uv sync",
+        tool_name="terminal",
+        exit_code=1,
+        options=opts(max_chars=400),
+    )
+
+    assert exact_search_then_package_command.changed is False
+    assert exact_search_then_package_command.text == structured_search_with_literal_error
+    assert exact_search_then_package_command.metadata["command_class"] == "source_search"
+
+    single_file_search_without_filename = "\n".join(
+        [
+            "Traceback (most recent call last):",
+            '  File "tests/test_demo.py", line 3, in test_signal',
+            "ModuleNotFoundError: No module named missing_package",
+            "FAILED tests/test_demo.py::test_signal",
+            *[f"literal source ERROR failed {index}" for index in range(80)],
+        ]
+    )
+    for command in (
+        "rg Traceback src/app.py && pytest -q",
+        "rg -i Traceback src/app.py && pytest -q",
+        "rg -e Traceback src/app.py && pytest -q",
+        "rg --regexp Traceback src/app.py && pytest -q",
+        "grep -e Traceback src/app.py && pytest -q",
+        "grep -eTraceback src/app.py && pytest -q",
+        "rg --glob=*.py Traceback src/app.py && pytest -q",
+    ):
+        exact_single_file_search_then_pytest = reduce_text(
+            single_file_search_without_filename,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=opts(max_chars=300),
+        )
+
+        assert exact_single_file_search_then_pytest.changed is False, command
+        assert exact_single_file_search_then_pytest.text == single_file_search_without_filename, (
+            command
+        )
+        assert exact_single_file_search_then_pytest.metadata["command_class"] == "source_search", (
+            command
+        )
+
+
+def test_exact_pipeline_consumers_do_not_infer_node_from_literal_source_output() -> None:
+    source_with_literal_node_error = "\n".join(
+        [
+            "const message = 'npm ERR! literal source text';",
+            *[f"def function_{index}(): return {index}" for index in range(100)],
+        ]
+    )
+    search_with_literal_node_error = "\n".join(
+        [
+            "src/app.py:1:npm ERR! literal source text",
+            *[f"src/file_{index}.py:{index}:def target(): pass" for index in range(100)],
+        ]
+    )
+
+    for command, raw, expected_class in (
+        ("cat file.py | head -20", source_with_literal_node_error, "file_read"),
+        ("rg target src | head -20", search_with_literal_node_error, "source_search"),
+        ("find src -name '*.py' | xargs -r cat", source_with_literal_node_error, "file_read"),
+        (
+            "find src -name '*.py' | xargs -r rg target",
+            search_with_literal_node_error,
+            "source_search",
+        ),
+    ):
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            options=opts(max_chars=400),
+        )
+
+        assert result.changed is False, command
+        assert result.text == raw, command
+        assert result.metadata["command_class"] == expected_class, command
+
 
 def test_source_and_exact_terminal_commands_stay_byte_for_byte_unchanged() -> None:
     raw_source = "\n".join(f"def function_{index}(): return {index}" for index in range(160))
@@ -1183,6 +1609,10 @@ def test_source_and_exact_terminal_commands_stay_byte_for_byte_unchanged() -> No
 
     cases = {
         "cat file.py": raw_source,
+        "cat < file.py": raw_source,
+        "cat <file.py": raw_source,
+        "cat file.py 2>/dev/null": raw_source,
+        "cat file.py 2> /dev/null": raw_source,
         "/bin/cat file.py": raw_source,
         "sed -n '1,200p' file.py": raw_source,
         "sed 's/foo/bar/' file.py": raw_source,
@@ -1215,7 +1645,6 @@ def test_source_and_exact_terminal_commands_stay_byte_for_byte_unchanged() -> No
         "bash -lc 'echo heading && cat file.py'": raw_source,
         "bash -lc 'pytest -q' && cat file.py": raw_source,
         "cat file.py; docker ps": raw_source,
-        "cat file.py; npm install": raw_source + "\nnpm ERR! code ERESOLVE",
         "pytest -q && cat file.py": raw_source,
         "apt install jq && cat file.py": raw_source,
         "docker build .; cat Dockerfile": raw_source,
@@ -1253,12 +1682,16 @@ def test_source_and_exact_terminal_commands_stay_byte_for_byte_unchanged() -> No
         "git --no-pager grep target": search_output,
         "rg target src; docker ps": search_output,
         "bash -lc 'npm install' && rg target src": search_output,
-        "rg target src; npm install": search_output + "\nnpm ERR! code ERESOLVE",
         "bash -lc 'rg target src'": search_output,
         "bash --noprofile --norc -c 'rg target src'": search_output,
         "bash --noprofile --norc -lc 'cd repo && rg target src'": search_output,
         "bash -lc 'cd repo && rg target src'": search_output,
         "uv run rg target src": search_output,
+        "uv run --extra test rg target src": search_output,
+        "uv run --group dev rg target src": search_output,
+        "uv run --no-group docs rg target src": search_output,
+        "uv run --only-group dev rg target src": search_output,
+        "uv run --python-platform x86_64-manylinux2014 rg target src": search_output,
         "uv run --with ripgrep rg target src": search_output,
         "uv run --with-editable . rg target src": search_output,
         "uv run --with-requirements requirements.txt rg target src": search_output,
@@ -1288,9 +1721,18 @@ def test_source_and_exact_terminal_commands_stay_byte_for_byte_unchanged() -> No
         "sudo find src -name '*.py' -exec rg target {} +": search_output,
         "time find src -name '*.py' -exec rg target {} +": search_output,
         "find src -name '*.py' | xargs rg target": search_output,
+        "find src -name '*.py' | xargs cat": raw_source,
+        "find src -name '*.py' -print0 | xargs -0 cat": raw_source,
+        "find src -name '*.py' -exec cat {} +": raw_source,
         "find src -name '*.py' -print0 | xargs -0 rg target": search_output,
         "find src -name '*.py' | xargs -r rg target": search_output,
         "find src -name '*.py' | xargs -I {} rg target {}": search_output,
+        "find src -name '*.py' -exec env LC_ALL=C cat {} +": raw_source,
+        "find src -name '*.py' -exec sudo -H cat {} +": raw_source,
+        "find src -name '*.py' -exec sh -c 'cat \"$1\"' _ {} \\;": raw_source,
+        "find src -name '*.py' -exec env LC_ALL=C rg target {} +": search_output,
+        "find src -name '*.py' -exec sudo -H rg target {} +": search_output,
+        "find src -name '*.py' -exec sh -c 'rg target \"$1\"' _ {} \\;": search_output,
         "xargs -a files.txt rg target": search_output,
         "xargs --arg-file files.txt rg target": search_output,
         "xargs -d '\\n' rg target": search_output,

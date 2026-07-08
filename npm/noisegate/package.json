@@ -11,6 +11,7 @@
   },
   "files": [
     "bin/",
+    "docs/product-contract.md",
     "README.md"
   ],
   "repository": {
