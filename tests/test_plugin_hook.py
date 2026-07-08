@@ -300,6 +300,810 @@ def test_context_retrieval_tools_are_not_touched() -> None:
         assert transform_tool_result(raw, tool_name=tool_name, noisegate_max_chars=100) is None
 
 
+def test_named_protected_tool_returns_before_result_json_parse(monkeypatch) -> None:
+    def fail_parse(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("protected result should not be parsed")
+
+    monkeypatch.setattr(plugin.json, "loads", fail_parse)
+
+    assert transform_tool_result("not-json", tool_name="mcp_github_list_issues") is None
+
+
+def test_mcp_outputs_stay_protected_for_conservative_policy(tmp_path: Path) -> None:
+    cases = {
+        "mcp_github_list_issues": json.dumps(
+            {
+                "issues": [
+                    {
+                        "number": index,
+                        "title": f"Issue {index}",
+                        "body": numbered(f"issue {index} body", 8),
+                    }
+                    for index in range(60)
+                ]
+            }
+        ),
+        "mcp_github_get_file": json.dumps(
+            {"path": "src/app.py", "content": numbered("exact source", 180)}
+        ),
+        "mcp_github_get_source": json.dumps(
+            {"source": "github", "content": numbered("exact source", 180)}
+        ),
+        "mcp_sentry_stacktrace": json.dumps(
+            {
+                "stacktrace": numbered("frame", 120),
+                "logs": "Authorization: "
+                + "Bearer "
+                + "not-a-real-sentry-token\n"
+                + numbered("sentry log", 120),
+            }
+        ),
+        "mcp_playwright_snapshot": json.dumps({"snapshot": numbered("role=button name=Save", 180)}),
+        "mcp_database_query": json.dumps(
+            {
+                "columns": ["id", "email", "created_at"],
+                "rows": [
+                    [index, f"person{index}@example.test", "2026-01-01"]
+                    for index in range(160)
+                ],
+            }
+        ),
+        "mcp_resource_read": json.dumps(
+            {"uri": "file:///repo/README.md", "content": numbered("resource line", 160)}
+        ),
+        "mcp_prompt_schema_output": json.dumps(
+            {
+                "prompts": [
+                    {"name": f"prompt_{index}", "arguments": [{"name": "query"}]}
+                    for index in range(80)
+                ],
+                "tools": [
+                    {
+                        "name": "lookup",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"q": {"type": "string"}},
+                        },
+                    }
+                ],
+            }
+        ),
+        "mcp_dynamic_tool_discovery": json.dumps(
+            {
+                "tools": [
+                    {"name": f"dynamic_tool_{index}", "description": numbered("schema", 3)}
+                    for index in range(90)
+                ]
+            }
+        ),
+        "mcp_error_log_spam": json.dumps(
+            {
+                "error": "rate limited",
+                "logs": numbered("retrying MCP request", 240),
+                "headers": {"x-api-key": "secret"},
+            }
+        ),
+    }
+
+    for tool_name, raw in cases.items():
+        artifact_dir = tmp_path / tool_name
+        transformed = transform_tool_result(
+            raw,
+            tool_name=tool_name,
+            noisegate_max_chars=200,
+            noisegate_artifacts=True,
+            noisegate_artifact_dir=str(artifact_dir),
+        )
+
+        assert transformed is None, tool_name
+        assert not artifact_dir.exists(), tool_name
+
+
+def test_tool_search_and_describe_wrappers_stay_exact() -> None:
+    raw = json.dumps(
+        {
+            "tools": [
+                {"name": f"mcp_dynamic_{index}", "inputSchema": {"type": "object"}}
+                for index in range(120)
+            ],
+            "content": numbered("dynamic discovery metadata", 120),
+        }
+    )
+
+    for tool_name in ("tool_search", "tool_describe"):
+        assert transform_tool_result(raw, tool_name=tool_name, noisegate_max_chars=120) is None
+
+
+def test_tool_call_wrapper_uses_real_mcp_tool_semantics() -> None:
+    raw = json.dumps({"content": numbered("issue listing", 180)})
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="tool_call",
+        args={"name": "mcp_github_list_issues", "arguments": {"repo": "Tosko4/noisegate"}},
+        noisegate_max_chars=120,
+    )
+
+    assert transformed is None
+
+
+def test_tool_call_wrapper_uses_real_noisy_tool_semantics() -> None:
+    raw = json.dumps({"stdout": numbered("pytest output", 180), "exit": 0})
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="tool_call",
+        args={"tool": {"name": "terminal"}, "arguments": {"command": "pytest -q"}},
+        noisegate_max_chars=160,
+        noisegate_head_lines=2,
+        noisegate_tail_lines=2,
+    )
+
+    payload = parse_hook_result(transformed)
+    assert "[noisegate: omitted" in payload["stdout"]
+    assert payload["noisegate"]["fields"]["stdout"]["tool_name"] == "terminal"
+
+
+def test_tool_call_wrapper_recurses_through_json_encoded_arguments() -> None:
+    raw = json.dumps({"stdout": numbered("pytest output", 180), "exit": 0})
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="tool_call",
+        args={
+            "name": "tool_call",
+            "arguments": json.dumps(
+                {"name": "terminal", "arguments": {"command": "pytest -q"}}
+            ),
+        },
+        noisegate_max_chars=160,
+        noisegate_head_lines=2,
+        noisegate_tail_lines=2,
+    )
+
+    payload = parse_hook_result(transformed)
+    assert "[noisegate: omitted" in payload["stdout"]
+    assert payload["noisegate"]["fields"]["stdout"]["command_class"] == "pytest"
+    assert payload["noisegate"]["fields"]["stdout"]["tool_name"] == "terminal"
+
+
+def test_tool_call_wrapper_without_explicit_identity_stays_exact() -> None:
+    raw = json.dumps({"stdout": numbered("exact", 180), "tool_name": "terminal"})
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={"arguments": {"name": "terminal", "command": "pytest -q"}},
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_with_conflicting_identities_stays_exact() -> None:
+    raw = json.dumps({"stdout": numbered("exact", 180)})
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={
+                "name": "terminal",
+                "tool": "mcp_github_get_file",
+                "arguments": {"command": "pytest -q"},
+            },
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_with_conflicting_argument_containers_stays_exact() -> None:
+    raw = json.dumps({"stdout": numbered("source", 180)})
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={
+                "name": "terminal",
+                "arguments": {"command": "pytest -q"},
+                "args": {"command": "cat important.py"},
+            },
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_with_conflicting_command_aliases_stays_exact() -> None:
+    raw = json.dumps({"stdout": numbered("source", 180)})
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={
+                "name": "terminal",
+                "arguments": {
+                    "command": "pytest -q",
+                    "cmd": "cat important.py",
+                },
+            },
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_with_conflicting_command_ownership_stays_exact() -> None:
+    raw = json.dumps({"stdout": numbered("source", 180)})
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={
+                "name": "terminal",
+                "command": "cat important.py",
+                "arguments": {"command": "pytest -q"},
+            },
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_rejects_duplicate_result_keys() -> None:
+    first = json.dumps(numbered("exact source", 180))
+    second = json.dumps(numbered("pytest output", 180))
+    raw = f'{{"stdout":{first},"stdout":{second},"exit":0}}'
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={"name": "terminal", "arguments": {"command": "pytest -q"}},
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_rejects_protected_embedded_result_identity() -> None:
+    raw = json.dumps(
+        {
+            "tool_name": "mcp_github_get_file",
+            "stdout": numbered("exact source", 180),
+        }
+    )
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={"name": "terminal", "arguments": {"command": "pytest -q"}},
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_rejects_intermediate_command_conflict() -> None:
+    raw = json.dumps({"stdout": numbered("exact source", 180)})
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={
+                "name": "tool_call",
+                "command": "cat important.py",
+                "arguments": {
+                    "name": "terminal",
+                    "arguments": {"command": "pytest -q"},
+                },
+            },
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_propagates_intermediate_exact_command() -> None:
+    raw = json.dumps({"stdout": numbered("exact source", 180)})
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={
+                "name": "tool_call",
+                "command": "cat important.py",
+                "arguments": {"name": "terminal"},
+            },
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_rejects_result_owned_command_conflict() -> None:
+    raw = json.dumps(
+        {
+            "args": {"command": "cat important.py"},
+            "stdout": numbered("exact source", 180),
+            "exit": 0,
+        }
+    )
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={"name": "terminal", "arguments": {"command": "pytest -q"}},
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_rejects_conflicting_result_identity_aliases() -> None:
+    raw = json.dumps(
+        {
+            "tool_name": "terminal",
+            "toolName": "mcp_github_get_file",
+            "stdout": numbered("exact source", 180),
+        }
+    )
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={"name": "terminal", "arguments": {"command": "pytest -q"}},
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_rejects_object_form_protected_result_identity() -> None:
+    raw = json.dumps(
+        {
+            "tool": {"name": "mcp_github_get_file"},
+            "stdout": numbered("exact source", 180),
+        }
+    )
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={"name": "terminal", "arguments": {"command": "pytest -q"}},
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_rejects_result_input_command_conflict() -> None:
+    raw = json.dumps(
+        {
+            "input": {"command": "cat important.py"},
+            "stdout": numbered("exact source", 180),
+            "exit": 0,
+        }
+    )
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={"name": "terminal", "arguments": {"command": "pytest -q"}},
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_rejects_nested_resolved_argument_command_conflict() -> None:
+    raw = json.dumps({"stdout": numbered("exact source", 180), "exit": 0})
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={
+                "name": "terminal",
+                "arguments": {
+                    "command": "pytest -q",
+                    "input": {"command": "cat important.py"},
+                },
+            },
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_rejects_nested_protected_result_identity() -> None:
+    raw = json.dumps(
+        {
+            "input": {"tool": {"name": "mcp_github_get_file"}},
+            "stdout": numbered("exact source", 180),
+            "exit": 0,
+        }
+    )
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={"name": "terminal", "arguments": {"command": "pytest -q"}},
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_rejects_nested_named_protected_result_identity() -> None:
+    raw = json.dumps(
+        {
+            "input": {"name": "mcp_github_get_file"},
+            "stdout": numbered("exact source", 180),
+            "exit": 0,
+        }
+    )
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={"name": "terminal", "arguments": {"command": "pytest -q"}},
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_rejects_object_form_tool_owned_command_conflict() -> None:
+    raw = json.dumps(
+        {
+            "tool": {
+                "name": "terminal",
+                "input": {"command": "cat important.py"},
+            },
+            "stdout": numbered("exact source", 180),
+            "exit": 0,
+        }
+    )
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={"name": "terminal", "arguments": {"command": "pytest -q"}},
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_rejects_protected_identity_in_resolved_arguments() -> None:
+    raw = json.dumps({"stdout": numbered("exact source", 180), "exit": 0})
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={
+                "name": "terminal",
+                "arguments": {
+                    "tool_name": "mcp_github_get_file",
+                    "command": "pytest -q",
+                },
+            },
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_rejects_root_name_identity_in_resolved_arguments() -> None:
+    raw = json.dumps({"stdout": numbered("exact source", 180), "exit": 0})
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={
+                "name": "terminal",
+                "arguments": {
+                    "name": "mcp_github_get_file",
+                    "command": "pytest -q",
+                },
+            },
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_rejects_root_name_identity_in_result() -> None:
+    raw = json.dumps(
+        {
+            "name": "mcp_github_get_file",
+            "stdout": numbered("exact source", 180),
+            "exit": 0,
+        }
+    )
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={"name": "terminal", "arguments": {"command": "pytest -q"}},
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_rejects_sibling_call_ownership() -> None:
+    raw = json.dumps({"stdout": numbered("exact source", 180), "exit": 0})
+
+    for sibling in (
+        {"name": "mcp_github_get_file", "arguments": {}},
+        {"name": "terminal", "arguments": {"command": "cat important.py"}},
+    ):
+        assert (
+            transform_tool_result(
+                raw,
+                tool_name="tool_call",
+                args={
+                    "name": "terminal",
+                    "arguments": {"command": "pytest -q"},
+                    "call": sibling,
+                },
+                noisegate_max_chars=120,
+            )
+            is None
+        )
+
+
+def test_tool_call_wrapper_rejects_intermediate_object_tool_ownership() -> None:
+    raw = json.dumps({"stdout": numbered("exact source", 180), "exit": 0})
+
+    for intermediate_evidence in (
+        {"command": "cat important.py"},
+        {"call": {"name": "mcp_github_get_file", "arguments": {}}},
+    ):
+        intermediate = {
+            **intermediate_evidence,
+            "tool": {
+                "name": "terminal",
+                "arguments": {"command": "pytest -q"},
+            },
+        }
+        assert (
+            transform_tool_result(
+                raw,
+                tool_name="tool_call",
+                args={"name": "tool_call", "arguments": {"tool": intermediate}},
+                noisegate_max_chars=120,
+            )
+            is None
+        )
+
+
+def test_tool_call_wrapper_rejects_identityless_sibling_ownership() -> None:
+    raw = json.dumps({"stdout": numbered("exact source", 180), "exit": 0})
+
+    for sibling in (
+        {"tool_name": "mcp_github_get_file"},
+        {"command": "cat important.py"},
+    ):
+        assert (
+            transform_tool_result(
+                raw,
+                tool_name="tool_call",
+                args={
+                    "call": {
+                        "name": "terminal",
+                        "arguments": {"command": "pytest -q"},
+                    },
+                    "arguments": sibling,
+                },
+                noisegate_max_chars=120,
+            )
+            is None
+        )
+
+
+def test_tool_call_wrapper_rejects_malformed_identity_types() -> None:
+    raw = json.dumps({"stdout": numbered("exact source", 180), "exit": 0})
+
+    for malformed in (
+        {"tool_name": {"name": "mcp_github_get_file"}},
+        {"name": ["terminal"]},
+        {"tool": 7},
+    ):
+        assert (
+            transform_tool_result(
+                raw,
+                tool_name="tool_call",
+                args={**malformed, "command": "pytest -q"},
+                noisegate_max_chars=120,
+            )
+            is None
+        )
+
+
+def test_tool_call_wrapper_rejects_malformed_nested_name_identities() -> None:
+    result_with_name = json.dumps(
+        {
+            "name": ["mcp_github_get_file"],
+            "stdout": numbered("exact source", 180),
+            "exit": 0,
+        }
+    )
+
+    assert (
+        transform_tool_result(
+            result_with_name,
+            tool_name="tool_call",
+            args={"name": "terminal", "arguments": {"command": "pytest -q"}},
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+    assert (
+        transform_tool_result(
+            json.dumps({"stdout": numbered("exact source", 180), "exit": 0}),
+            tool_name="tool_call",
+            args={
+                "name": "terminal",
+                "arguments": {
+                    "name": ["mcp_github_get_file"],
+                    "command": "pytest -q",
+                },
+            },
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_with_detached_arguments_stays_exact() -> None:
+    raw = json.dumps({"stdout": numbered("source", 180)})
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={"name": "terminal"},
+            arguments={"command": "cat important.py"},
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_rejects_duplicate_json_identity_keys() -> None:
+    raw = json.dumps({"stdout": numbered("exact", 180)})
+    encoded = (
+        '{"name":"mcp_github_get_file","name":"terminal",'
+        '"arguments":{"command":"pytest -q"}}'
+    )
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={"name": "tool_call", "arguments": encoded},
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_rejects_oversized_encoded_arguments() -> None:
+    raw = json.dumps({"stdout": numbered("exact", 180)})
+    encoded_json = json.dumps(
+        {
+            "name": "terminal",
+            "arguments": {"command": "pytest -q", "padding": "x" * 70_000},
+        }
+    )
+
+    for encoded in (encoded_json, " " * 70_000):
+        assert (
+            transform_tool_result(
+                raw,
+                tool_name="tool_call",
+                args={"name": "tool_call", "arguments": encoded},
+                noisegate_max_chars=120,
+            )
+            is None
+        )
+
+
+def test_tool_call_wrapper_container_preserves_exact_command() -> None:
+    raw = json.dumps({"stdout": numbered("source", 180)})
+
+    for container in ("call", "request"):
+        assert (
+            transform_tool_result(
+                raw,
+                tool_name="tool_call",
+                args={
+                    container: {
+                        "name": "terminal",
+                        "arguments": {"command": "cat important.py"},
+                    }
+                },
+                noisegate_max_chars=120,
+            )
+            is None
+        )
+
+
+def test_tool_call_wrapper_uses_arguments_owned_by_nested_tool_identity() -> None:
+    raw = json.dumps({"stdout": numbered("source", 180)})
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={
+                "tool": {
+                    "name": "terminal",
+                    "arguments": {"command": "cat important.py"},
+                }
+            },
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_cycle_fails_closed() -> None:
+    raw = json.dumps({"stdout": numbered("exact", 180)})
+    wrapper: dict[str, object] = {"name": "tool_call"}
+    wrapper["arguments"] = wrapper
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args=wrapper,
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_call_wrapper_shared_mapping_fails_closed() -> None:
+    raw = json.dumps({"stdout": numbered("exact", 180)})
+    nested: dict[str, object] = {
+        "name": "terminal",
+        "arguments": {"command": "pytest -q"},
+    }
+    wrapper = {"name": "tool_call", "args": nested, "arguments": nested}
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args=wrapper,
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
 def test_unknown_tool_result_is_not_touched() -> None:
     raw = json.dumps({"content": numbered("unknown but useful", 120)})
 

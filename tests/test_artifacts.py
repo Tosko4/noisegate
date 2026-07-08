@@ -15,11 +15,40 @@ from noisegate.artifacts import (
     ArtifactStore,
     ArtifactTooLarge,
 )
-from noisegate.engine import NoisegateOptions, reduce_text
+from noisegate.engine import (
+    NoisegateOptions,
+    _looks_secret_bearing_text,
+    _strip_terminal_escape_sequences,
+    reduce_text,
+)
 
 
 def numbered(prefix: str, count: int) -> str:
     return "\n".join(f"{prefix} {index:03d}" for index in range(1, count + 1))
+
+
+def test_terminal_escape_normalization_handles_repeated_unterminated_osc_linearly() -> None:
+    malformed = "\x1b]A" * 10_000
+
+    assert not _strip_terminal_escape_sequences(malformed, preserve_osc_payload=False)
+
+
+def test_secret_classifier_handles_keyword_heavy_nonmatch_in_bounded_time() -> None:
+    keyword_heavy = "A" + "TOKEN" * 4_000
+
+    started = time.perf_counter()
+    assert not _looks_secret_bearing_text(keyword_heavy)
+
+    assert time.perf_counter() - started < 1.0
+
+
+def test_secret_classifier_handles_uri_like_nonmatch_in_bounded_time() -> None:
+    uri_like = "a." * 16_000
+
+    started = time.perf_counter()
+    assert not _looks_secret_bearing_text(uri_like)
+
+    assert time.perf_counter() - started < 1.0
 
 
 def mode(path: Path) -> int:
@@ -96,6 +125,124 @@ def test_reduce_text_records_artifact_metadata_when_enabled(tmp_path: Path) -> N
     assert str(artifact["sha256"])[:16] in result.text
     assert f"noisegate cat --artifact-dir {tmp_path / 'store'} {artifact['id']}" in result.text
     assert ArtifactStore(tmp_path / "store").read(str(artifact["id"])) == raw
+
+
+def test_reduce_text_refuses_secret_bearing_artifacts(tmp_path: Path) -> None:
+    raw = "\n".join(
+        [
+            *[f"startup log {index:03d}" for index in range(80)],
+            "EXAMPLE_" + "TOKEN=not-a-real-value",
+            "Authorization: " + "Bearer " + "not-a-real-value",
+            *[f"tail log {index:03d}" for index in range(80)],
+        ]
+    )
+    options = NoisegateOptions(
+        max_chars=260,
+        artifact_enabled=True,
+        artifact_dir=tmp_path / "store",
+    )
+
+    result = reduce_text(raw, command="make noisy", options=options)
+
+    assert result.changed is True
+    assert result.metadata["artifact"] == {
+        "stored": False,
+        "reason": "secret_detected",
+        "size_bytes": len(raw.encode("utf-8")),
+    }
+    assert "id=ng_" not in result.text
+    assert not (tmp_path / "store").exists()
+
+
+def test_reduce_text_scans_full_artifact_for_late_secret(tmp_path: Path) -> None:
+    raw = "\n".join(
+        [
+            "filler " + ("x" * 210_000),
+            '"x-api-key": "not-a-real-value"',
+            numbered("tail", 80),
+        ]
+    )
+    options = NoisegateOptions(
+        max_chars=260,
+        artifact_enabled=True,
+        artifact_dir=tmp_path / "store",
+        artifact_size_cap=len(raw.encode("utf-8")) + 100,
+    )
+
+    result = reduce_text(raw, command="make noisy", options=options)
+
+    assert result.changed is True
+    assert result.metadata["artifact"] == {
+        "stored": False,
+        "reason": "secret_detected",
+        "size_bytes": len(raw.encode("utf-8")),
+    }
+    assert not (tmp_path / "store").exists()
+
+
+@pytest.mark.parametrize(
+    "secret_line",
+    [
+        "token: not-a-real-value",
+        '"credentials": "not-a-real-value"',
+        "-----BEGIN " + "OPENSSH PRIVATE KEY-----",
+        "-----BEGIN " + "PGP PRIVATE KEY BLOCK-----",
+        "    -----BEGIN " + "OPENSSH PRIVATE KEY-----",
+        "> -----BEGIN " + "PGP PRIVATE KEY BLOCK-----",
+        "'-----BEGIN " + "RSA PRIVATE KEY-----",
+        "'-----BEGIN " + "RSA PRIVATE KEY-----'",
+        '"-----BEGIN ' + 'OPENSSH PRIVATE KEY-----"',
+        ">-----BEGIN " + "PGP PRIVATE KEY BLOCK-----",
+        "1. -----BEGIN " + "EC PRIVATE KEY-----",
+        "-----BEGIN " + "OPENSSH PRIVATE KEY-----\r\nbody",
+        "X-Amz-Security-Token: not-a-real-value",
+        "GITHUB_TOKEN: not-a-real-value",
+        '"AWS_SECRET_ACCESS_KEY": "not-a-real-value"',
+        "> Cookie: not-a-real-value",
+        "HTTP_AUTHORIZATION=Basic not-a-real-value",
+        "Cookie=sessionid=not-a-real-value",
+        "--password not-a-real-value",
+        "password not-a-real-value",
+        "Author\x1b[31mization: Basic not-a-real-value",
+        "\x1b]0;Authorization: Bearer not-a-real-value\x07visible output",
+        "Author\x1b]0;ignored\x07ization: Basic not-a-real-value",
+        "curl --user alice:not-a-real-value https://example.test",
+        "client --auth not-a-real-value",
+        "postgresql://alice:not-a-real-value@example.test/db",
+        "redis://:not-a-real-value@example.test/0",
+        "https://not-a-real-token@example.test/path",
+        "MYSQL_PWD=not-a-real-value",
+        "REDISCLI_AUTH=not-a-real-value",
+        "DB_PASS=not-a-real-value",
+        "Author\x9b31mization: Basic not-a-real-value",
+        "Author\x1bPignored\x1b\\ization: Basic not-a-real-value",
+        "AuthorizX\bation: Basic not-a-real-value",
+        "X_API_TOKX\bEN=not-a-real-value",
+        "Authoriz\x00ation: Basic not-a-real-value",
+        "\x1b[31mordinary colored output\x1b[0m",
+        "\x1b]52;c;bm90LWEtcmVhbC12YWx1ZQ==\x07",
+    ],
+)
+def test_reduce_text_refuses_additional_secret_artifact_shapes(
+    tmp_path: Path,
+    secret_line: str,
+) -> None:
+    raw = "\n".join([numbered("before", 80), secret_line, numbered("after", 80)])
+    options = NoisegateOptions(
+        max_chars=260,
+        artifact_enabled=True,
+        artifact_dir=tmp_path / "store",
+    )
+
+    result = reduce_text(raw, command="make noisy", options=options)
+
+    assert result.changed is True
+    assert result.metadata["artifact"] == {
+        "stored": False,
+        "reason": "secret_detected",
+        "size_bytes": len(raw.encode("utf-8")),
+    }
+    assert not (tmp_path / "store").exists()
 
 
 def test_artifact_store_refuses_outputs_over_size_cap(tmp_path: Path) -> None:
