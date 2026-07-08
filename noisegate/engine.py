@@ -414,7 +414,7 @@ def _preserve_patterns_for_output(
     if command_class in {"pytest", "unittest"}:
         return CRITICAL_PATTERNS + lcm_patterns
     if command_class == "node":
-        return NODE_PATTERNS + lcm_patterns
+        return NODE_PRESERVATION_PATTERNS + lcm_patterns
     return lcm_patterns or None
 
 
@@ -433,7 +433,11 @@ def _apply_reducer(
     if command_class in {"pytest", "unittest"}:
         return command_class, _important_lines(text, options, TEST_PATTERNS + lcm_patterns)
     if command_class == "node":
-        return "node", _important_lines(text, options, NODE_PATTERNS + lcm_patterns)
+        return "node", _important_lines(
+            text,
+            options,
+            NODE_PRESERVATION_PATTERNS + lcm_patterns,
+        )
     if command_class == "docker_build":
         return "docker_build", _important_lines(text, options, DOCKER_PATTERNS + lcm_patterns)
     if command_class == "git_status":
@@ -465,11 +469,13 @@ TEST_PATTERNS = tuple(
 CRITICAL_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
-        r"\bFAILED\b|\bERROR\b",
-        r"^(failed|error)\s+",
-        r"assertionerror|traceback|exception",
+        r"assertionerror|traceback|exceptiongroup|baseexception|\bexception\b\s*:",
+        r"\bunhandled\s+exception\b",
+        r"\bexception\s+in\b",
         r"^\s*E\s+",
         r"\d+\s+failed",
+        r"^(failed|error)\s+",
+        r"\bFAILED\b|\bERROR\b",
         r"\berror\b|\bfailed\b|\bfail\b",
     )
 )
@@ -483,6 +489,8 @@ NODE_PATTERNS = tuple(
         r"tests?.*(failed|passed)",
     )
 )
+
+NODE_PRESERVATION_PATTERNS = (*NODE_PATTERNS, *CRITICAL_PATTERNS)
 
 DOCKER_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
@@ -550,7 +558,7 @@ def _important_lines(
 
     if len(keep) >= len(lines):
         if len(lines) > options.max_lines:
-            budgeted = _line_budgeted_important_excerpt(lines, important, options)
+            budgeted = _line_budgeted_important_excerpt(lines, important, options, patterns)
             if budgeted is not None:
                 return budgeted
             return _head_tail(text, options)
@@ -563,7 +571,7 @@ def _important_lines(
         return _char_head_tail(text, options)
     selected = _lines_with_markers(lines, sorted(keep))
     if _line_count(selected) > options.max_lines:
-        budgeted = _line_budgeted_important_excerpt(lines, important, options)
+        budgeted = _line_budgeted_important_excerpt(lines, important, options, patterns)
         if budgeted is None:
             return None
         selected = budgeted
@@ -580,23 +588,37 @@ def _preservation_patterns(
     text: str,
     patterns: tuple[re.Pattern[str], ...],
 ) -> tuple[re.Pattern[str], ...]:
+    base_patterns = patterns
+    if patterns in {NODE_PATTERNS, NODE_PRESERVATION_PATTERNS}:
+        if _first_pattern_match(text, CRITICAL_PATTERNS):
+            base_patterns = NODE_PRESERVATION_PATTERNS
+    elif _first_pattern_match(text, CRITICAL_PATTERNS):
+        base_patterns = CRITICAL_PATTERNS
+
     lcm_patterns = _lcm_externalized_patterns_for(text)
     if lcm_patterns:
-        return lcm_patterns + tuple(pattern for pattern in patterns if pattern not in lcm_patterns)
-    return CRITICAL_PATTERNS if _first_pattern_match(text, CRITICAL_PATTERNS) else patterns
+        return lcm_patterns + tuple(
+            pattern for pattern in base_patterns if pattern not in lcm_patterns
+        )
+    return base_patterns
 
 
 def _line_budgeted_important_excerpt(
     lines: list[str],
     important: list[int],
     options: NoisegateOptions,
+    patterns: tuple[re.Pattern[str], ...],
 ) -> str | None:
     if not important:
         return None
     lcm_priority = _matching_indices(lines, important, LCM_EXTERNALIZED_PATTERNS)
     critical_priority = _matching_indices(lines, important, CRITICAL_PATTERNS)
-    priority = _important_priority_indices(lines, important)
-    priority = priority or important
+    ranked_priority = sorted(
+        critical_priority or important,
+        key=lambda index: (_failure_detail_rank(lines[index]), index),
+    )
+    priority = lcm_priority + [index for index in ranked_priority if index not in lcm_priority]
+    best_rank = min(_failure_detail_rank(lines[index]) for index in ranked_priority)
     max_context = max(0, options.important_context_lines)
 
     # Externalized payload refs are recovery handles, not just interesting log
@@ -605,7 +627,7 @@ def _line_budgeted_important_excerpt(
     # budget is too tight for both, the fallback below prioritizes the refs so
     # the externalized-payload recovery path stays intact.
     multi_anchor_priority = lcm_priority + [
-        index for index in critical_priority[:1] if index not in lcm_priority
+        index for index in ranked_priority[:1] if index not in lcm_priority
     ]
     if len(multi_anchor_priority) > 1:
         for context in range(max_context, -1, -1):
@@ -619,18 +641,83 @@ def _line_budgeted_important_excerpt(
                 return candidate
 
     for anchor in priority:
+        if anchor not in lcm_priority and _would_hide_better_failure_anchor(
+            best_rank,
+            _failure_detail_rank(lines[anchor]),
+        ):
+            return None
         for context in range(max_context, -1, -1):
             start = max(0, anchor - context)
             end = min(len(lines), anchor + context + 1)
             candidate = _lines_with_surrounding_omission_markers(lines, start, end - 1)
             if _line_count(candidate) <= options.max_lines:
-                return candidate
+                if len(candidate) <= options.max_chars:
+                    return candidate
+                char_capped = _char_head_tail_preserving_patterns(
+                    candidate,
+                    options,
+                    _preservation_patterns(candidate, patterns),
+                )
+                if (
+                    char_capped is not None
+                    and _fits_budget(char_capped, options)
+                    and _contains_full_line(char_capped, lines[anchor])
+                ):
+                    return char_capped
+                continue
     return None
+
+
+def _failure_detail_rank(line: str) -> int:
+    """Prefer diagnostic detail over progress/status lines when budgets are tight."""
+    if _is_diagnostic_detail_line(line):
+        return 0
+    if re.search(r"npm err!|pnpm err!|err_pnpm|elifecycle|yarn.*error", line, re.IGNORECASE):
+        return 0
+    if re.search(r"\btraceback\b", line, re.IGNORECASE):
+        return 0
+    if re.search(r"\bFAILED\b.*tests?/.*::|tests?/.*::.*\bFAILED\b", line, re.IGNORECASE):
+        return 1
+    if re.search(r"^failed\s+|^error\s+tests?/.*::", line, re.IGNORECASE):
+        return 1
+    if re.search(r"={2,}.*(failures|errors|short test summary)", line, re.IGNORECASE):
+        return 2
+    if re.search(r"\d+\s+failed", line, re.IGNORECASE):
+        return 3
+    if re.search(r"^\s*(?:={2,}.*)?\d+\s+passed\b", line, re.IGNORECASE):
+        return 4
+    if _is_incidental_exception_line(line):
+        return 6
+    return 5
+
+
+def _is_diagnostic_detail_line(line: str) -> bool:
+    if re.search(r"^\s*E\s+", line):
+        return True
+    if _is_incidental_exception_line(line):
+        return False
+    return bool(
+        re.search(
+            r"\b(assertionerror|[a-z0-9_]*error|exceptiongroup|baseexception)\b(?::|$)"
+            r"|\bexception\b\s*:"
+            r"|\bunhandled\s+exception\b"
+            r"|\bexception\s+in\b",
+            line,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _is_incidental_exception_line(line: str) -> bool:
+    return bool(re.search(r"\bexception ignored\b", line, re.IGNORECASE))
 
 
 def _important_priority_indices(lines: list[str], indices: list[int]) -> list[int]:
     lcm_priority = _matching_indices(lines, indices, LCM_EXTERNALIZED_PATTERNS)
-    critical_priority = _matching_indices(lines, indices, CRITICAL_PATTERNS)
+    critical_priority = sorted(
+        _matching_indices(lines, indices, CRITICAL_PATTERNS),
+        key=lambda index: (_failure_detail_rank(lines[index]), index),
+    )
     return lcm_priority + [index for index in critical_priority if index not in lcm_priority]
 
 
@@ -743,13 +830,31 @@ def _char_head_tail_preserving_patterns(
 ) -> str | None:
     if len(text) <= options.max_chars:
         return None
-    match = _first_pattern_match(text, patterns)
-    if match is None:
+    matches = _ranked_pattern_line_matches(text, patterns)
+    if not matches:
         return _char_head_tail(text, options)
-    line_excerpt = _line_centered_excerpt(text, options, match)
-    if line_excerpt is not None:
-        return line_excerpt
+    layout = _line_layout(text)
+    best_rank = min(_rank_for_span_match(match, layout) for match in matches)
+    for match in matches:
+        if _would_hide_better_failure_anchor(best_rank, _rank_for_span_match(match, layout)):
+            return None
+        line_excerpt = _line_centered_excerpt(text, options, match, layout=layout)
+        if line_excerpt is not None:
+            return line_excerpt
     return None
+
+
+def _rank_for_span_match(match: _SpanMatch, layout: _LineLayout) -> int:
+    if match.detail_rank is not None:
+        return match.detail_rank
+    for index, (start, end) in enumerate(layout.offsets):
+        if start <= match.start() <= end:
+            return _failure_detail_rank(layout.lines[index])
+    return 5
+
+
+def _would_hide_better_failure_anchor(best_rank: int, candidate_rank: int) -> bool:
+    return best_rank <= 1 and candidate_rank > 1
 
 
 def _dropped_lcm_externalized_match(*, before: str, after: str) -> bool:
@@ -784,27 +889,31 @@ def _match_centered_excerpt(
 def _line_centered_excerpt(
     text: str,
     options: NoisegateOptions,
-    match: re.Match[str],
+    match: re.Match[str] | _SpanMatch,
+    *,
+    layout: _LineLayout | None = None,
 ) -> str | None:
     if "\n" not in text:
         return None
-    lines = text.splitlines()
-    offsets: list[tuple[int, int]] = []
-    cursor = 0
-    for line in lines:
-        start = cursor
-        end = start + len(line)
-        offsets.append((start, end))
-        cursor = end + 1
+    layout = layout or _line_layout(text)
+    lines = layout.lines
+    offsets = layout.offsets
 
-    match_line = next(
-        (
-            index
-            for index, (start, end) in enumerate(offsets)
-            if start <= match.start() <= end
-        ),
-        None,
-    )
+    match_line = match.line_index if isinstance(match, _SpanMatch) else None
+    if (
+        match_line is None
+        or match_line < 0
+        or match_line >= len(offsets)
+        or not offsets[match_line][0] <= match.start() <= offsets[match_line][1]
+    ):
+        match_line = next(
+            (
+                index
+                for index, (start, end) in enumerate(offsets)
+                if start <= match.start() <= end
+            ),
+            None,
+        )
     if match_line is None:
         return None
 
@@ -855,6 +964,11 @@ def _lines_with_surrounding_omission_markers(
         selected = f"{selected}\n[noisegate: omitted {len(lines) - end_line - 1} lines]"
     return selected
 
+
+def _contains_full_line(text: str, line: str) -> bool:
+    return line in text.splitlines()
+
+
 def _match_centered_slice(
     text: str,
     options: NoisegateOptions,
@@ -885,12 +999,34 @@ def _match_centered_slice(
 class _SpanMatch:
     start_index: int
     end_index: int
+    line_index: int | None = None
+    detail_rank: int | None = None
 
     def start(self) -> int:
         return self.start_index
 
     def end(self) -> int:
         return self.end_index
+
+
+@dataclass(frozen=True, slots=True)
+class _LineLayout:
+    lines: list[str]
+    offsets: list[tuple[int, int]]
+
+
+def _line_layout(text: str) -> _LineLayout:
+    lines: list[str] = []
+    offsets: list[tuple[int, int]] = []
+    cursor = 0
+    for raw_line in text.splitlines(keepends=True):
+        line = raw_line.rstrip("\r\n")
+        start = cursor
+        end = start + len(line)
+        lines.append(line)
+        offsets.append((start, end))
+        cursor += len(raw_line)
+    return _LineLayout(lines=lines, offsets=offsets)
 
 
 def _has_partial_noisegate_marker(text: str) -> bool:
@@ -951,6 +1087,59 @@ def _first_pattern_match(
         if match is not None:
             return match
     return None
+
+
+def _best_pattern_line_match(
+    text: str,
+    patterns: tuple[re.Pattern[str], ...],
+) -> _SpanMatch | None:
+    matches = _ranked_pattern_line_matches(text, patterns)
+    return matches[0] if matches else None
+
+
+def _ranked_pattern_line_matches(
+    text: str,
+    patterns: tuple[re.Pattern[str], ...],
+) -> list[_SpanMatch]:
+    candidates: list[tuple[tuple[int, int, int, int, int], _SpanMatch]] = []
+    pattern_order_first = patterns is NODE_PATTERNS
+    offset = 0
+    for line_index, line in enumerate(text.splitlines(keepends=True)):
+        stripped_line = line.rstrip("\r\n")
+        for pattern_index, pattern in enumerate(patterns):
+            match = pattern.search(stripped_line)
+            if match is None:
+                continue
+            detail_rank = _failure_detail_rank(stripped_line)
+            if pattern_order_first:
+                rank = (
+                    pattern_index,
+                    detail_rank,
+                    line_index,
+                    offset + match.start(),
+                    offset + match.end(),
+                )
+            else:
+                rank = (
+                    detail_rank,
+                    pattern_index,
+                    line_index,
+                    offset + match.start(),
+                    offset + match.end(),
+                )
+            candidates.append(
+                (
+                    rank,
+                    _SpanMatch(
+                        offset + match.start(),
+                        offset + match.end(),
+                        line_index=line_index,
+                        detail_rank=detail_rank,
+                    ),
+                )
+            )
+        offset += len(line)
+    return [match for _, match in sorted(candidates, key=lambda candidate: candidate[0])]
 
 
 def _char_head_tail(text: str, options: NoisegateOptions) -> str | None:

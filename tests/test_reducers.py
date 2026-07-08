@@ -209,6 +209,452 @@ def test_important_line_char_cap_keeps_middle_failure() -> None:
     assert "AssertionError: boom" in result.text
 
 
+def test_line_budget_prefers_pytest_assertion_detail_over_progress_line() -> None:
+    lines = [
+        f"tests/test_generated.py::test_pass_before_{index:03d} PASSED [ 20%]"
+        for index in range(120)
+    ]
+    lines.append("tests/test_generated.py::test_signal FAILED [ 50%]")
+    lines.extend(
+        f"tests/test_generated.py::test_pass_after_{index:03d} PASSED [ 70%]"
+        for index in range(120)
+    )
+    lines.extend(
+        [
+            "=================================== FAILURES ===================================",
+            "_______________________________ test_signal _______________________________",
+            "E       AssertionError: DOGFOOD_SIGNAL_SURVIVED",
+            "=========================== short test summary info ===========================",
+            "FAILED tests/test_generated.py::test_signal - AssertionError: DOGFOOD_SIGNAL_SURVIVED",
+        ]
+    )
+    raw = "\n".join(lines)
+
+    result = reduce_text(
+        raw,
+        command="uv run pytest -vv tests/test_generated.py",
+        options=options(max_chars=700, max_lines=20, max_important_lines=20),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 700
+    assert "DOGFOOD_SIGNAL_SURVIVED" in result.text
+
+
+def test_char_budget_prefers_pytest_assertion_detail_over_progress_line() -> None:
+    lines = [
+        f"tests/test_generated.py::test_pass_before_{index:03d} PASSED [ 20%]"
+        for index in range(20)
+    ]
+    lines.append("tests/test_generated.py::test_signal FAILED [ 50%]")
+    lines.extend(
+        f"tests/test_generated.py::test_pass_after_{index:03d} PASSED [ 70%]"
+        for index in range(20)
+    )
+    lines.extend(
+        [
+            "=================================== FAILURES ===================================",
+            "_______________________________ test_signal _______________________________",
+            "E       AssertionError: DOGFOOD_SIGNAL_SURVIVED",
+            "=========================== short test summary info ===========================",
+            "FAILED tests/test_generated.py::test_signal - AssertionError: DOGFOOD_SIGNAL_SURVIVED",
+        ]
+    )
+    raw = "\n".join(lines)
+
+    result = reduce_text(
+        raw,
+        command="uv run pytest -vv tests/test_generated.py",
+        options=options(max_chars=700, max_lines=160, max_important_lines=80),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 700
+    assert "DOGFOOD_SIGNAL_SURVIVED" in result.text
+
+
+def test_char_budget_ignores_passing_test_name_with_exception_substring() -> None:
+    lines = [
+        "tests/test_widget.py::test_exception_name PASSED " + ("p" * 40)
+        for _ in range(8)
+    ]
+    lines.extend(
+        [
+            "tests/test_widget.py::test_boom FAILED [100%]",
+            "E       RuntimeError: boom",
+        ]
+    )
+    raw = "\n".join(lines)
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(max_chars=180, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 180
+    assert "RuntimeError: boom" in result.text
+    assert "test_exception_name PASSED" not in result.text
+
+
+def test_line_budget_prefers_pytest_exception_summary_over_count_summary() -> None:
+    raw = "\n".join(
+        [
+            *[f"tests/test_widget.py::test_ok_{index} PASSED" for index in range(30)],
+            "FAILED tests/test_widget.py::test_widget - TypeError: unsupported operand type",
+            *[f"noise {index}" for index in range(30)],
+            "========================= 1 failed in 0.12s =========================",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            max_important_lines=10,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "TypeError: unsupported operand type" in result.text
+    assert "1 failed in 0.12s" not in result.text
+
+
+def test_line_budget_prefers_pytest_progress_failure_over_count_summary() -> None:
+    raw = "\n".join(
+        [
+            *[f"tests/test_widget.py::test_ok_{index} PASSED" for index in range(10)],
+            "tests/test_widget.py::test_widget FAILED [100%]",
+            *[f"noise {index}" for index in range(10)],
+            "========================= 1 failed in 0.12s =========================",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            max_important_lines=10,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "tests/test_widget.py::test_widget FAILED" in result.text
+    assert "1 failed in 0.12s" not in result.text
+
+
+def test_char_budget_prefers_real_pytest_failure_over_incidental_exception_log() -> None:
+    raw = "\n".join(
+        [
+            "Exception ignored in: <function _cleanup at 0xabc>",
+            *[f"captured log noise {index} " + ("x" * 50) for index in range(10)],
+            "tests/test_widget.py::test_widget FAILED [100%]",
+            "E       AssertionError: real failure detail",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(max_chars=180, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert "AssertionError: real failure detail" in result.text
+    assert "Exception ignored" not in result.text
+
+
+def test_recovery_notice_survives_when_incidental_exception_name_is_dropped() -> None:
+    raw = "\n".join(
+        [
+            *[
+                "tests/test_widget.py::test_exception_name PASSED " + ("p" * 20)
+                for _ in range(4)
+            ],
+            "FAILED tests/test_widget.py::test_widget - TypeError: unsupported operand type",
+            *[f"noise {index} " + ("x" * 20) for index in range(6)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(max_chars=170, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 170
+    assert "TypeError: unsupported operand type" in result.text
+    assert "test_exception_name PASSED" not in result.text
+    assert "[noisegate: exit_code=1]" in result.text
+
+
+def test_char_budget_falls_back_to_lower_ranked_pytest_line_that_fits() -> None:
+    raw = "\n".join(
+        [
+            "E       AssertionError: " + ("x" * 200),
+            *[f"noise {index}" for index in range(10)],
+            "tests/test_widget.py::test_widget FAILED",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(max_chars=120, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 120
+    assert "tests/test_widget.py::test_widget FAILED" in result.text
+
+
+def test_char_budget_keeps_trying_anchors_when_capped_context_loses_anchor() -> None:
+    raw = "\n".join(
+        [
+            "E       AssertionError: " + ("x" * 200),
+            "captured ERROR local log recovered successfully",
+            *[f"noise {index}" for index in range(8)],
+            "tests/test_widget.py::test_widget FAILED [100%]",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=135,
+            max_lines=80,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=2,
+        ),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 135
+    assert "tests/test_widget.py::test_widget FAILED" in result.text
+    assert "captured ERROR local log" not in result.text
+
+
+def test_line_budget_falls_back_to_lower_ranked_pytest_line_that_fits() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(20)],
+            "E       AssertionError: " + ("x" * 200),
+            *[f"noise {index}" for index in range(20)],
+            "tests/test_widget.py::test_widget FAILED",
+            *[f"teardown {index}" for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=120,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 120
+    assert len(result.text.splitlines()) <= 3
+    assert "tests/test_widget.py::test_widget FAILED" in result.text
+
+
+def test_char_budget_prefers_pytest_failure_over_benign_error_log() -> None:
+    raw = "\n".join(
+        [
+            "ERROR monitoring task recovered successfully",
+            *[f"captured log noise {index} " + ("x" * 20) for index in range(10)],
+            "tests/test_widget.py::test_widget FAILED [100%]",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(max_chars=120, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 120
+    assert "tests/test_widget.py::test_widget FAILED" in result.text
+    assert "ERROR monitoring task recovered successfully" not in result.text
+
+
+def test_line_budget_prefers_traceback_over_failed_progress_line() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(20)],
+            "tests/test_widget.py::test_widget FAILED [100%]",
+            *[f"noise {index}" for index in range(20)],
+            "Traceback (most recent call last):",
+            *[f"teardown {index}" for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "Traceback (most recent call last):" in result.text
+    assert "tests/test_widget.py::test_widget FAILED" not in result.text
+
+
+def test_line_budget_recognizes_exception_group_as_diagnostic_detail() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(20)],
+            "ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)",
+            *[f"noise {index}" for index in range(20)],
+            "FAILED tests/test_widget.py::test_widget - ExceptionGroup",
+            *[f"teardown {index}" for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "ExceptionGroup: unhandled errors" in result.text
+    assert "FAILED tests/test_widget.py::test_widget" not in result.text
+
+
+def test_line_budget_recognizes_exception_in_header_as_diagnostic_detail() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(20)],
+            "Exception in thread worker-1:",
+            *[f"noise {index}" for index in range(20)],
+            "========================= 1 failed in 0.12s =========================",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "Exception in thread worker-1:" in result.text
+    assert "1 failed in 0.12s" not in result.text
+
+
+def test_line_budget_preserves_unhandled_exception_shutdown_detail() -> None:
+    raw = "\n".join(
+        [
+            *[
+                f"tests/test_widget.py::test_exception_name_{index} PASSED"
+                for index in range(30)
+            ],
+            "Unhandled exception during asyncio.run() shutdown",
+            "RuntimeError: shutdown boom",
+            *[f"noise {index}" for index in range(30)],
+            "========================= 1 failed in 0.12s =========================",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            max_important_lines=10,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "Unhandled exception during asyncio.run() shutdown" in result.text
+    assert "1 failed in 0.12s" not in result.text
+    assert "test_exception_name_" not in result.text
+
+
+def test_line_budget_prefers_pytest_pass_summary_over_progress_line() -> None:
+    raw = "\n".join(
+        [
+            *[
+                f"tests/test_widget.py::test_ok_{index} PASSED [ {index}%]"
+                for index in range(20)
+            ],
+            "========================= 40 passed in 1.23s =========================",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            max_important_lines=10,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "40 passed in 1.23s" in result.text
+    assert "tests/test_widget.py::test_ok_0 PASSED" not in result.text
+
+
 def test_first_pattern_match_short_circuits_after_first_matching_pattern() -> None:
     match = _first_pattern_match("FIRST then SECOND", (re.compile("FIRST"), re.compile("SECOND")))
 
@@ -239,6 +685,20 @@ def test_important_line_reducer_handles_high_volume_repeated_failures() -> None:
     assert result.metadata["reducer"] == "pytest"
     assert "FAILED tests/test_load_" in result.text
     assert "[noisegate: omitted" in result.text
+
+
+def test_ranked_pattern_matches_carry_line_rank_metadata() -> None:
+    matches = engine._ranked_pattern_line_matches(
+        "E       AssertionError: dense failure\n",
+        engine.CRITICAL_PATTERNS,
+    )
+
+    assert matches
+    assert matches[0].line_index == 0
+    assert engine._rank_for_span_match(
+        matches[0],
+        engine._LineLayout(lines=[], offsets=[]),
+    ) == 0
 
 
 def test_terminal_file_read_commands_are_protected_by_default() -> None:
@@ -1053,6 +1513,28 @@ def test_tight_important_excerpt_does_not_slice_numeric_marker_suffixes() -> Non
     assert result.metadata["reason"] == "reducer_no_output"
 
 
+def test_char_budget_fails_open_instead_of_count_only_pytest_summary() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index} " + ("x" * 20) for index in range(10)],
+            "E       AssertionError: " + ("x" * 90),
+            *[f"noise {index} " + ("y" * 20) for index in range(10)],
+            "========================= 1 failed in 0.12s =========================",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        options=options(max_chars=100, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reason"] == "reducer_no_output"
+    assert result.metadata["attempted_reducer"] == "pytest"
+
+
 def test_node_reducer_tight_budget_fails_open_when_node_error_line_cannot_fit() -> None:
     raw = "\n".join(
         [
@@ -1072,6 +1554,182 @@ def test_node_reducer_tight_budget_fails_open_when_node_error_line_cannot_fit() 
     assert result.changed is False
     assert result.text == raw
     assert result.metadata["reason"] == "reducer_no_output"
+
+
+def test_node_char_budget_preserves_python_exception_over_warning() -> None:
+    raw = "\n".join(
+        [
+            "warning package.json: deprecated dependency",
+            *[f"build noise {index} " + ("x" * 20) for index in range(12)],
+            "Exception: plugin crashed",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="npm test",
+        exit_code=1,
+        options=options(max_chars=120, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 120
+    assert "Exception: plugin crashed" in result.text
+    assert "deprecated dependency" not in result.text
+
+
+def test_node_recovery_notice_budget_preserves_python_exception_line() -> None:
+    raw = "\n".join(
+        [
+            "warning package.json: deprecated dependency",
+            *[f"build noise {index} " + ("x" * 20) for index in range(8)],
+            "Exception: plugin crashed",
+            *[f"tail noise {index} " + ("y" * 20) for index in range(8)],
+        ]
+    )
+
+    for max_chars in (120, 130, 140, 170, 200):
+        result = reduce_text(
+            raw,
+            command="npm test",
+            exit_code=1,
+            options=options(max_chars=max_chars, max_lines=80, head_lines=0, tail_lines=0),
+        )
+
+        if result.changed:
+            assert "Exception: plugin crashed" in result.text
+            assert "[noisegate: exit_code=1]" in result.text
+        else:
+            assert result.text == raw
+            assert result.metadata["reason"] == "no_gain"
+
+
+def test_node_char_budget_fails_open_instead_of_warning_when_error_cannot_fit() -> None:
+    raw = "\n".join(
+        [
+            "WARNING deprecated package",
+            *[f"build noise {index} " + ("x" * 20) for index in range(10)],
+            "Error: central failure detail " + ("z" * 40),
+            *[f"tail noise {index} " + ("y" * 20) for index in range(10)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="npm test",
+        exit_code=1,
+        options=options(max_chars=80, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reason"] == "reducer_no_output"
+    assert result.metadata["attempted_reducer"] == "node"
+
+
+def test_node_line_budget_prefers_error_detail_over_count_summary() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(30)],
+            "Error: Cannot find module './missing'",
+            *[f"build noise {index}" for index in range(30)],
+            "3 failed",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="npm test",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            max_important_lines=10,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "Cannot find module './missing'" in result.text
+    assert "3 failed" not in result.text
+
+
+def test_node_char_budget_preserves_pattern_priority_when_ranks_tie() -> None:
+    raw = "\n".join(
+        [
+            "warning package.json: deprecated dependency",
+            *[f"build noise {index}" for index in range(20)],
+            "npm ERR! Cannot find module './missing'",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="npm test",
+        exit_code=1,
+        options=options(max_chars=120, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 120
+    assert "npm ERR! Cannot find module './missing'" in result.text
+    assert "deprecated dependency" not in result.text
+
+
+def test_node_char_budget_prefers_npm_error_over_count_summary() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index} " + ("x" * 20) for index in range(10)],
+            "npm ERR! Cannot find module './missing'",
+            *[f"build noise {index} " + ("y" * 20) for index in range(10)],
+            "3 failed",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="npm test",
+        exit_code=1,
+        options=options(max_chars=120, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 120
+    assert "npm ERR! Cannot find module './missing'" in result.text
+    assert "3 failed" not in result.text
+
+
+def test_preserving_pattern_char_path_reuses_line_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = "\n".join(
+        [
+            *("warning " + ("x" * 160) for _ in range(50)),
+            "npm ERR! Cannot find module './missing'",
+        ]
+    )
+    calls = 0
+    original = engine._line_layout
+
+    def counted_line_layout(text: str) -> engine._LineLayout:
+        nonlocal calls
+        calls += 1
+        return original(text)
+
+    monkeypatch.setattr(engine, "_line_layout", counted_line_layout)
+
+    result = reduce_text(
+        raw,
+        command="npm test",
+        exit_code=1,
+        options=options(max_chars=120, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert "npm ERR! Cannot find module './missing'" in result.text
+    assert calls == 1
 
 
 def test_direct_node_command_preserves_error_line() -> None:

@@ -17,6 +17,7 @@ All notable changes to Noisegate are documented here. Release notes are generate
 - Preserve Hermes-LCM externalized payload placeholders and `externalized_ref` metadata while compacting noisy terminal-style output, without requiring Noisegate artifacts.
 - `install-hermes` now rejects non-Hermes Python launchers instead of trusting any virtualenv Python shebang, and it validates shell shims that exec Python are actually invoking `hermes_cli`.
 - The Hermes config helper now avoids rewriting an already-correct plugin config while still removing stale `noisegate` entries from `plugins.disabled`.
+- Pytest compaction now prefers assertion/traceback detail over progress lines when tight budgets force a single failure excerpt.
 - Preserve source-like exact output for direct terminal file-display commands, V4A patches, and `reduce-json` command aliases even when the content resembles noisy failures.
 
 ## [0.1.2] - 2026-07-07
