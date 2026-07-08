@@ -243,8 +243,30 @@ def _reduce_text(
             options,
             preserve_patterns=preserve_patterns,
         )
-    if compacted is None or compacted == text or len(compacted) >= len(text):
-        return _unchanged(text, "no_gain", command_class, reason="no_gain")
+    if compacted is None:
+        return _unchanged(
+            text,
+            "no_gain",
+            command_class,
+            reason="reducer_no_output",
+            attempted_reducer=reducer_name,
+        )
+    if compacted == text:
+        return _unchanged(
+            text,
+            "no_gain",
+            command_class,
+            reason="reducer_unchanged",
+            attempted_reducer=reducer_name,
+        )
+    if len(compacted) >= len(text):
+        return _unchanged(
+            text,
+            "no_gain",
+            command_class,
+            reason="no_gain",
+            attempted_reducer=reducer_name,
+        )
 
     metadata = _metadata(
         original=text,
@@ -268,9 +290,21 @@ def _reduce_text(
         preserve_patterns=preserve_patterns,
     )
     if not _fits_budget(compacted, options):
-        return _unchanged(text, "invalid_budget", command_class, reason="invalid_budget")
+        return _unchanged(
+            text,
+            "invalid_budget",
+            command_class,
+            reason="invalid_budget_after_notices",
+            attempted_reducer=reducer_name,
+        )
     if len(compacted) >= len(text):
-        return _unchanged(text, "no_gain", command_class, reason="no_gain_after_notices")
+        return _unchanged(
+            text,
+            "no_gain",
+            command_class,
+            reason="no_gain_after_notices",
+            attempted_reducer=reducer_name,
+        )
     if options.artifact_enabled:
         planned_artifact = metadata.get("artifact")
         if isinstance(planned_artifact, dict) and planned_artifact.get("stored") is True:
@@ -302,7 +336,8 @@ def _reduce_text(
                         text,
                         "invalid_budget",
                         command_class,
-                        reason="invalid_budget",
+                        reason="invalid_budget_after_artifact_store",
+                        attempted_reducer=reducer_name,
                     )
                 if len(compacted) >= len(text):
                     return _unchanged(
@@ -310,6 +345,7 @@ def _reduce_text(
                         "no_gain",
                         command_class,
                         reason="no_gain_after_artifact_store",
+                        attempted_reducer=reducer_name,
                     )
     return ReducedOutput(compacted, True, metadata)
 
@@ -914,23 +950,29 @@ def _metadata(
     return metadata
 
 
-def _unchanged(text: str, reducer: str, command_class: str, *, reason: str) -> ReducedOutput:
-    return ReducedOutput(
-        text,
-        False,
-        {
-            "version": __version__,
-            "compacted": False,
-            "mode": "passthrough",
-            "reducer": reducer,
-            "command_class": command_class,
-            "reason": reason,
-            "original_chars": len(text),
-            "original_lines": _line_count(text),
-            "omitted_chars": 0,
-            "omitted_lines": 0,
-        },
-    )
+def _unchanged(
+    text: str,
+    reducer: str,
+    command_class: str,
+    *,
+    reason: str,
+    attempted_reducer: str | None = None,
+) -> ReducedOutput:
+    metadata: dict[str, JsonValue] = {
+        "version": __version__,
+        "compacted": False,
+        "mode": "passthrough",
+        "reducer": reducer,
+        "command_class": command_class,
+        "reason": reason,
+        "original_chars": len(text),
+        "original_lines": _line_count(text),
+        "omitted_chars": 0,
+        "omitted_lines": 0,
+    }
+    if attempted_reducer is not None:
+        metadata["attempted_reducer"] = attempted_reducer
+    return ReducedOutput(text, False, metadata)
 
 
 def _plan_artifact(text: str, options: NoisegateOptions) -> dict[str, JsonValue]:

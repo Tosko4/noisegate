@@ -4,8 +4,13 @@ All notable changes to Noisegate are documented here. Release notes are generate
 
 ## [Unreleased]
 
+### Added
+- `noisegate reduce`, `reduce-json`, and `wrap` now accept `--metadata`/`--debug` to print diagnostic JSON to stderr without changing stdout.
+
 ### Changed
 - `noisegate install-hermes --dry-run` now explicitly states that install/enable/doctor commands are not run and no Hermes restart/reload is performed.
+- Unchanged reduction metadata now reports more specific reason codes and the attempted reducer when a reducer could not produce a safe smaller output.
+- `noisegate doctor` now prints the effective runtime config, artifact directory, and artifact size cap alongside environment warnings.
 
 ### Fixed
 - `install-hermes` now rejects non-Hermes Python launchers instead of trusting any virtualenv Python shebang, and it validates shell shims that exec Python are actually invoking `hermes_cli`.

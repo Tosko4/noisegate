@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import json
+import os
 import shlex
 import sys
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -115,6 +117,7 @@ def cmd_reduce(args: argparse.Namespace) -> int:
             options=options,
         )
         sys.stdout.write(reduced.text)
+        _maybe_print_metadata(args, _debug_metadata(reduced.metadata, raw, reduced.text))
     except Exception:
         sys.stdout.write(raw)
     return 0
@@ -126,17 +129,25 @@ def cmd_reduce_json(args: argparse.Namespace) -> int:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
         sys.stdout.write(raw)
+        _maybe_print_metadata(
+            args,
+            _json_debug_metadata(raw, raw, options=None, reason="invalid_json"),
+        )
         return 0
 
     options = _options_from_args(args)
     if isinstance(parsed, dict) and isinstance(parsed.get("noisegate"), dict):
         options = options.with_mapping(parsed["noisegate"])
 
+    metadata: dict[str, Any] = {}
     try:
-        output = _reduce_json_value(parsed, raw, options)
+        output = _reduce_json_value(parsed, raw, options, metadata_out=metadata)
     except Exception:
         output = raw
     sys.stdout.write(output)
+    if metadata:
+        metadata = _json_metadata_with_envelope_metrics(metadata, raw, output, options)
+    _maybe_print_metadata(args, metadata or _json_debug_metadata(raw, output, options))
     return 0
 
 
@@ -170,6 +181,7 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         return 130
 
     sys.stdout.write(result.text)
+    _maybe_print_metadata(args, _debug_metadata(result.metadata, result.stdout, result.text))
     return _normalize_process_exit_code(result.exit_code)
 
 
@@ -187,17 +199,28 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
     else:
         print("environment: ok")
     options = NoisegateOptions.from_env()
+    print(
+        "config: "
+        f"enabled={options.enabled} "
+        f"mode={options.mode} "
+        f"max_chars={options.max_chars} "
+        f"max_lines={options.max_lines} "
+        f"head_lines={options.head_lines} "
+        f"tail_lines={options.tail_lines}"
+    )
     artifact_dir = options.artifact_dir or ArtifactStore.from_env().root
     if options.artifact_enabled:
         try:
             ArtifactStore(artifact_dir, size_cap=options.artifact_size_cap)._ensure_root()
             print(f"artifacts: enabled ({artifact_dir})")
+            print(f"artifact_size_cap: {options.artifact_size_cap}")
         except ArtifactError as exc:
             print(f"artifacts: error ({exc})")
             return 2
     else:
-        print("artifacts: disabled")
+        print("artifacts: disabled (set NOISEGATE_ARTIFACTS=1 to enable)")
         print(f"artifact_dir: {artifact_dir}")
+        print(f"artifact_size_cap: {options.artifact_size_cap}")
     return 0
 
 
@@ -283,7 +306,13 @@ def cmd_artifacts_verify(args: argparse.Namespace) -> int:
     return 2 if failed else 0
 
 
-def _reduce_json_value(parsed: Any, raw: str, options: NoisegateOptions) -> str:
+def _reduce_json_value(
+    parsed: Any,
+    raw: str,
+    options: NoisegateOptions,
+    *,
+    metadata_out: dict[str, Any] | None = None,
+) -> str:
     hook_kwargs = _options_to_hook_kwargs(options)
     if isinstance(parsed, dict) and isinstance(parsed.get("result"), str):
         tool_name = str(
@@ -315,6 +344,8 @@ def _reduce_json_value(parsed: Any, raw: str, options: NoisegateOptions) -> str:
                 source="reduce-json",
                 options=options,
             )
+            if metadata_out is not None:
+                metadata_out.update(_debug_metadata(reduced.metadata, result_text, reduced.text))
             transformed = reduced.text if reduced.changed else None
         if transformed is not None:
             parsed = dict(parsed)
@@ -383,6 +414,93 @@ def _options_to_hook_kwargs(options: NoisegateOptions) -> dict[str, object]:
     return values
 
 
+def _maybe_print_metadata(args: argparse.Namespace, metadata: dict[str, Any]) -> None:
+    if not getattr(args, "metadata", False):
+        return
+    try:
+        sys.stderr.write(json.dumps(metadata, ensure_ascii=False, sort_keys=True) + "\n")
+        sys.stderr.flush()
+    except OSError:
+        # Diagnostics must never corrupt stdout or change the wrapped command's
+        # exit behavior. If stderr is closed/full, keep the data path intact and
+        # replace stderr so interpreter shutdown does not retry a failed flush.
+        with suppress(OSError):
+            sys.stderr = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
+        return
+
+
+def _debug_metadata(metadata: dict[str, Any], original: str, output: str) -> dict[str, Any]:
+    original_lines = _line_count(original)
+    output_lines = _line_count(output)
+    return {
+        **metadata,
+        "output_chars": len(output),
+        "output_lines": output_lines,
+        "saved_chars": max(0, len(original) - len(output)),
+        "saved_lines": max(0, original_lines - output_lines),
+    }
+
+
+def _json_debug_metadata(
+    raw: str,
+    output: str,
+    options: NoisegateOptions | None,
+    *,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    compacted = output != raw
+    original_lines = _line_count(raw)
+    output_lines = _line_count(output)
+    mode = "unknown" if options is None else options.mode if options.enabled else "passthrough"
+    saved_chars = max(0, len(raw) - len(output))
+    saved_lines = max(0, original_lines - output_lines)
+    return {
+        "version": __version__,
+        "compacted": compacted,
+        "mode": mode,
+        "source": "reduce-json",
+        "reason": reason or ("changed" if compacted else "unchanged"),
+        "original_chars": len(raw),
+        "output_chars": len(output),
+        "saved_chars": saved_chars,
+        "omitted_chars": saved_chars,
+        "original_lines": original_lines,
+        "output_lines": output_lines,
+        "saved_lines": saved_lines,
+        "omitted_lines": saved_lines,
+    }
+
+
+def _json_metadata_with_envelope_metrics(
+    metadata: dict[str, Any],
+    raw: str,
+    output: str,
+    options: NoisegateOptions,
+) -> dict[str, Any]:
+    combined = dict(metadata)
+    for key in (
+        "original_chars",
+        "output_chars",
+        "saved_chars",
+        "omitted_chars",
+        "original_lines",
+        "output_lines",
+        "saved_lines",
+        "omitted_lines",
+    ):
+        if key in metadata:
+            combined[f"field_{key}"] = metadata[key]
+    reason = str(metadata["reason"]) if "reason" in metadata else None
+    combined.update(_json_debug_metadata(raw, output, options, reason=reason))
+    return combined
+
+
+def _line_count(text: str) -> int:
+    if not text:
+        return 0
+    return len(text.splitlines())
+
+
 def _artifact_store_from_args(args: argparse.Namespace) -> ArtifactStore:
     return ArtifactStore(args.artifact_dir) if args.artifact_dir else ArtifactStore.from_env()
 
@@ -403,6 +521,12 @@ def _add_reduce_options(parser: argparse.ArgumentParser, *, default_source: str 
     )
     parser.add_argument("--artifact-dir", default=None)
     parser.add_argument("--artifact-size-cap", type=int, default=None)
+    parser.add_argument(
+        "--metadata",
+        "--debug",
+        action="store_true",
+        help="print Noisegate diagnostic metadata as JSON to stderr",
+    )
 
 
 def _passthrough_argv(argv: list[str]) -> list[str]:
