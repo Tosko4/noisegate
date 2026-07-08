@@ -564,6 +564,33 @@ def test_docker_build_summary_outranks_early_generic_error_noise() -> None:
         assert "did not complete successfully" in char_budgeted.text, command
 
 
+def test_docker_build_keeps_traceback_root_cause_under_tight_budget() -> None:
+    raw = "\n".join(
+        [
+            *[f"#1 build progress {index}" for index in range(80)],
+            "Traceback (most recent call last):",
+            "ValueError: build script root cause",
+            *[f"#2 build progress {index}" for index in range(80)],
+            '#8 ERROR: failed to solve: process "/bin/sh -c python build.py" '
+            "did not complete successfully",
+            *[f"#9 build progress {index}" for index in range(80)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="docker build .",
+        tool_name="terminal",
+        exit_code=1,
+        options=opts(max_chars=500, max_lines=8, head_lines=1, tail_lines=1),
+    )
+
+    assert result.changed is True
+    assert result.metadata["command_class"] == "docker_build"
+    assert "Traceback (most recent call last)" in result.text
+    assert "ValueError: build script root cause" in result.text
+
+
 def test_non_build_reducers_do_not_let_stale_build_lines_outrank_tracebacks() -> None:
     raw = "\n".join(
         [
@@ -817,6 +844,116 @@ def test_log_filter_pipelines_still_use_the_original_slop_classifier() -> None:
         )
         result = reduce_text(
             signal_raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=opts(max_chars=500, max_lines=10),
+        )
+
+        assert result.changed is True
+        assert result.metadata["command_class"] == expected_class
+        assert signal in result.text
+
+
+def test_background_jobs_use_later_compactable_command_class() -> None:
+    raw = "\n".join(
+        [
+            *[f"pytest noise before {index}" for index in range(80)],
+            "FAILED tests/test_demo.py::test_signal",
+            *[f"pytest noise after {index}" for index in range(80)],
+        ]
+    )
+
+    for command in (
+        "cat file.py & pytest -q",
+        "rg target src & pytest -q",
+        "cat file.py & bash -lc 'pytest -q'",
+        "rg target src & bash -lc 'pytest -q'",
+    ):
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=opts(max_chars=500, max_lines=10),
+        )
+
+        assert result.changed is True
+        assert result.metadata["command_class"] == "pytest"
+        assert "FAILED tests/test_demo.py::test_signal" in result.text
+
+
+def test_reverse_background_exact_tail_stays_byte_for_byte_unchanged() -> None:
+    raw_source = "\n".join(f"def function_{index}(): return {index}" for index in range(160))
+    search_output = "\n".join(
+        f"src/module_{index}.py:{index}:def target_{index}():" for index in range(180)
+    )
+
+    for command, raw, expected_class, expected_changed in (
+        ("pytest -q & cat file.py", raw_source, "file_read", False),
+        ("pytest -q & rg target src", search_output, "source_search", False),
+        ("pytest -q & cat file.py; pytest -q", raw_source, "pytest", True),
+        ("pytest -q & rg target src; pytest -q", search_output, "pytest", True),
+        ("true & cat <(pytest -q)", raw_source, "pytest", True),
+    ):
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=opts(max_chars=400),
+        )
+
+        assert result.changed is expected_changed
+        if not expected_changed:
+            assert result.text == raw
+        assert result.metadata["command_class"] == expected_class
+
+
+def test_source_search_feeding_xargs_uses_consumer_command_class() -> None:
+    pytest_raw = "\n".join(
+        [
+            *[f"pytest noise before {index}" for index in range(80)],
+            "FAILED tests/test_demo.py::test_signal",
+            *[f"pytest noise after {index}" for index in range(80)],
+        ]
+    )
+    package_raw = "\n".join(
+        [
+            *[f"package noise before {index}" for index in range(80)],
+            "ERROR: No matching distribution found for missing-package",
+            *[f"package noise after {index}" for index in range(80)],
+        ]
+    )
+
+    for command, raw, expected_class, signal in (
+        (
+            "rg -l test tests | xargs pytest -q",
+            pytest_raw,
+            "pytest",
+            "FAILED tests/test_demo.py::test_signal",
+        ),
+        (
+            "rg -l test tests | xargs bash -lc 'pytest -q'",
+            pytest_raw,
+            "pytest",
+            "FAILED tests/test_demo.py::test_signal",
+        ),
+        (
+            "bash -lc 'rg -l test tests | xargs pytest -q'",
+            pytest_raw,
+            "pytest",
+            "FAILED tests/test_demo.py::test_signal",
+        ),
+        (
+            "rg -l reqs requirements | xargs pip install missing-package",
+            package_raw,
+            "python_package",
+            "No matching distribution found for missing-package",
+        ),
+    ):
+        result = reduce_text(
+            raw,
             command=command,
             tool_name="terminal",
             exit_code=1,

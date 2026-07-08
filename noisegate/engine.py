@@ -53,7 +53,7 @@ LCM_EXTERNALIZED_PATTERNS = tuple(
         r"\bexternalized_ref\b\s*[:=]\s*[^,\s}\]]+",
     )
 )
-SHELL_SEPARATORS = {"|", "||", "&&", ";"}
+SHELL_SEPARATORS = {"|", "||", "&&", ";", "&"}
 SOURCE_SEARCH_COMMANDS = {"rg", "grep", "ag", "ack"}
 OPTIONS_WITH_VALUES = {
     "-C",
@@ -448,6 +448,13 @@ def classify_command(command: str | None, text: str) -> str:
     sample_l = text[:4_000].lower()
     text_l = text.lower()
 
+    source_consumer_class = _source_consumer_command_class(
+        command_l,
+        sample_l,
+        text_l,
+    )
+    if source_consumer_class is not None:
+        return source_consumer_class
     if _looks_like_file_read_command(command_l):
         return "file_read"
     if _is_source_search_command(command_l):
@@ -521,7 +528,7 @@ def _preserve_patterns_for_output(
     if command_class == "docker_build":
         return _priority_preservation_patterns(
             text,
-            DOCKER_PATTERNS,
+            DOCKER_BUILD_PRESERVATION_PATTERNS,
             DOCKER_BUILD_HIGH_SIGNAL_PRIORITY_PATTERNS,
         )
     if command_class == "docker_logs":
@@ -561,7 +568,7 @@ def _apply_reducer(
         return "docker_build", _important_lines(
             text,
             options,
-            DOCKER_PATTERNS + lcm_patterns,
+            DOCKER_BUILD_PRESERVATION_PATTERNS + lcm_patterns,
             priority_patterns=DOCKER_BUILD_HIGH_SIGNAL_PRIORITY_PATTERNS,
         )
     if command_class == "docker_logs":
@@ -644,6 +651,8 @@ DOCKER_PATTERNS = tuple(
         r"^#\d+|^=>",
     )
 )
+
+DOCKER_BUILD_PRESERVATION_PATTERNS = (*DOCKER_PATTERNS, *CRITICAL_PATTERNS)
 
 DOCKER_LOG_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
@@ -730,8 +739,6 @@ DOCKER_BUILD_HIGH_SIGNAL_PRIORITY_PATTERNS = tuple(
         (
             r"failed to solve",
             r"did not complete successfully",
-        ),
-        (
             r"traceback \(most recent call last\)",
             r"valueerror|typeerror|runtimeerror|assertionerror",
         ),
@@ -2151,6 +2158,136 @@ def _is_source_search_command(command: str) -> bool:
     return False
 
 
+def _source_consumer_command_class(
+    command: str,
+    sample: str,
+    text: str,
+) -> str | None:
+    for variant in _command_intent_variants(command):
+        command_class = _background_tail_command_class(variant, sample, text)
+        if command_class is not None:
+            return command_class
+    for variant in _command_intent_variants(command):
+        command_class = _pipeline_xargs_compactable_class(variant, sample, text)
+        if command_class is not None:
+            return command_class
+    return None
+
+
+def _background_tail_command_class(command: str, sample: str, text: str) -> str | None:
+    segments = _background_segments(command)
+    for index, (separator, tokens) in enumerate(segments):
+        if separator != "&" or not tokens:
+            continue
+        exact_class = _exact_class_for_tokens(tokens)
+        if exact_class is not None:
+            later_compactable_class = _later_compactable_class(segments[index + 1 :], sample, text)
+            return later_compactable_class or exact_class
+        compactable_class = _compactable_class_for_tokens(tokens, sample, text)
+        if compactable_class is not None:
+            return compactable_class
+    return None
+
+
+def _background_segments(command: str) -> list[tuple[str | None, list[str]]]:
+    segments: list[tuple[str | None, list[str]]] = []
+    separator: str | None = None
+    current: list[str] = []
+    for token in _shell_tokens(command):
+        if token in {"&&", "||", ";", "&"}:
+            if current:
+                segments.append((separator, current))
+                current = []
+            separator = token
+            continue
+        current.append(token)
+    if current:
+        segments.append((separator, current))
+    return segments
+
+
+def _later_compactable_class(
+    segments: list[tuple[str | None, list[str]]],
+    sample: str,
+    text: str,
+) -> str | None:
+    for _separator, tokens in segments:
+        if not tokens or _is_setup_segment(tokens):
+            continue
+        command_class = _compactable_class_for_tokens(tokens, sample, text)
+        if command_class is not None:
+            return command_class
+    return None
+
+
+def _exact_class_for_tokens(tokens: list[str]) -> str | None:
+    if _tokens_have_unsafe_shell_expansion(tokens):
+        return None
+    if _tokens_start_file_read(tokens):
+        return "file_read"
+    if _tokens_start_source_search(tokens) or _tokens_pipe_to_source_search(tokens):
+        return "source_search"
+    return None
+
+
+def _tokens_have_unsafe_shell_expansion(tokens: list[str]) -> bool:
+    return any(
+        "<" in token or ">" in token or "`" in token or "$" in token for token in tokens
+    )
+
+
+def _pipeline_xargs_compactable_class(command: str, sample: str, text: str) -> str | None:
+    for tokens in _command_token_segments(command):
+        for index, token in enumerate(tokens[:-1]):
+            if token != "|":
+                continue
+            upstream = tokens[:index]
+            if not (_tokens_start_source_search(upstream) or _tokens_start_file_read(upstream)):
+                continue
+            downstream = _strip_command_wrappers(tokens[index + 1 :])
+            payload = _command_runner_payload(downstream)
+            if payload is None:
+                continue
+            command_class = _compactable_class_for_tokens(payload, sample, text)
+            if command_class is not None:
+                return command_class
+    return None
+
+
+def _compactable_class_for_tokens(
+    tokens: list[str],
+    sample: str,
+    text: str,
+) -> str | None:
+    if not tokens:
+        return None
+    command = shlex.join(tokens)
+    command_variants = _command_intent_variants(command)
+    if any(_is_apt_command(variant) for variant in command_variants):
+        return "apt"
+    if any(_is_python_package_command(variant) for variant in command_variants):
+        return "python_package"
+    if any(
+        _contains_command(variant, ("pytest", "py.test")) for variant in command_variants
+    ) or "=== failures ===" in sample:
+        return "pytest"
+    if any("unittest" in variant for variant in command_variants) or re.search(
+        r"ran \d+ tests?",
+        sample,
+    ):
+        return "unittest"
+    if any(_is_docker_log_command(variant) for variant in command_variants):
+        return "docker_logs"
+    if any(_is_docker_build_command(variant) for variant in command_variants) or (
+        _looks_like_docker_build_output(text)
+        and any(_can_infer_docker_build_from_output(variant) for variant in command_variants)
+    ):
+        return "docker_build"
+    if any(_is_node_command(variant, sample) for variant in command_variants):
+        return "node"
+    return None
+
+
 def _is_setup_segment(tokens: list[str]) -> bool:
     setup_commands = {".", "cd", "export", "popd", "pushd", "pwd", "set", "source", "true"}
     return bool(tokens and Path(tokens[0]).name in setup_commands)
@@ -2412,7 +2549,7 @@ def _command_token_segments(command: str) -> list[list[str]]:
     segments: list[list[str]] = []
     current: list[str] = []
     for token in _shell_tokens(command):
-        if token in {"&&", "||", ";"}:
+        if token in {"&&", "||", ";", "&"}:
             if current:
                 segments.append(current)
                 current = []
