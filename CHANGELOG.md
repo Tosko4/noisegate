@@ -6,6 +6,7 @@ All notable changes to Noisegate are documented here. Release notes are generate
 
 ### Added
 - `noisegate reduce`, `reduce-json`, and `wrap` now accept `--metadata`/`--debug` to print diagnostic JSON to stderr without changing stdout.
+- Regression coverage now defines the `execute_code` print-output boundary across JSON, source, config, diff, test, web excerpt, dependency, package-manager, and invalid-text payloads.
 
 ### Changed
 - `noisegate install-hermes --dry-run` now explicitly states that install/enable/doctor commands are not run and no Hermes restart/reload is performed.
