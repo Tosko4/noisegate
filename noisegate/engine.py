@@ -230,6 +230,8 @@ def _reduce_text(
         return _unchanged(text, "protected_tool", command_class, reason="protected_tool")
     if command_class == "git_diff" and options.preserve_diffs:
         return _unchanged(text, "protected_diff", command_class, reason="diff_passthrough")
+    if command_class == "patch":
+        return _unchanged(text, "protected_patch", command_class, reason="patch_passthrough")
     if command_class == "file_read":
         return _unchanged(
             text,
@@ -361,14 +363,14 @@ def classify_command(command: str | None, text: str) -> str:
     command_l = (command or "").strip().lower()
     sample_l = text[:4_000].lower()
 
-    if (
-        _looks_like_diff_command(command_l)
-        or "diff --git " in text
-        or _looks_like_unified_diff(text)
-    ):
-        return "git_diff"
     if _looks_like_file_read_command(command_l):
         return "file_read"
+    if _looks_like_v4a_patch(text):
+        return "patch"
+    if _looks_like_diff_command(command_l):
+        return "git_diff"
+    if "diff --git " in text or _looks_like_unified_diff(text):
+        return "git_diff"
     if "git status" in command_l or ("on branch " in sample_l and "working tree" in sample_l):
         return "git_status"
     if "git log" in command_l:
@@ -1297,13 +1299,95 @@ def _looks_like_unified_diff(text: str) -> bool:
     )
 
 
+def _looks_like_v4a_patch(text: str) -> bool:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return len(lines) >= 2 and lines[0] == "*** Begin Patch" and lines[-1] == "*** End Patch"
+
+
 def _looks_like_file_read_command(command: str) -> bool:
-    if not command or re.search(r"[|;&><]", command):
+    if not command or _has_unquoted_shell_operator(command):
         return False
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    if not tokens:
+        return False
+    executable = tokens[0]
+    if executable in {"cat", "head", "tail", "less", "more", "bat", "nl"}:
+        return True
+    if _looks_like_git_show_file_read_tokens(tokens):
+        return True
+    if executable != "sed":
+        return False
+    if "-i" in tokens or any(token.startswith("-i") and token != "-i" for token in tokens):
+        return False
+    return any(_looks_like_sed_print_script(token) for token in tokens[1:])
+
+
+def _has_unquoted_shell_operator(command: str) -> bool:
+    quote: str | None = None
+    escaped = False
+    for index, char in enumerate(command):
+        if escaped:
+            escaped = False
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = None
+            continue
+        if quote == '"':
+            if char == "\\":
+                escaped = True
+                continue
+            if char == '"':
+                quote = None
+                continue
+            if char == "`" or (char == "$" and command[index + 1 : index + 2] == "("):
+                return True
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            continue
+        if char in "|;&><`\n\r" or (char == "$" and command[index + 1 : index + 2] == "("):
+            return True
+    return False
+
+
+def _looks_like_sed_print_script(token: str) -> bool:
+    script = token.strip()
     return bool(
-        re.match(r"^(cat|head|tail|less|more|bat)\b", command)
-        or re.match(r"^sed\s+(-n\s+)?(['\"]?\d+,?\d*p['\"]?)\s+\S+", command)
+        re.fullmatch(r"\d+(,\d+)?p", script)
+        or re.fullmatch(r"\d+,\$p", script)
+        or re.fullmatch(r"\$p", script)
     )
+
+
+def _looks_like_git_show_file_read_tokens(tokens: list[str]) -> bool:
+    if not tokens or tokens[0] != "git" or "show" not in tokens:
+        return False
+    show_index = tokens.index("show")
+    skip_next = False
+    for token in tokens[show_index + 1 :]:
+        if skip_next:
+            skip_next = False
+            continue
+        if token == "--":
+            continue
+        if token in {"-l", "--format", "--pretty", "--date"}:
+            skip_next = True
+            continue
+        if token.startswith(("-l", "--format=", "--pretty=", "--date=")):
+            continue
+        if token.startswith("-"):
+            continue
+        _, separator, path = token.partition(":")
+        if separator and path:
+            return True
+    return False
 
 
 def _is_node_command(command: str, sample: str) -> bool:

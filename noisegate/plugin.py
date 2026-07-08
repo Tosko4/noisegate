@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import Any, Protocol, TypeAlias
@@ -61,7 +62,7 @@ def transform_tool_result(
             return None
 
         parsed = json.loads(result)
-        call_args = args or arguments or {}
+        call_args = _combined_call_args(args, arguments)
 
         if isinstance(parsed, str):
             command = _extract_command({}, call_args)
@@ -261,15 +262,30 @@ def _candidate_fields(tool_name: str, payload: Mapping[str, JsonValue]) -> tuple
     return tuple(field for field in candidates if field in payload)
 
 
+def _combined_call_args(
+    args: Mapping[str, Any] | None,
+    arguments: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    combined: dict[str, Any] = {}
+    args_map = args if isinstance(args, Mapping) else {}
+    arguments_map = arguments if isinstance(arguments, Mapping) else {}
+    combined.update(arguments_map)
+    combined.update(args_map)
+    command = _extract_command({}, args_map) or _extract_command({}, arguments_map)
+    if command:
+        combined["command"] = command
+    return combined
+
+
 def _extract_command(payload: Mapping[str, JsonValue], args: Mapping[str, Any]) -> str:
-    for source in (payload, args):
+    for source in (args, payload):
         for key in ("command", "cmd", "shell_command", "code"):
             value = source.get(key)
-            if isinstance(value, str):
+            if isinstance(value, str) and value.strip():
                 return value
     argv = args.get("argv")
     if isinstance(argv, list) and all(isinstance(item, str) for item in argv):
-        return " ".join(argv)
+        return shlex.join(argv)
     return ""
 
 
