@@ -1208,6 +1208,29 @@ def test_node_char_budget_preserves_pattern_priority_when_ranks_tie() -> None:
     assert "deprecated dependency" not in result.text
 
 
+def test_node_char_budget_prefers_npm_error_over_count_summary() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index} " + ("x" * 20) for index in range(10)],
+            "npm ERR! Cannot find module './missing'",
+            *[f"build noise {index} " + ("y" * 20) for index in range(10)],
+            "3 failed",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="npm test",
+        exit_code=1,
+        options=options(max_chars=120, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 120
+    assert "npm ERR! Cannot find module './missing'" in result.text
+    assert "3 failed" not in result.text
+
+
 def test_preserving_pattern_char_path_reuses_line_layout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

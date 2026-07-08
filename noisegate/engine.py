@@ -514,6 +514,8 @@ def _preservation_patterns(
     text: str,
     patterns: tuple[re.Pattern[str], ...],
 ) -> tuple[re.Pattern[str], ...]:
+    if patterns is NODE_PATTERNS:
+        return patterns
     return CRITICAL_PATTERNS if _first_pattern_match(text, CRITICAL_PATTERNS) else patterns
 
 
@@ -915,6 +917,7 @@ def _ranked_pattern_line_matches(
     patterns: tuple[re.Pattern[str], ...],
 ) -> list[_SpanMatch]:
     candidates: list[tuple[tuple[int, int, int, int, int], _SpanMatch]] = []
+    pattern_order_first = patterns is NODE_PATTERNS
     offset = 0
     for line_index, line in enumerate(text.splitlines(keepends=True)):
         stripped_line = line.rstrip("\r\n")
@@ -922,13 +925,23 @@ def _ranked_pattern_line_matches(
             match = pattern.search(stripped_line)
             if match is None:
                 continue
-            rank = (
-                _failure_detail_rank(stripped_line),
-                pattern_index,
-                line_index,
-                offset + match.start(),
-                offset + match.end(),
-            )
+            detail_rank = _failure_detail_rank(stripped_line)
+            if pattern_order_first:
+                rank = (
+                    pattern_index,
+                    detail_rank,
+                    line_index,
+                    offset + match.start(),
+                    offset + match.end(),
+                )
+            else:
+                rank = (
+                    detail_rank,
+                    pattern_index,
+                    line_index,
+                    offset + match.start(),
+                    offset + match.end(),
+                )
             candidates.append((rank, _SpanMatch(offset + match.start(), offset + match.end())))
         offset += len(line)
     return [match for _, match in sorted(candidates, key=lambda candidate: candidate[0])]
