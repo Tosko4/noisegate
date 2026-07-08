@@ -13,6 +13,20 @@ def numbered(prefix: str, count: int) -> str:
     return "\n".join(f"{prefix} {index:03d}" for index in range(1, count + 1))
 
 
+def write_hermes_console_script(
+    path: Path,
+    *,
+    python: str = "/opt/hermes/.venv/bin/python",
+) -> None:
+    path.write_text(
+        f"#!{python}\n"
+        "from hermes_cli.cli import main\n"
+        "if __name__ == '__main__':\n"
+        "    raise SystemExit(main())\n",
+        encoding="utf-8",
+    )
+
+
 def run_cli(
     *args: str,
     input_text: str = "",
@@ -193,7 +207,7 @@ def test_doctor_cli_reports_invalid_environment_values(tmp_path: Path) -> None:
 
 def test_install_hermes_cli_dry_run_reports_plan(tmp_path: Path) -> None:
     hermes = tmp_path / "hermes"
-    hermes.write_text("#!/opt/hermes/.venv/bin/python\n", encoding="utf-8")
+    write_hermes_console_script(hermes)
 
     proc = run_cli(
         "install-hermes",
@@ -222,6 +236,28 @@ def test_install_hermes_cli_rejects_invalid_launcher(tmp_path: Path) -> None:
 
     assert proc.returncode == 2
     assert "no Python shebang" in proc.stderr
+
+
+def test_install_hermes_cli_dry_run_mentions_no_writes_or_restart(tmp_path: Path) -> None:
+    hermes = tmp_path / "hermes"
+    write_hermes_console_script(hermes)
+
+    proc = run_cli("install-hermes", "--dry-run", "--hermes", str(hermes))
+
+    assert proc.returncode == 0, proc.stderr
+    assert "dry run; install/enable/doctor commands will not run" in proc.stdout
+    assert "restart: not performed by Noisegate" in proc.stdout
+
+
+def test_install_hermes_cli_reports_missing_hermes_on_path(tmp_path: Path) -> None:
+    proc = run_cli(
+        "install-hermes",
+        "--dry-run",
+        env={"PATH": str(tmp_path)},
+    )
+
+    assert proc.returncode == 2
+    assert "Hermes executable not found on PATH: hermes" in proc.stderr
 
 
 def test_cat_cli_reads_artifact(tmp_path: Path) -> None:

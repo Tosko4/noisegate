@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import os
 import re
 import shlex
@@ -22,17 +23,32 @@ SHELL_ASSIGNMENT_RE = re.compile(
 SHELL_VARIABLE_REF_RE = re.compile(
     r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<bare>[A-Za-z_][A-Za-z0-9_]*))"
 )
+HERMES_ENTRYPOINT_MODULES = {
+    "hermes_cli",
+    "hermes_cli.main",
+    "hermes_cli.cli",
+    "hermes_cli.__main__",
+}
 ENABLE_PLUGIN_CODE = """
 from hermes_cli.config import load_config, save_config
 cfg = load_config()
 plugins = cfg.setdefault("plugins", {})
-enabled = plugins.get("enabled") if isinstance(plugins.get("enabled"), list) else []
-disabled = plugins.get("disabled") if isinstance(plugins.get("disabled"), list) else []
+changed = False
+raw_enabled = plugins.get("enabled")
+enabled = list(raw_enabled) if isinstance(raw_enabled, list) else []
 if "noisegate" not in enabled:
     enabled.append("noisegate")
-plugins["enabled"] = enabled
-plugins["disabled"] = [name for name in disabled if name != "noisegate"]
-save_config(cfg)
+if raw_enabled != enabled:
+    plugins["enabled"] = enabled
+    changed = True
+raw_disabled = plugins.get("disabled")
+if isinstance(raw_disabled, list):
+    disabled = [name for name in raw_disabled if name != "noisegate"]
+    if raw_disabled != disabled:
+        plugins["disabled"] = disabled
+        changed = True
+if changed:
+    save_config(cfg)
 """.strip()
 
 
@@ -57,6 +73,7 @@ class InstallHermesPlan:
             f"install: {shlex.join(self.install_command)}",
             "enable: " + shlex.join(self.enable_command),
             f"doctor: {shlex.join(self.doctor_command)}",
+            "restart: not performed by Noisegate",
         ]
 
 
@@ -131,7 +148,9 @@ def _python_from_launcher(executable: Path, *, seen: set[Path] | None = None) ->
         raise InstallHermesError(f"Hermes launcher has an empty shebang: {executable}")
     command = _python_command_from_shebang_parts(parts)
     if _looks_like_python(command):
-        return _validated_python_command(command)
+        hermes_python = _validated_python_command(command)
+        _validate_hermes_python_console_launcher(executable, text)
+        return hermes_python
     if _looks_like_shell(command):
         return _python_from_shell_launcher(executable, text, seen=seen)
     raise InstallHermesError(
@@ -149,18 +168,233 @@ def _python_from_shell_launcher(executable: Path, text: str, *, seen: set[Path])
             tokens = shlex.split(stripped)
         except ValueError:
             continue
-        for token in tokens[1:]:
-            if token == "$@" or token.startswith("-"):
-                continue
-            expanded = _expand_shell_vars(token, assignments)
-            if _looks_like_env(expanded) or _looks_like_shell_assignment(expanded):
-                continue
-            if _looks_like_python(expanded):
-                return _validated_python_command(expanded)
-            target = _candidate_launcher_path(expanded, executable.parent)
-            if target is not None and target.exists():
-                return _python_from_launcher(target, seen=seen)
+        command_and_args = _shell_exec_command(tokens, assignments=assignments)
+        if command_and_args is None:
+            continue
+        command, args = command_and_args
+        if _looks_like_python(command):
+            hermes_python = _validated_python_command(command)
+            _validate_shell_python_invokes_hermes(executable, args, assignments=assignments)
+            return hermes_python
+        target = _candidate_launcher_path(command, executable.parent)
+        if target is not None and target.exists():
+            return _python_from_launcher(target, seen=seen)
     raise InstallHermesError(f"Unsupported Hermes shell launcher: {executable}")
+
+
+def _shell_exec_command(
+    tokens: list[str],
+    *,
+    assignments: dict[str, str],
+) -> tuple[str, list[str]] | None:
+    if len(tokens) < 2 or tokens[0] != "exec":
+        return None
+    args = [_expand_shell_vars(token, assignments) for token in tokens[1:]]
+    if not args:
+        return None
+    if not _looks_like_env(args[0]):
+        if _looks_like_shell_assignment(args[0]) or args[0] == "$@" or args[0].startswith("-"):
+            return None
+        return args[0], args[1:]
+
+    index = 1
+    expanded_env_args: list[str] = []
+    while index < len(args):
+        arg = args[index]
+        if arg == "$@":
+            return None
+        if _looks_like_shell_assignment(arg):
+            index += 1
+            continue
+        if arg in {"-i", "--ignore-environment", "-0", "--null"}:
+            index += 1
+            continue
+        if arg in {"-u", "--unset", "--argv0"}:
+            index += 2
+            continue
+        if arg in {"-S", "--split-string"}:
+            split_index = index + 1
+            if split_index >= len(args):
+                return None
+            try:
+                expanded_env_args.extend(shlex.split(args[split_index]))
+            except ValueError:
+                return None
+            expanded_env_args.extend(args[split_index + 1 :])
+            index = len(args)
+            break
+        if arg.startswith("-"):
+            index += 1
+            continue
+        break
+    expanded_env_args.extend(args[index:])
+    if not expanded_env_args:
+        return None
+    command = expanded_env_args[0]
+    if command == "$@" or _looks_like_shell_assignment(command) or command.startswith("-"):
+        return None
+    return command, expanded_env_args[1:]
+
+
+def _validate_hermes_python_console_launcher(executable: Path, text: str) -> None:
+    body = "\n".join(text.splitlines()[1:])
+    try:
+        tree = ast.parse(body)
+    except SyntaxError as exc:
+        raise InstallHermesError(
+            "Hermes launcher is not a valid Hermes Python console script: "
+            f"{executable}"
+        ) from exc
+    entrypoint_names = _top_level_hermes_entrypoint_names(tree)
+    if entrypoint_names and _module_calls_entrypoint(tree, entrypoint_names):
+        return
+    if _main_guard_imports_and_calls_entrypoint(tree):
+        return
+    raise InstallHermesError(
+        "Hermes launcher is not a Hermes Python console script: " f"{executable}"
+    )
+
+
+def _top_level_hermes_entrypoint_names(tree: ast.Module) -> set[str]:
+    names: set[str] = set()
+    for node in tree.body:
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        if node.module not in HERMES_ENTRYPOINT_MODULES:
+            continue
+        for alias in node.names:
+            if alias.name in {"main", "app"}:
+                names.add(alias.asname or alias.name)
+    return names
+
+
+def _module_calls_entrypoint(tree: ast.Module, entrypoint_names: set[str]) -> bool:
+    for node in tree.body:
+        if isinstance(node, ast.If) and _is_main_guard(node.test):
+            if _body_calls_entrypoint(node.body, entrypoint_names):
+                return True
+            continue
+        if isinstance(node, ast.Expr) and _statement_calls_entrypoint(node, entrypoint_names):
+            return True
+    return False
+
+
+def _main_guard_imports_and_calls_entrypoint(tree: ast.Module) -> bool:
+    for node in tree.body:
+        if not isinstance(node, ast.If) or not _is_main_guard(node.test):
+            continue
+        entrypoint_names = _hermes_entrypoint_names_from_statements(node.body)
+        if entrypoint_names and _body_calls_entrypoint(node.body, entrypoint_names):
+            return True
+    return False
+
+
+def _hermes_entrypoint_names_from_statements(statements: list[ast.stmt]) -> set[str]:
+    names: set[str] = set()
+    for node in statements:
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        if node.module not in HERMES_ENTRYPOINT_MODULES:
+            continue
+        for alias in node.names:
+            if alias.name in {"main", "app"}:
+                names.add(alias.asname or alias.name)
+    return names
+
+
+def _body_calls_entrypoint(statements: list[ast.stmt], entrypoint_names: set[str]) -> bool:
+    return any(_statement_calls_entrypoint(node, entrypoint_names) for node in statements)
+
+
+def _statement_calls_entrypoint(node: ast.AST, entrypoint_names: set[str]) -> bool:
+    if isinstance(
+        node,
+        (
+            ast.FunctionDef,
+            ast.AsyncFunctionDef,
+            ast.ClassDef,
+            ast.Lambda,
+            ast.If,
+            ast.For,
+            ast.AsyncFor,
+            ast.While,
+            ast.Try,
+            ast.With,
+            ast.AsyncWith,
+        ),
+    ):
+        return False
+    for child in ast.iter_child_nodes(node):
+        if (
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Name)
+            and child.func.id in entrypoint_names
+        ):
+            return True
+        if _statement_calls_entrypoint(child, entrypoint_names):
+            return True
+    return False
+
+
+def _is_main_guard(test: ast.expr) -> bool:
+    if not isinstance(test, ast.Compare) or len(test.ops) != 1 or len(test.comparators) != 1:
+        return False
+    if not isinstance(test.ops[0], ast.Eq):
+        return False
+    left = test.left
+    right = test.comparators[0]
+    return (
+        _is_name_constant(left, "__name__") and _is_string_constant(right, "__main__")
+    ) or (_is_string_constant(left, "__main__") and _is_name_constant(right, "__name__"))
+
+
+def _is_name_constant(node: ast.expr, value: str) -> bool:
+    return isinstance(node, ast.Name) and node.id == value
+
+
+def _is_string_constant(node: ast.expr, value: str) -> bool:
+    return isinstance(node, ast.Constant) and node.value == value
+
+
+def _validate_shell_python_invokes_hermes(
+    executable: Path,
+    args: list[str],
+    *,
+    assignments: dict[str, str],
+) -> None:
+    args = [_expand_shell_vars(arg, assignments) for arg in args]
+    module = _python_interpreter_module_arg(args)
+    if module is not None and _is_hermes_cli_module(module):
+        return
+    raise InstallHermesError(
+        "Hermes shell launcher does not invoke hermes_cli with the resolved Python: "
+        f"{executable}"
+    )
+
+
+def _python_interpreter_module_arg(args: list[str]) -> str | None:
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in {"$@", "--"}:
+            return None
+        if arg == "-m":
+            module_index = index + 1
+            return args[module_index] if module_index < len(args) else None
+        if arg == "-c":
+            return None
+        if arg in {"-W", "-X"}:
+            index += 2
+            continue
+        if arg.startswith("-W") or arg.startswith("-X") or arg.startswith("-"):
+            index += 1
+            continue
+        return None
+    return None
+
+
+def _is_hermes_cli_module(value: str) -> bool:
+    return value in HERMES_ENTRYPOINT_MODULES
 
 
 def _looks_like_windows_launcher(executable: Path) -> bool:

@@ -271,6 +271,9 @@ def test_release_notes_include_categorized_prs_and_new_contributors(
     assert "## How to update" in notes
     assert "uvx --from noisegate-hermes noisegate install-hermes" in notes
     assert "npx -p noisegate-hermes noisegate install-hermes" in notes
+    assert "install/enable/doctor commands" in notes
+    assert "removes any stale `plugins.disabled` entry" in notes
+    assert "restart or reload that Hermes process" in notes
     assert "## Included pull requests" in notes
     assert "Release range: `v0.1.0...v0.2.0`." in notes
     assert "### Release / Packaging" in notes
