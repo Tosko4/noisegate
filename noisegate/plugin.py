@@ -2,20 +2,20 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import Any, Protocol, TypeAlias
 
 from ._version import __version__
 from .engine import (
-    CRITICAL_PATTERNS,
-    NODE_PRESERVATION_PATTERNS,
     JsonValue,
     NoisegateOptions,
     _append_recovery_notices,
     _drop_artifact_if_notice_cannot_fit,
     _is_compactable_tool_name,
     _plan_artifact,
+    _preserve_patterns_for_output,
     _store_artifact,
     classify_command,
     reduce_text,
@@ -62,7 +62,7 @@ def transform_tool_result(
             return None
 
         parsed = json.loads(result)
-        call_args = args or arguments or {}
+        call_args = _combined_call_args(args, arguments)
 
         if isinstance(parsed, str):
             command = _extract_command({}, call_args)
@@ -226,11 +226,7 @@ def _preserve_patterns_for(
     text: str,
 ) -> tuple[re.Pattern[str], ...] | None:
     command_class = classify_command(command, text)
-    if command_class in {"pytest", "unittest"}:
-        return CRITICAL_PATTERNS
-    if command_class == "node":
-        return NODE_PRESERVATION_PATTERNS
-    return None
+    return _preserve_patterns_for_output(command_class, text)
 
 
 def transform_terminal_output(
@@ -266,15 +262,30 @@ def _candidate_fields(tool_name: str, payload: Mapping[str, JsonValue]) -> tuple
     return tuple(field for field in candidates if field in payload)
 
 
+def _combined_call_args(
+    args: Mapping[str, Any] | None,
+    arguments: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    combined: dict[str, Any] = {}
+    args_map = args if isinstance(args, Mapping) else {}
+    arguments_map = arguments if isinstance(arguments, Mapping) else {}
+    combined.update(arguments_map)
+    combined.update(args_map)
+    command = _extract_command({}, args_map) or _extract_command({}, arguments_map)
+    if command:
+        combined["command"] = command
+    return combined
+
+
 def _extract_command(payload: Mapping[str, JsonValue], args: Mapping[str, Any]) -> str:
-    for source in (payload, args):
+    for source in (args, payload):
         for key in ("command", "cmd", "shell_command", "code"):
             value = source.get(key)
-            if isinstance(value, str):
+            if isinstance(value, str) and value.strip():
                 return value
     argv = args.get("argv")
     if isinstance(argv, list) and all(isinstance(item, str) for item in argv):
-        return " ".join(argv)
+        return shlex.join(argv)
     return ""
 
 

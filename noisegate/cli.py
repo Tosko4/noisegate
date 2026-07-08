@@ -321,9 +321,10 @@ def _reduce_json_value(
             or parsed.get("tool")
             or ""
         )
-        call_args = parsed.get("args") or parsed.get("arguments") or {}
-        if not isinstance(call_args, dict):
-            call_args = {}
+        call_args = _combined_call_args(parsed.get("args"), parsed.get("arguments"))
+        top_level_command = _extract_command_arg(parsed)
+        if not _has_command_arg(call_args) and top_level_command:
+            call_args = {**call_args, "command": top_level_command}
         result_text = parsed["result"]
         transformed = transform_tool_result(
             result_text,
@@ -336,7 +337,7 @@ def _reduce_json_value(
             and _is_compactable_tool_name(tool_name)
             and not _is_json_text(result_text)
         ):
-            command = str(call_args.get("command") or parsed.get("command") or "")
+            command = _extract_command_arg(call_args)
             reduced = reduce_text(
                 result_text,
                 command=command,
@@ -354,6 +355,7 @@ def _reduce_json_value(
         return raw
 
     tool_name = ""
+    call_args: dict[Any, Any] = {}
     if isinstance(parsed, dict):
         tool_name = str(
             parsed.get("tool_name")
@@ -361,9 +363,13 @@ def _reduce_json_value(
             or parsed.get("tool")
             or ""
         )
+        call_args = _combined_call_args(parsed.get("args"), parsed.get("arguments"))
+        top_level_command = _extract_command_arg(parsed)
+        if not _has_command_arg(call_args) and top_level_command:
+            call_args = {**call_args, "command": top_level_command}
         if not tool_name and _looks_terminal_payload(parsed):
             tool_name = "terminal"
-    transformed = transform_tool_result(raw, tool_name=tool_name, **hook_kwargs)
+    transformed = transform_tool_result(raw, tool_name=tool_name, args=call_args, **hook_kwargs)
     return transformed if transformed is not None else raw
 
 
@@ -371,6 +377,33 @@ def _looks_terminal_payload(payload: dict[Any, Any]) -> bool:
     return any(key in payload for key in ("stdout", "stderr", "output")) and any(
         key in payload for key in ("command", "exit", "exit_code", "status")
     )
+
+
+def _has_command_arg(args: dict[Any, Any]) -> bool:
+    return bool(_extract_command_arg(args))
+
+
+def _combined_call_args(args: object, arguments: object) -> dict[Any, Any]:
+    combined: dict[Any, Any] = {}
+    args_map = args if isinstance(args, dict) else {}
+    arguments_map = arguments if isinstance(arguments, dict) else {}
+    combined.update(arguments_map)
+    combined.update(args_map)
+    command = _extract_command_arg(args_map) or _extract_command_arg(arguments_map)
+    if command:
+        combined["command"] = command
+    return combined
+
+
+def _extract_command_arg(args: dict[Any, Any]) -> str:
+    for key in ("command", "cmd", "shell_command", "code"):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    argv = args.get("argv")
+    if isinstance(argv, list) and argv and all(isinstance(item, str) for item in argv):
+        return shlex.join(argv)
+    return ""
 
 
 def _is_json_text(value: str) -> bool:

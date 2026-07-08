@@ -27,6 +27,22 @@ def write_hermes_console_script(
     )
 
 
+def source_like_payload() -> str:
+    return "\n".join(
+        [
+            "# Exact source-like payload that resembles noisy logs.",
+            "config = {'FAILED': 'fixture', 'ERROR': 'fixture'}",
+            "traceback_literal = 'Traceback (most recent call last):'",
+            "npm_literal = 'npm ERR! code ELIFECYCLE'",
+            "docker_literal = 'Dockerfile'",
+            *[
+                f"literal fixture line {index:03d}: FAILED ERROR Traceback npm ERR!"
+                for index in range(90)
+            ],
+        ]
+    )
+
+
 def run_cli(
     *args: str,
     input_text: str = "",
@@ -265,6 +281,241 @@ def test_reduce_json_preserves_direct_protected_tool_payload() -> None:
         "tool_name": "read_file",
         "content": numbered("exact line", 100),
         "noisegate": {"max_chars": 120},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+
+def test_reduce_json_preserves_source_like_protected_tool_payloads() -> None:
+    exact = source_like_payload()
+    for tool_name in (
+        "read_file",
+        "write_file",
+        "patch",
+        "apply_patch",
+        "skill_view",
+        "web_extract",
+        "memory",
+        "hindsight_recall",
+        "lcm_expand",
+        "mcp__mindlyos__get_note_page",
+    ):
+        payload = {
+            "tool_name": tool_name,
+            "result": exact,
+            "noisegate": {"max_chars": 200, "max_lines": 20},
+        }
+
+        proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(proc.stdout) == payload
+
+
+def test_reduce_json_preserves_source_like_terminal_file_display_payload() -> None:
+    exact = source_like_payload()
+    payload = {
+        "tool_name": "terminal",
+        "command": "nl -ba src/source_fixture.py",
+        "stdout": exact,
+        "exit_code": 0,
+        "noisegate": {"max_chars": 200, "max_lines": 20},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+
+def test_reduce_json_args_command_alias_wins_over_direct_payload_command() -> None:
+    exact = source_like_payload()
+    payload = {
+        "tool_name": "terminal",
+        "args": {"cmd": "cat src/source_fixture.py"},
+        "command": "pytest -q",
+        "stdout": exact,
+        "exit_code": 0,
+        "noisegate": {"max_chars": 200, "max_lines": 20},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+
+def test_reduce_json_preserves_direct_terminal_payload_with_args_command_alias() -> None:
+    exact = source_like_payload()
+    payload = {
+        "tool_name": "terminal",
+        "args": {"cmd": "cat src/source_fixture.py"},
+        "stdout": exact,
+        "exit_code": 0,
+        "noisegate": {"max_chars": 200, "max_lines": 20},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+
+def test_reduce_json_preserves_argv_file_display_with_metachar_paths() -> None:
+    exact = source_like_payload()
+
+    for path in ("src/A&B.py", "src/A>B.py", "src/A;B.py", "src/$(fixture).py"):
+        payload = {
+            "tool_name": "terminal",
+            "args": {"argv": ["cat", path]},
+            "stdout": exact,
+            "exit_code": 0,
+            "noisegate": {"max_chars": 200, "max_lines": 20},
+        }
+
+        proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(proc.stdout) == payload
+
+
+def test_reduce_json_uses_arguments_command_when_args_has_no_command() -> None:
+    exact = source_like_payload()
+    payload = {
+        "tool_name": "terminal",
+        "args": {"timeout": 10},
+        "arguments": {"cmd": "cat src/source_fixture.py"},
+        "stdout": exact,
+        "exit_code": 0,
+        "noisegate": {"max_chars": 200, "max_lines": 20},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+
+def test_reduce_json_args_command_alias_wins_over_arguments_command() -> None:
+    exact = source_like_payload()
+    payload = {
+        "tool_name": "terminal",
+        "args": {"cmd": "cat src/source_fixture.py"},
+        "arguments": {"command": "pytest -q"},
+        "stdout": exact,
+        "exit_code": 0,
+        "noisegate": {"max_chars": 200, "max_lines": 20},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+
+def test_reduce_json_preserves_file_display_patch_when_diff_passthrough_is_disabled() -> None:
+    exact = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Add File: src/source_fixture.py",
+            "+value = 'FAILED ERROR Traceback npm ERR! Dockerfile'",
+            *[f"+literal patch line {index:03d}: FAILED ERROR" for index in range(90)],
+            "*** End Patch",
+        ]
+    )
+    payload = {
+        "tool_name": "terminal",
+        "command": "cat patches/source.patch",
+        "stdout": exact,
+        "exit_code": 0,
+        "noisegate": {"max_chars": 200, "max_lines": 20, "preserve_diffs": False},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+
+def test_reduce_json_preserves_json_result_file_display_from_top_level_command() -> None:
+    exact = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Add File: src/source_fixture.py",
+            "+value = 'FAILED ERROR Traceback npm ERR! Dockerfile'",
+            *[f"+literal patch line {index:03d}: FAILED ERROR" for index in range(90)],
+            "*** End Patch",
+        ]
+    )
+    payload = {
+        "tool_name": "terminal",
+        "command": "cat patches/source.patch",
+        "result": json.dumps({"stdout": exact, "exit_code": 0}),
+        "noisegate": {"max_chars": 200, "max_lines": 20, "preserve_diffs": False},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+
+def test_reduce_json_prefers_existing_args_command_alias_over_top_level_command() -> None:
+    exact = source_like_payload()
+    payload = {
+        "tool_name": "terminal",
+        "args": {"cmd": "cat src/source_fixture.py"},
+        "command": "pytest -q",
+        "result": json.dumps({"stdout": exact, "exit_code": 0}),
+        "noisegate": {"max_chars": 200, "max_lines": 20},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+
+def test_reduce_json_plain_result_uses_existing_args_command_alias() -> None:
+    exact = source_like_payload()
+    payload = {
+        "tool_name": "terminal",
+        "args": {"cmd": "cat src/source_fixture.py"},
+        "result": exact,
+        "noisegate": {"max_chars": 200, "max_lines": 20},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+
+def test_reduce_json_plain_result_uses_top_level_command_alias() -> None:
+    exact = source_like_payload()
+    payload = {
+        "tool_name": "terminal",
+        "cmd": "cat src/source_fixture.py",
+        "result": exact,
+        "noisegate": {"max_chars": 200, "max_lines": 20},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+
+def test_reduce_json_inner_blank_command_falls_back_to_outer_file_display_command() -> None:
+    exact = source_like_payload()
+    payload = {
+        "tool_name": "terminal",
+        "command": "cat src/source_fixture.py",
+        "result": json.dumps({"command": "", "stdout": exact, "exit_code": 0}),
+        "noisegate": {"max_chars": 200, "max_lines": 20},
     }
 
     proc = run_cli("reduce-json", input_text=json.dumps(payload))

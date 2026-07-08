@@ -43,6 +43,16 @@ PROTECTED_TOOL_NAMES = frozenset(
 )
 PROTECTED_TOOL_PREFIXES = ("hindsight_", "lcm_", "mcp_", "mcp__")
 COMPACTABLE_TOOL_NAMES = frozenset({"terminal", "process", "read_terminal", "browser_console"})
+LCM_EXTERNALIZED_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\[(?:Externalized|GC'd externalized) (?:tool output|payload):"
+        r"[^\]\n]*\bref=[^;\]\s]+[^\]\n]*\]",
+        r"\[Externalized LCM ingest payload:[^\]\n]*\bref=[^;\]\s]+[^\]\n]*\]",
+        r'"externalized_ref"\s*:\s*"[^"\n]+"',
+        r"\bexternalized_ref\b\s*[:=]\s*[^,\s}\]]+",
+    )
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +230,8 @@ def _reduce_text(
         return _unchanged(text, "protected_tool", command_class, reason="protected_tool")
     if command_class == "git_diff" and options.preserve_diffs:
         return _unchanged(text, "protected_diff", command_class, reason="diff_passthrough")
+    if command_class == "patch":
+        return _unchanged(text, "protected_patch", command_class, reason="patch_passthrough")
     if command_class == "file_read":
         return _unchanged(
             text,
@@ -231,12 +243,9 @@ def _reduce_text(
         return _unchanged(text, "below_threshold", command_class, reason="below_threshold")
 
     reducer_name, compacted = _apply_reducer(text, command_class, options, exit_code)
-    if command_class in {"pytest", "unittest"}:
-        preserve_patterns = CRITICAL_PATTERNS
-    elif command_class == "node":
-        preserve_patterns = NODE_PRESERVATION_PATTERNS
-    else:
-        preserve_patterns = None
+    if compacted is not None and _dropped_lcm_externalized_match(before=text, after=compacted):
+        compacted = None
+    preserve_patterns = _preserve_patterns_for_output(command_class, text)
     if compacted is not None:
         compacted = _enforce_final_budget(
             compacted,
@@ -354,14 +363,14 @@ def classify_command(command: str | None, text: str) -> str:
     command_l = (command or "").strip().lower()
     sample_l = text[:4_000].lower()
 
-    if (
-        _looks_like_diff_command(command_l)
-        or "diff --git " in text
-        or _looks_like_unified_diff(text)
-    ):
-        return "git_diff"
     if _looks_like_file_read_command(command_l):
         return "file_read"
+    if _looks_like_v4a_patch(text):
+        return "patch"
+    if _looks_like_diff_command(command_l):
+        return "git_diff"
+    if "diff --git " in text or _looks_like_unified_diff(text):
+        return "git_diff"
     if "git status" in command_l or ("on branch " in sample_l and "working tree" in sample_l):
         return "git_status"
     if "git log" in command_l:
@@ -391,6 +400,24 @@ def _is_compactable_tool_name(tool_name: str | None) -> bool:
     return tool_name in COMPACTABLE_TOOL_NAMES
 
 
+def _lcm_externalized_patterns_for(text: str) -> tuple[re.Pattern[str], ...]:
+    if _first_pattern_match(text, LCM_EXTERNALIZED_PATTERNS):
+        return LCM_EXTERNALIZED_PATTERNS
+    return ()
+
+
+def _preserve_patterns_for_output(
+    command_class: str,
+    text: str,
+) -> tuple[re.Pattern[str], ...] | None:
+    lcm_patterns = _lcm_externalized_patterns_for(text)
+    if command_class in {"pytest", "unittest"}:
+        return CRITICAL_PATTERNS + lcm_patterns
+    if command_class == "node":
+        return NODE_PRESERVATION_PATTERNS + lcm_patterns
+    return lcm_patterns or None
+
+
 def _apply_reducer(
     text: str,
     command_class: str,
@@ -398,20 +425,31 @@ def _apply_reducer(
     exit_code: int | None,
 ) -> tuple[str, str | None]:
     del exit_code
+    lcm_patterns = _lcm_externalized_patterns_for(text)
     if options.mode == "head_tail":
+        if lcm_patterns:
+            return "generic_head_tail", _important_lines(text, options, lcm_patterns)
         return "generic_head_tail", _head_tail(text, options)
     if command_class in {"pytest", "unittest"}:
-        return command_class, _important_lines(text, options, TEST_PATTERNS)
+        return command_class, _important_lines(text, options, TEST_PATTERNS + lcm_patterns)
     if command_class == "node":
-        return "node", _important_lines(text, options, NODE_PRESERVATION_PATTERNS)
+        return "node", _important_lines(
+            text,
+            options,
+            NODE_PRESERVATION_PATTERNS + lcm_patterns,
+        )
     if command_class == "docker_build":
-        return "docker_build", _important_lines(text, options, DOCKER_PATTERNS)
+        return "docker_build", _important_lines(text, options, DOCKER_PATTERNS + lcm_patterns)
     if command_class == "git_status":
-        return "git_status", _important_lines(text, options, GIT_STATUS_PATTERNS)
+        return "git_status", _important_lines(text, options, GIT_STATUS_PATTERNS + lcm_patterns)
     if command_class == "git_log":
         return "git_log", _head_tail(text, replace(options, head_lines=40, tail_lines=8))
     if command_class == "search":
+        if lcm_patterns:
+            return "search", _important_lines(text, options, lcm_patterns)
         return "search", _head_tail(text, options)
+    if lcm_patterns:
+        return "generic_head_tail", _important_lines(text, options, lcm_patterns)
     return "generic_head_tail", _head_tail(text, options)
 
 
@@ -497,15 +535,11 @@ def _important_lines(
             important.append(index)
 
     if len(important) > options.max_important_lines:
-        critical = [
-            index
-            for index in important
-            if any(pattern.search(lines[index]) for pattern in CRITICAL_PATTERNS)
-        ]
-        if critical:
+        priority = _important_priority_indices(lines, important)
+        if priority:
             important = _trim_indices_around_priority(
                 important,
-                critical,
+                priority,
                 options.max_important_lines,
             )
         else:
@@ -554,11 +588,19 @@ def _preservation_patterns(
     text: str,
     patterns: tuple[re.Pattern[str], ...],
 ) -> tuple[re.Pattern[str], ...]:
+    base_patterns = patterns
     if patterns in {NODE_PATTERNS, NODE_PRESERVATION_PATTERNS}:
         if _first_pattern_match(text, CRITICAL_PATTERNS):
-            return NODE_PRESERVATION_PATTERNS
-        return patterns
-    return CRITICAL_PATTERNS if _first_pattern_match(text, CRITICAL_PATTERNS) else patterns
+            base_patterns = NODE_PRESERVATION_PATTERNS
+    elif _first_pattern_match(text, CRITICAL_PATTERNS):
+        base_patterns = CRITICAL_PATTERNS
+
+    lcm_patterns = _lcm_externalized_patterns_for(text)
+    if lcm_patterns:
+        return lcm_patterns + tuple(
+            pattern for pattern in base_patterns if pattern not in lcm_patterns
+        )
+    return base_patterns
 
 
 def _line_budgeted_important_excerpt(
@@ -569,19 +611,40 @@ def _line_budgeted_important_excerpt(
 ) -> str | None:
     if not important:
         return None
-    priority = [
-        index
-        for index in important
-        if any(pattern.search(lines[index]) for pattern in CRITICAL_PATTERNS)
-    ] or important
-    priority = sorted(
-        priority,
+    lcm_priority = _matching_indices(lines, important, LCM_EXTERNALIZED_PATTERNS)
+    critical_priority = _matching_indices(lines, important, CRITICAL_PATTERNS)
+    ranked_priority = sorted(
+        critical_priority or important,
         key=lambda index: (_failure_detail_rank(lines[index]), index),
     )
-    best_rank = _failure_detail_rank(lines[priority[0]])
+    priority = lcm_priority + [index for index in ranked_priority if index not in lcm_priority]
+    best_rank = min(_failure_detail_rank(lines[index]) for index in ranked_priority)
     max_context = max(0, options.important_context_lines)
+
+    # Externalized payload refs are recovery handles, not just interesting log
+    # lines. If they appear alongside a failure cluster, keep the refs and at
+    # least one failure anchor together when the line budget allows it. If the
+    # budget is too tight for both, the fallback below prioritizes the refs so
+    # the externalized-payload recovery path stays intact.
+    multi_anchor_priority = lcm_priority + [
+        index for index in ranked_priority[:1] if index not in lcm_priority
+    ]
+    if len(multi_anchor_priority) > 1:
+        for context in range(max_context, -1, -1):
+            keep: set[int] = set()
+            for anchor in multi_anchor_priority:
+                start = max(0, anchor - context)
+                end = min(len(lines), anchor + context + 1)
+                keep.update(range(start, end))
+            candidate = _lines_with_markers(lines, sorted(keep))
+            if _line_count(candidate) <= options.max_lines:
+                return candidate
+
     for anchor in priority:
-        if _would_hide_better_failure_anchor(best_rank, _failure_detail_rank(lines[anchor])):
+        if anchor not in lcm_priority and _would_hide_better_failure_anchor(
+            best_rank,
+            _failure_detail_rank(lines[anchor]),
+        ):
             return None
         for context in range(max_context, -1, -1):
             start = max(0, anchor - context)
@@ -647,6 +710,27 @@ def _is_diagnostic_detail_line(line: str) -> bool:
 
 def _is_incidental_exception_line(line: str) -> bool:
     return bool(re.search(r"\bexception ignored\b", line, re.IGNORECASE))
+
+
+def _important_priority_indices(lines: list[str], indices: list[int]) -> list[int]:
+    lcm_priority = _matching_indices(lines, indices, LCM_EXTERNALIZED_PATTERNS)
+    critical_priority = sorted(
+        _matching_indices(lines, indices, CRITICAL_PATTERNS),
+        key=lambda index: (_failure_detail_rank(lines[index]), index),
+    )
+    return lcm_priority + [index for index in critical_priority if index not in lcm_priority]
+
+
+def _matching_indices(
+    lines: list[str],
+    indices: list[int],
+    patterns: tuple[re.Pattern[str], ...],
+) -> list[int]:
+    return [
+        index
+        for index in indices
+        if any(pattern.search(lines[index]) for pattern in patterns)
+    ]
 
 
 def _trim_indices_around_priority(
@@ -718,6 +802,8 @@ def _enforce_final_budget(
         else:
             line_capped = _head_tail(compacted, options)
         if line_capped is not None and len(line_capped) < len(compacted):
+            if _dropped_lcm_externalized_match(before=compacted, after=line_capped):
+                return None
             compacted = line_capped
     if len(compacted) > options.max_chars:
         if preserve_patterns is not None and _first_pattern_match(compacted, preserve_patterns):
@@ -729,6 +815,8 @@ def _enforce_final_budget(
         else:
             char_capped = _char_head_tail(compacted, options)
         if char_capped is not None and len(char_capped) < len(compacted):
+            if _dropped_lcm_externalized_match(before=compacted, after=char_capped):
+                return None
             compacted = char_capped
     if not _fits_budget(compacted, options):
         return None
@@ -767,6 +855,20 @@ def _rank_for_span_match(match: _SpanMatch, layout: _LineLayout) -> int:
 
 def _would_hide_better_failure_anchor(best_rank: int, candidate_rank: int) -> bool:
     return best_rank <= 1 and candidate_rank > 1
+
+
+def _dropped_lcm_externalized_match(*, before: str, after: str) -> bool:
+    return any(match not in after for match in _lcm_externalized_matches(before))
+
+
+def _lcm_externalized_matches(text: str) -> list[str]:
+    matches: list[str] = []
+    for pattern in LCM_EXTERNALIZED_PATTERNS:
+        for match in pattern.finditer(text):
+            value = match.group(0)
+            if value not in matches:
+                matches.append(value)
+    return matches
 
 
 def _match_centered_excerpt(
@@ -1386,13 +1488,95 @@ def _looks_like_unified_diff(text: str) -> bool:
     )
 
 
+def _looks_like_v4a_patch(text: str) -> bool:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return len(lines) >= 2 and lines[0] == "*** Begin Patch" and lines[-1] == "*** End Patch"
+
+
 def _looks_like_file_read_command(command: str) -> bool:
-    if not command or re.search(r"[|;&><]", command):
+    if not command or _has_unquoted_shell_operator(command):
         return False
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    if not tokens:
+        return False
+    executable = tokens[0]
+    if executable in {"cat", "head", "tail", "less", "more", "bat", "nl"}:
+        return True
+    if _looks_like_git_show_file_read_tokens(tokens):
+        return True
+    if executable != "sed":
+        return False
+    if "-i" in tokens or any(token.startswith("-i") and token != "-i" for token in tokens):
+        return False
+    return any(_looks_like_sed_print_script(token) for token in tokens[1:])
+
+
+def _has_unquoted_shell_operator(command: str) -> bool:
+    quote: str | None = None
+    escaped = False
+    for index, char in enumerate(command):
+        if escaped:
+            escaped = False
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = None
+            continue
+        if quote == '"':
+            if char == "\\":
+                escaped = True
+                continue
+            if char == '"':
+                quote = None
+                continue
+            if char == "`" or (char == "$" and command[index + 1 : index + 2] == "("):
+                return True
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            continue
+        if char in "|;&><`\n\r" or (char == "$" and command[index + 1 : index + 2] == "("):
+            return True
+    return False
+
+
+def _looks_like_sed_print_script(token: str) -> bool:
+    script = token.strip()
     return bool(
-        re.match(r"^(cat|head|tail|less|more|bat)\b", command)
-        or re.match(r"^sed\s+(-n\s+)?(['\"]?\d+,?\d*p['\"]?)\s+\S+", command)
+        re.fullmatch(r"\d+(,\d+)?p", script)
+        or re.fullmatch(r"\d+,\$p", script)
+        or re.fullmatch(r"\$p", script)
     )
+
+
+def _looks_like_git_show_file_read_tokens(tokens: list[str]) -> bool:
+    if not tokens or tokens[0] != "git" or "show" not in tokens:
+        return False
+    show_index = tokens.index("show")
+    skip_next = False
+    for token in tokens[show_index + 1 :]:
+        if skip_next:
+            skip_next = False
+            continue
+        if token == "--":
+            continue
+        if token in {"-l", "--format", "--pretty", "--date"}:
+            skip_next = True
+            continue
+        if token.startswith(("-l", "--format=", "--pretty=", "--date=")):
+            continue
+        if token.startswith("-"):
+            continue
+        _, separator, path = token.partition(":")
+        if separator and path:
+            return True
+    return False
 
 
 def _is_node_command(command: str, sample: str) -> bool:
