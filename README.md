@@ -302,7 +302,8 @@ web_search
 web_extract
 execute_code
 search_files
-git diff / unified diffs
+simple direct terminal file-display commands (`cat`, `sed -n`, `head`, `tail`, `less`, `more`, `nl`, `bat`, `git show REV:path`)
+git diff / unified diffs / V4A patches
 unknown future tools
 ```
 

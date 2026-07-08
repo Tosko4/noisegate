@@ -15,6 +15,22 @@ def numbered(prefix: str, count: int) -> str:
     return "\n".join(f"{prefix} {index:03d}" for index in range(1, count + 1))
 
 
+def source_like_payload() -> str:
+    return "\n".join(
+        [
+            "# Retrieved/source content that looks like a failing log.",
+            "```python",
+            "def fixture():",
+            "    return 'FAILED ERROR Traceback npm ERR! Dockerfile'",
+            "```",
+            *[
+                f"exact context line {index:03d}: FAILED ERROR Traceback npm ERR!"
+                for index in range(90)
+            ],
+        ]
+    )
+
+
 def terminal_result(stdout: str, *, command: str = "pytest", exit_code: int = 0) -> str:
     return json.dumps(
         {
@@ -157,6 +173,25 @@ def test_unknown_tool_result_is_not_touched() -> None:
     assert transform_tool_result(raw, tool_name="future_tool", noisegate_max_chars=100) is None
 
 
+def test_source_like_payloads_from_exact_context_tools_are_not_touched() -> None:
+    exact = source_like_payload()
+    raw = json.dumps({"content": exact, "output": exact, "result": exact})
+
+    for tool_name in (
+        "read_file",
+        "write_file",
+        "patch",
+        "apply_patch",
+        "skill_view",
+        "web_extract",
+        "memory",
+        "hindsight_recall",
+        "lcm_expand",
+        "mcp__mindlyos__get_note_page",
+    ):
+        assert transform_tool_result(raw, tool_name=tool_name, noisegate_max_chars=200) is None
+
+
 def test_only_known_noisy_tool_results_are_compacted() -> None:
     long_text = numbered("tool output", 120)
     cases = {
@@ -264,6 +299,91 @@ def test_patch_tool_result_is_not_touched() -> None:
     raw = "\n".join(["*** Begin Patch", *numbered("+line", 100), "*** End Patch"])
 
     assert transform_tool_result(raw, tool_name="patch", noisegate_max_chars=100) is None
+
+
+def test_terminal_tool_result_keeps_source_like_file_display_exact() -> None:
+    exact = source_like_payload()
+    raw = terminal_result(exact, command="nl -ba src/source_fixture.py")
+
+    assert transform_tool_result(raw, tool_name="terminal", noisegate_max_chars=200) is None
+
+
+def test_terminal_tool_result_uses_args_when_payload_command_is_blank() -> None:
+    exact = source_like_payload()
+    raw = terminal_result(exact, command="")
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="terminal",
+            args={"cmd": "cat src/source_fixture.py"},
+            noisegate_max_chars=200,
+        )
+        is None
+    )
+
+
+def test_terminal_tool_result_uses_arguments_when_args_has_no_command() -> None:
+    exact = source_like_payload()
+    raw = terminal_result(exact, command="")
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="terminal",
+            args={"timeout": 10},
+            arguments={"cmd": "cat src/source_fixture.py"},
+            noisegate_max_chars=200,
+        )
+        is None
+    )
+
+
+def test_terminal_tool_result_args_command_alias_wins_over_arguments_command() -> None:
+    exact = source_like_payload()
+    raw = terminal_result(exact, command="")
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="terminal",
+            args={"cmd": "cat src/source_fixture.py"},
+            arguments={"command": "pytest -q"},
+            noisegate_max_chars=200,
+        )
+        is None
+    )
+
+
+def test_terminal_tool_result_args_command_alias_wins_over_payload_command() -> None:
+    exact = source_like_payload()
+    raw = terminal_result(exact, command="pytest -q")
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="terminal",
+            args={"cmd": "cat src/source_fixture.py"},
+            noisegate_max_chars=200,
+        )
+        is None
+    )
+
+
+def test_terminal_tool_result_preserves_argv_file_display_with_metachar_paths() -> None:
+    exact = source_like_payload()
+    raw = terminal_result(exact, command="")
+
+    for path in ("src/A&B.py", "src/A>B.py", "src/A;B.py", "src/$(fixture).py"):
+        assert (
+            transform_tool_result(
+                raw,
+                tool_name="terminal",
+                args={"argv": ["cat", path]},
+                noisegate_max_chars=200,
+            )
+            is None
+        )
 
 
 def test_bad_json_fails_open_for_tool_result_hook() -> None:

@@ -12,6 +12,25 @@ def numbered(prefix: str, count: int) -> str:
     return "\n".join(f"{prefix} {index:03d}" for index in range(1, count + 1))
 
 
+def source_like_python() -> str:
+    lines = [
+        "# Source file that deliberately looks like noisy output.",
+        "def render_status() -> dict[str, str]:",
+        "    return {",
+        "        'FAILED': 'literal test fixture, not a pytest result',",
+        "        'ERROR': 'literal config value, not a runtime failure',",
+        "        'Traceback': 'literal docs example',",
+        "        'npm ERR!': 'literal npm transcript fixture',",
+        "        'Dockerfile': 'literal filename fixture',",
+        "    }",
+    ]
+    lines.extend(
+        f"# exact source filler {index:03d}: FAILED ERROR Traceback npm ERR!"
+        for index in range(80)
+    )
+    return "\n".join(lines)
+
+
 def options(**overrides: object) -> NoisegateOptions:
     values: dict[str, object] = {"max_chars": 160, "head_lines": 3, "tail_lines": 2}
     values.update(overrides)
@@ -243,6 +262,96 @@ def test_terminal_file_read_commands_are_protected_by_default() -> None:
         assert result.metadata["reducer"] == "protected_file_read"
 
 
+def test_source_like_terminal_file_display_commands_are_protected() -> None:
+    raw = source_like_python()
+
+    commands = (
+        "cat -- src/example.py",
+        "head -n 200 src/example.py",
+        "tail -n +1 src/example.py",
+        "sed -n -e '1,200p' src/example.py",
+        "cat 'src/A&B.py'",
+        "cat 'src/A>B.py'",
+        "nl -ba src/example.py",
+        "bat --paging=never src/example.py",
+    )
+    for command in commands:
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            options=options(max_chars=220, max_lines=20),
+        )
+        assert result.changed is False, command
+        assert result.text == raw
+        assert result.metadata["reducer"] == "protected_file_read"
+
+
+def test_shell_substitution_file_display_commands_are_not_file_read() -> None:
+    raw = source_like_python()
+
+    for command in (
+        "cat $(pytest -q)",
+        "cat `pytest -q`",
+        "cat \"$(pytest -q)\"",
+        "cat 'file\\'; pytest -q",
+    ):
+        assert engine.classify_command(command, raw) != "file_read", command
+
+
+def test_sed_search_scripts_are_not_file_read_passthroughs() -> None:
+    raw = source_like_python()
+
+    assert engine.classify_command("sed -n '/ERROR/p' build.log", raw) != "file_read"
+
+
+def test_git_show_line_range_option_is_not_file_read_passthrough() -> None:
+    raw = source_like_python()
+
+    assert engine.classify_command("git show -L 1,10:src/foo.py HEAD", raw) != "file_read"
+
+
+def test_v4a_patch_snippet_inside_noisy_log_is_not_patch_passthrough() -> None:
+    raw = "\n".join(
+        [
+            "FAILED tests/test_patch_docs.py::test_example",
+            "Here is an example patch snippet in the failure output:",
+            "*** Begin Patch",
+            "*** Update File: src/example.py",
+            "+def fixture():",
+            *[f"noisy failure filler {index:03d} FAILED ERROR Traceback" for index in range(90)],
+            "*** End Patch",
+            "========================= 1 failed in 1.23s =========================",
+        ]
+    )
+
+    result = reduce_text(raw, command="pytest -q", options=options(max_chars=280, max_lines=20))
+
+    assert result.changed is True
+    assert result.metadata["command_class"] == "pytest"
+    assert result.metadata["reducer"] != "protected_patch"
+
+
+def test_git_show_path_source_read_is_protected() -> None:
+    raw = source_like_python()
+
+    for command in (
+        "git show HEAD:src/example.py",
+        "git show 1234:src/example.py",
+        "git show :src/example.py",
+    ):
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            options=options(max_chars=220, max_lines=20, preserve_diffs=False),
+        )
+
+        assert result.changed is False, command
+        assert result.text == raw
+        assert result.metadata["reducer"] == "protected_file_read"
+
+
 def test_git_diff_is_protected_by_default() -> None:
     raw = "\n".join(
         [
@@ -262,6 +371,119 @@ def test_git_diff_is_protected_by_default() -> None:
     assert result.changed is False
     assert result.text == raw
     assert result.metadata["reducer"] == "protected_diff"
+
+
+def test_v4a_patch_payload_with_failure_like_text_is_protected_by_default() -> None:
+    raw = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Add File: src/failure_fixture.py",
+            "+def fixture():",
+            "+    return 'FAILED ERROR Traceback npm ERR! Dockerfile'",
+            *[f"+source patch filler {index:03d} FAILED ERROR Traceback" for index in range(100)],
+            "*** End Patch",
+        ]
+    )
+
+    result = reduce_text(raw, command="", options=options(max_chars=400, max_lines=30))
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reducer"] == "protected_patch"
+
+
+def test_v4a_patch_payload_stays_exact_when_diff_passthrough_is_disabled() -> None:
+    raw = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Add File: src/failure_fixture.py",
+            "+def fixture():",
+            "+    return 'FAILED ERROR Traceback npm ERR! Dockerfile'",
+            *[f"+source patch filler {index:03d} FAILED ERROR Traceback" for index in range(100)],
+            "*** End Patch",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="",
+        options=options(max_chars=400, max_lines=30, preserve_diffs=False),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reducer"] == "protected_patch"
+
+
+def test_v4a_patch_containing_diff_stays_exact_when_diff_passthrough_is_disabled() -> None:
+    raw = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Update File: src/example.py",
+            "+diff --git a/src/example.py b/src/example.py",
+            "+--- a/src/example.py",
+            "++++ b/src/example.py",
+            "+@@ -1,2 +1,2 @@",
+            *[f"+source patch filler {index:03d} FAILED ERROR Traceback" for index in range(100)],
+            "*** End Patch",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="",
+        options=options(max_chars=400, max_lines=30, preserve_diffs=False),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reducer"] == "protected_patch"
+
+
+def test_v4a_patch_from_diff_like_command_stays_exact_when_diff_passthrough_is_disabled() -> None:
+    raw = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Add File: src/example.py",
+            "+def fixture():",
+            *[f"+source patch filler {index:03d} FAILED ERROR Traceback" for index in range(100)],
+            "*** End Patch",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="git show --patch HEAD",
+        options=options(max_chars=400, max_lines=30, preserve_diffs=False),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reducer"] == "protected_patch"
+
+
+def test_file_read_patch_payload_stays_exact_when_diff_passthrough_is_disabled() -> None:
+    raw = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Add File: src/failure_fixture.py",
+            "+def fixture():",
+            "+    return 'FAILED ERROR Traceback npm ERR! Dockerfile'",
+            *[f"+source patch filler {index:03d} FAILED ERROR Traceback" for index in range(100)],
+            "*** End Patch",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="cat patches/source.patch",
+        tool_name="terminal",
+        options=options(max_chars=400, max_lines=30, preserve_diffs=False),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reducer"] == "protected_file_read"
 
 
 def test_git_log_patch_output_is_protected_by_default() -> None:
