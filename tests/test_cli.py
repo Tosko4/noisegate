@@ -416,6 +416,55 @@ def test_reduce_json_args_command_alias_wins_over_arguments_command() -> None:
     assert json.loads(proc.stdout) == payload
 
 
+def test_reduce_json_arguments_source_alias_wins_over_args_test_command() -> None:
+    exact = source_like_payload()
+    payload = {
+        "tool_name": "terminal",
+        "args": {"command": "pytest -q"},
+        "arguments": {"cmd": "cat src/source_fixture.py"},
+        "stdout": exact,
+        "exit_code": 0,
+        "noisegate": {"max_chars": 200, "max_lines": 20},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+
+def test_reduce_json_plain_result_arguments_source_alias_wins_over_args_test_command() -> None:
+    exact = source_like_payload()
+    payload = {
+        "tool_name": "terminal",
+        "args": {"command": "pytest -q"},
+        "arguments": {"cmd": "cat src/source_fixture.py"},
+        "result": exact,
+        "noisegate": {"max_chars": 200, "max_lines": 20},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+
+def test_reduce_json_json_result_arguments_source_alias_wins_over_args_test_command() -> None:
+    exact = source_like_payload()
+    payload = {
+        "tool_name": "terminal",
+        "args": {"command": "pytest -q"},
+        "arguments": {"cmd": "cat src/source_fixture.py"},
+        "result": json.dumps({"stdout": exact, "exit_code": 0}),
+        "noisegate": {"max_chars": 200, "max_lines": 20},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+
 def test_reduce_json_preserves_file_display_patch_when_diff_passthrough_is_disabled() -> None:
     exact = "\n".join(
         [
@@ -1175,3 +1224,173 @@ def test_artifacts_cli_verify_rejects_oversized_nodes_without_reading(tmp_path: 
 
     assert verify_proc.returncode == 2
     assert "too_large" in verify_proc.stdout
+
+
+def test_reduce_json_direct_payload_uses_nested_args_command_for_source_reads() -> None:
+    payload = {
+        "tool_name": "terminal",
+        "args": {"command": "cat fixture.py"},
+        "stdout": source_like_payload(),
+        "exit_code": 0,
+        "noisegate": {"max_chars": 180},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+def test_reduce_json_direct_payload_blank_args_command_keeps_arguments_command() -> None:
+    payload = {
+        "tool_name": "terminal",
+        "args": {"command": ""},
+        "arguments": {"command": "cat fixture.py"},
+        "stdout": source_like_payload(),
+        "exit_code": 0,
+        "noisegate": {"max_chars": 180},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+def test_reduce_json_direct_payload_args_aliases_beat_arguments_command() -> None:
+    for args in (
+        {"cmd": "cat fixture.py"},
+        {"shell_command": "cat fixture.py"},
+        {"code": "cat fixture.py"},
+        {"argv": ["cat", "fixture.py"]},
+    ):
+        payload = {
+            "tool_name": "terminal",
+            "args": args,
+            "arguments": {"command": "pytest -q"},
+            "stdout": source_like_payload(),
+            "exit_code": 0,
+            "noisegate": {"max_chars": 180},
+        }
+
+        proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(proc.stdout) == payload
+
+def test_reduce_json_result_envelope_uses_nested_payload_args_for_source_reads() -> None:
+    inner = {
+        "args": {"cmd": "cat fixture.py"},
+        "arguments": {"command": "pytest -q"},
+        "stdout": source_like_payload(),
+        "exit_code": 0,
+    }
+    envelope = {
+        "tool_name": "terminal",
+        "result": json.dumps(inner),
+        "noisegate": {"max_chars": 180},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == envelope
+
+def test_reduce_json_result_envelope_nested_source_read_beats_outer_pytest_command() -> None:
+    inner = {
+        "args": {"cmd": "cat fixture.py"},
+        "stdout": source_like_payload(),
+        "exit_code": 0,
+    }
+    envelope = {
+        "tool_name": "terminal",
+        "args": {"command": "pytest -q"},
+        "result": json.dumps(inner),
+        "noisegate": {"max_chars": 180},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == envelope
+
+def test_reduce_json_preserves_json_result_when_top_level_command_is_source_read() -> None:
+    inner = {"stdout": source_like_payload(), "exit_code": 0}
+    payload = {
+        "tool_name": "terminal",
+        "command": "cat fixture.json",
+        "result": json.dumps(inner),
+        "noisegate": {"max_chars": 200, "max_lines": 20},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+def test_reduce_json_call_args_command_beats_inner_result_command() -> None:
+    inner = {"command": "pytest -q", "stdout": source_like_payload(), "exit_code": 0}
+    payload = {
+        "tool_name": "terminal",
+        "args": {"command": "cat fixture.py"},
+        "result": json.dumps(inner),
+        "noisegate": {"max_chars": 200, "max_lines": 20},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+def test_reduce_json_blank_args_command_does_not_mask_arguments_command() -> None:
+    inner = {"stdout": source_like_payload(), "exit_code": 0}
+    payload = {
+        "tool_name": "terminal",
+        "args": {"command": ""},
+        "arguments": {"command": "cat fixture.py"},
+        "result": json.dumps(inner),
+        "noisegate": {"max_chars": 200, "max_lines": 20},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+def test_reduce_json_preserves_plain_result_with_source_read_alias_command() -> None:
+    payload = {
+        "tool_name": "terminal",
+        "cmd": "cat fixture.py",
+        "result": source_like_payload(),
+        "noisegate": {"max_chars": 200, "max_lines": 20},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+def test_reduce_json_ignores_blank_command_alias_before_real_alias() -> None:
+    payload = {
+        "tool_name": "terminal",
+        "command": "",
+        "cmd": "cat fixture.py",
+        "result": source_like_payload(),
+        "noisegate": {"max_chars": 200, "max_lines": 20},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+def test_reduce_json_ignores_blank_argument_command_before_argv() -> None:
+    payload = {
+        "tool_name": "terminal",
+        "arguments": {"command": "", "argv": ["cat", "fixture.py"]},
+        "result": source_like_payload(),
+        "noisegate": {"max_chars": 200, "max_lines": 20},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload

@@ -62,7 +62,7 @@ def transform_tool_result(
             return None
 
         parsed = json.loads(result)
-        call_args = _combined_call_args(args, arguments)
+        call_args = _call_args_from_sources(args, arguments)
 
         if isinstance(parsed, str):
             command = _extract_command({}, call_args)
@@ -262,32 +262,81 @@ def _candidate_fields(tool_name: str, payload: Mapping[str, JsonValue]) -> tuple
     return tuple(field for field in candidates if field in payload)
 
 
-def _combined_call_args(
-    args: Mapping[str, Any] | None,
-    arguments: Mapping[str, Any] | None,
-) -> dict[str, Any]:
-    combined: dict[str, Any] = {}
-    args_map = args if isinstance(args, Mapping) else {}
-    arguments_map = arguments if isinstance(arguments, Mapping) else {}
-    combined.update(arguments_map)
-    combined.update(args_map)
-    command = _extract_command({}, args_map) or _extract_command({}, arguments_map)
-    if command:
-        combined["command"] = command
-    return combined
 
 
 def _extract_command(payload: Mapping[str, JsonValue], args: Mapping[str, Any]) -> str:
-    for source in (args, payload):
-        for key in ("command", "cmd", "shell_command", "code"):
-            value = source.get(key)
-            if isinstance(value, str) and value.strip():
-                return value
-    argv = args.get("argv")
-    if isinstance(argv, list) and all(isinstance(item, str) for item in argv):
-        return shlex.join(argv)
-    return ""
+    commands = [
+        command
+        for source in (args, _call_args_from_payload(payload), payload)
+        if (command := _command_from_mapping(source))
+    ]
+    for command in commands:
+        if classify_command(command, "") in {"file_read", "source_mixed", "git_diff"}:
+            return command
+    return commands[0] if commands else ""
 
+
+def _call_args_from_sources(
+    args: Mapping[str, Any] | None,
+    arguments: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    call_args: dict[str, Any] = {}
+    if arguments is not None:
+        _merge_command_args(call_args, arguments)
+    if args is not None:
+        _merge_command_args(call_args, args)
+    command = _preferred_command(args, arguments)
+    if command:
+        call_args["command"] = command
+    return call_args
+
+def _preferred_command(*sources: Mapping[str, Any] | None) -> str:
+    commands: list[str] = []
+    for source in sources:
+        if source is None:
+            continue
+        commands.extend(_command_candidates_from_mapping(source))
+    for command in commands:
+        if classify_command(command, "") in {"file_read", "source_mixed", "git_diff"}:
+            return command
+    return commands[0] if commands else ""
+
+def _merge_command_args(target: dict[str, Any], source: Mapping[str, Any]) -> None:
+    for key, value in source.items():
+        if (
+            key in {"command", "cmd", "shell_command", "code"}
+            and isinstance(value, str)
+            and not value.strip()
+        ):
+            continue
+        target[str(key)] = value
+
+def _call_args_from_payload(payload: Mapping[str, JsonValue]) -> dict[str, Any]:
+    args = payload.get("args")
+    arguments = payload.get("arguments")
+    return _call_args_from_sources(
+        args if isinstance(args, Mapping) else None,
+        arguments if isinstance(arguments, Mapping) else None,
+    )
+
+def _command_from_mapping(source: Mapping[str, Any]) -> str:
+    commands = _command_candidates_from_mapping(source)
+    for command in commands:
+        if classify_command(command, "") in {"file_read", "source_mixed", "git_diff"}:
+            return command
+    return commands[0] if commands else ""
+
+
+def _command_candidates_from_mapping(source: Mapping[str, Any]) -> list[str]:
+    commands: list[str] = []
+    for key in ("command", "cmd", "shell_command", "code"):
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            commands.append(value)
+    argv = source.get("argv")
+    if isinstance(argv, list) and argv and all(isinstance(item, str) for item in argv):
+        commands.append(shlex.join(argv))
+    return commands
 
 def _extract_exit_code(payload: Mapping[str, JsonValue], tool_name: str) -> int | None:
     for key in ("exit", "exit_code", "returncode", "return_code"):

@@ -224,21 +224,21 @@ def _reduce_text(
         return _unchanged(text, "disabled", command_class, reason="disabled")
     if not _has_usable_budget(text, options):
         return _unchanged(text, "invalid_budget", command_class, reason="invalid_budget")
-    if _has_bypass_marker(text) or _has_bypass_marker(command or ""):
-        return _unchanged(text, "bypass", command_class, reason="bypass_marker")
     if tool_name and not _is_compactable_tool_name(tool_name):
         return _unchanged(text, "protected_tool", command_class, reason="protected_tool")
     if command_class == "git_diff" and options.preserve_diffs:
         return _unchanged(text, "protected_diff", command_class, reason="diff_passthrough")
     if command_class == "patch":
         return _unchanged(text, "protected_patch", command_class, reason="patch_passthrough")
-    if command_class == "file_read":
+    if command_class in {"file_read", "source_mixed"}:
         return _unchanged(
             text,
             "protected_file_read",
             command_class,
             reason="file_read_passthrough",
         )
+    if _has_bypass_marker(text) or _has_bypass_marker(command or ""):
+        return _unchanged(text, "bypass", command_class, reason="bypass_marker")
     if not _should_reduce(text, options):
         return _unchanged(text, "below_threshold", command_class, reason="below_threshold")
 
@@ -360,31 +360,74 @@ def _reduce_text(
 
 
 def classify_command(command: str | None, text: str) -> str:
-    command_l = (command or "").strip().lower()
+    command_s = (command or "").strip()
+    command_l = command_s.lower()
     sample_l = text[:4_000].lower()
 
-    if _looks_like_file_read_command(command_l):
+    if not _has_unquoted_shell_operator(
+        command_s,
+        allow_input_redirection=True,
+        allow_stderr_redirection=True,
+    ):
+        shell_payload = _shell_command_payload(command_s)
+        if shell_payload and shell_payload != command_s:
+            shell_payload_class = classify_command(shell_payload, text)
+            if shell_payload_class != "generic":
+                return shell_payload_class
+        env_s_payload = _env_split_string_payload(command_s)
+        if env_s_payload and env_s_payload != command_s:
+            env_s_payload_class = classify_command(env_s_payload, text)
+            if env_s_payload_class != "generic":
+                return env_s_payload_class
+    if _looks_like_mixed_source_command(command_s):
+        return "source_mixed"
+    if _looks_like_file_read_command(command_s):
         return "file_read"
-    if _looks_like_v4a_patch(text):
+    if _looks_like_v4a_patch(text) and not (
+        _looks_like_pytest_command(command_l)
+        or _contains_pytest_invocation(command_l)
+        or _looks_like_unittest_command(command_l)
+        or _contains_unittest_invocation(command_l)
+    ):
         return "patch"
     if _looks_like_diff_command(command_l):
         return "git_diff"
     if "diff --git " in text or _looks_like_unified_diff(text):
         return "git_diff"
+    if _is_os_package_command(command_l) and _looks_like_package_failure_output(sample_l):
+        return "os_package"
+    if _is_dependency_install_command(command_l) and _looks_like_package_failure_output(sample_l):
+        return "dependency_install"
+    if _looks_like_pytest_command(command_l) or _contains_pytest_invocation(command_l):
+        return "pytest"
+    if _looks_like_unittest_command(command_l) or _contains_unittest_invocation(command_l):
+        return "unittest"
+    if _is_node_runtime_or_test_command(command_l):
+        if _looks_like_pytest_output(sample_l):
+            return "pytest"
+        if _looks_like_unittest_output(sample_l):
+            return "unittest"
+        return "node"
+    if _is_os_package_command(command_l):
+        return "os_package"
+    if _is_dependency_install_command(command_l):
+        return "dependency_install"
+    if "docker build" in command_l or "docker compose" in command_l or "dockerfile" in sample_l:
+        return "docker_build"
+    if _is_inventory_command(command_l):
+        return "inventory"
+    if _is_search_command(command_l):
+        return "search"
     if "git status" in command_l or ("on branch " in sample_l and "working tree" in sample_l):
         return "git_status"
     if "git log" in command_l:
         return "git_log"
-    if _contains_command(command_l, ("pytest", "py.test")) or "=== failures ===" in sample_l:
+    if _looks_like_pytest_output(sample_l):
         return "pytest"
-    if "unittest" in command_l or re.search(r"ran \d+ tests?", sample_l):
+    if _looks_like_unittest_output(sample_l):
         return "unittest"
     if _is_node_command(command_l, sample_l):
         return "node"
-    if "docker build" in command_l or "docker compose" in command_l or "dockerfile" in sample_l:
-        return "docker_build"
-    if _is_search_command(command_l):
-        return "search"
     return "generic"
 
 
@@ -412,9 +455,23 @@ def _preserve_patterns_for_output(
 ) -> tuple[re.Pattern[str], ...] | None:
     lcm_patterns = _lcm_externalized_patterns_for(text)
     if command_class in {"pytest", "unittest"}:
-        return CRITICAL_PATTERNS + lcm_patterns
+        return (
+            CRITICAL_PATTERNS
+            + OS_PACKAGE_PATTERNS
+            + DEPENDENCY_INSTALL_PATTERNS
+            + DOCKER_PATTERNS
+            + lcm_patterns
+        )
     if command_class == "node":
         return NODE_PRESERVATION_PATTERNS + lcm_patterns
+    if command_class == "os_package":
+        return OS_PACKAGE_PATTERNS + CRITICAL_PATTERNS + lcm_patterns
+    if command_class == "dependency_install":
+        return DEPENDENCY_INSTALL_PATTERNS + CRITICAL_PATTERNS + lcm_patterns
+    if command_class == "inventory":
+        return INVENTORY_PATTERNS + CRITICAL_PATTERNS + lcm_patterns
+    if command_class == "docker_build":
+        return DOCKER_PATTERNS + CRITICAL_PATTERNS + lcm_patterns
     return lcm_patterns or None
 
 
@@ -431,7 +488,27 @@ def _apply_reducer(
             return "generic_head_tail", _important_lines(text, options, lcm_patterns)
         return "generic_head_tail", _head_tail(text, options)
     if command_class in {"pytest", "unittest"}:
-        return command_class, _important_lines(text, options, TEST_PATTERNS + lcm_patterns)
+        return command_class, _important_lines(
+            text,
+            options,
+            TEST_PATTERNS
+            + OS_PACKAGE_PATTERNS
+            + DEPENDENCY_INSTALL_PATTERNS
+            + DOCKER_PATTERNS
+            + lcm_patterns,
+        )
+    if command_class == "os_package":
+        return "os_package", _important_lines(
+            text,
+            options,
+            OS_PACKAGE_PATTERNS + CRITICAL_PATTERNS + lcm_patterns,
+        )
+    if command_class == "dependency_install":
+        return "dependency_install", _important_lines(
+            text,
+            options,
+            DEPENDENCY_INSTALL_PATTERNS + CRITICAL_PATTERNS + lcm_patterns,
+        )
     if command_class == "node":
         return "node", _important_lines(
             text,
@@ -439,11 +516,17 @@ def _apply_reducer(
             NODE_PRESERVATION_PATTERNS + lcm_patterns,
         )
     if command_class == "docker_build":
-        return "docker_build", _important_lines(text, options, DOCKER_PATTERNS + lcm_patterns)
+        return "docker_build", _important_lines(
+            text,
+            options,
+            DOCKER_PATTERNS + CRITICAL_PATTERNS + lcm_patterns,
+        )
     if command_class == "git_status":
         return "git_status", _important_lines(text, options, GIT_STATUS_PATTERNS + lcm_patterns)
     if command_class == "git_log":
         return "git_log", _head_tail(text, replace(options, head_lines=40, tail_lines=8))
+    if command_class == "inventory":
+        return "inventory", _important_lines(text, options, INVENTORY_PATTERNS + lcm_patterns)
     if command_class == "search":
         if lcm_patterns:
             return "search", _important_lines(text, options, lcm_patterns)
@@ -470,9 +553,15 @@ CRITICAL_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
         r"assertionerror|traceback|exceptiongroup|baseexception|\bexception\b\s*:",
+        r"\b(?:type|reference|syntax|range|value|key|attribute|name|runtime|import|module)error\b",
         r"\bunhandled\s+exception\b",
         r"\bexception\s+in\b",
-        r"^\s*E\s+",
+        r"^\s*E\s+|^\s*E:",
+        r"\b[A-Za-z_]*(?:Type|Reference|Syntax|Range|URI|Eval)?Error\b(?::|$)",
+        r"unable to locate package|no matching distribution|no match for argument",
+        r"no packages? available|package .* not found|target not found",
+        r"resolutionimpossible|no solution found|eresolve",
+        r"permission denied|cannot access|no such file|not found",
         r"\d+\s+failed",
         r"^(failed|error)\s+",
         r"\bFAILED\b|\bERROR\b",
@@ -510,6 +599,182 @@ GIT_STATUS_PATTERNS = tuple(
     )
 )
 
+
+APT_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"^err:\d+|^e:|^w:.*gpg error",
+        r"unable to locate package|could not get lock|gpg error|hash sum mismatch|failed to fetch",
+        r"does not have a release file|repository .* not signed|no_pubkey|404\s+not found",
+        r"reading package lists\.\.\. done|fetched .* in .*|\d+ upgraded, .* newly installed",
+        r"setting up \S+|processing triggers for",
+    )
+)
+
+SYSTEM_PACKAGE_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"^error:|^err:|^warning:|^fatal:",
+        r"no such package|unable to locate|package .* not found|target not found",
+        (
+            r"no packages? available|no packages? available to install matching"
+            r"|packages? .* not available"
+        ),
+        r"no match for argument|unable to find a match|no provider .* found",
+        r"failed to synchronize|failed to fetch|failed retrieving|failed to solve",
+        r"conflicting requests|broken dependencies|nothing provides|dependency problem",
+        r"no available formula|no formula|cannot find package|could not resolve",
+        r"\berror\b|\bfailed\b|\bfail\b|not found",
+    )
+)
+
+PYTHON_PACKAGE_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"^error:|^error\b|resolutionimpossible|no solution found|resolution failed",
+        (
+            r"dependency conflict|conflicting dependencies|failed to prepare distributions"
+            r"|could not find a version"
+        ),
+        r"no matching distribution|failed to build|because .* depends on|caused by:",
+        r"successfully installed|resolved \d+ packages|installed \S+",
+    )
+)
+
+NODE_INSTALL_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"npm err!|pnpm err!|yarn.*error|yn\d{4}: error|err_pnpm|elifecycle|eresolve",
+        r"\berror\b|\bfailed\b|\bfail\b|failed with errors",
+        r"\bwarning\b|\bwarn\b",
+        r"could not resolve|unable to resolve|peer dep|lockfile|e404|enotfound",
+        r"added \d+ packages|found \d+ vulnerabilities|audited \d+ packages",
+    )
+)
+
+DEPENDENCY_INSTALL_PATTERNS = PYTHON_PACKAGE_PATTERNS + NODE_INSTALL_PATTERNS
+
+OS_PACKAGE_PATTERNS = APT_PATTERNS + SYSTEM_PACKAGE_PATTERNS + DEPENDENCY_INSTALL_PATTERNS
+
+INVENTORY_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"permission denied|no such file|cannot access|not found",
+        r"^(find|ls|fd|tree):",
+    )
+)
+
+PYTHON_OPTIONS_WITH_VALUE = frozenset({"-W", "-X", "--check-hash-based-pycs"})
+
+UV_RUN_OPTIONS_WITH_VALUE = frozenset(
+    {
+        "--active",
+        "--config-file",
+        "--default-index",
+        "--directory",
+        "--env-file",
+        "--extra",
+        "--find-links",
+        "--from",
+        "--group",
+        "--index",
+        "--index-url",
+        "--keyring-provider",
+        "--link-mode",
+        "--project",
+        "--python",
+        "--resolution",
+        "--with",
+        "--with-editable",
+        "--with-requirements",
+        "-p",
+    }
+)
+
+UV_GLOBAL_OPTIONS_WITH_VALUE = frozenset(
+    {
+        "--cache-dir",
+        "--config-file",
+        "--directory",
+        "--index",
+        "--index-url",
+        "--keyring-provider",
+        "--link-mode",
+        "--project",
+        "--python",
+        "--resolution",
+        "--with",
+        "--with-editable",
+        "--with-requirements",
+        "-p",
+    }
+)
+
+PACKAGE_RUNNER_OPTIONS_WITH_VALUE = frozenset(
+    {
+        "--cache",
+        "--call",
+        "--cwd",
+        "--dir",
+        "--from",
+        "--package",
+        "--prefix",
+        "--registry",
+        "--workspace",
+        "-c",
+        "-p",
+        "-w",
+    }
+)
+
+SUDO_OPTIONS_WITH_VALUE = frozenset(
+    {
+        "-u",
+        "--user",
+        "-g",
+        "--group",
+        "-c",
+        "--close-from",
+        "-p",
+        "--prompt",
+        "-d",
+        "-D",
+        "--chdir",
+        "-r",
+        "-R",
+        "--chroot",
+        "-t",
+        "-T",
+        "--command-timeout",
+        "-h",
+        "--host",
+    }
+)
+
+ENV_OPTIONS_WITH_VALUE = frozenset({"-u", "--unset", "-c", "-C", "--chdir", "-s", "-S"})
+
+TIMEOUT_OPTIONS_WITH_VALUE = frozenset({"-k", "--kill-after", "-s", "--signal"})
+
+NPM_FAMILY_INSTALL_SUBCOMMANDS = frozenset({"install", "i", "ci", "add", "update", "up"})
+
+NPM_FAMILY_OPTIONS_WITH_VALUE = frozenset(
+    {
+        "--cache",
+        "--cwd",
+        "--dir",
+        "--filter",
+        "--prefix",
+        "--loglevel",
+        "--omit",
+        "--registry",
+        "--scope",
+        "--store-dir",
+        "--workspace",
+        "-c",
+        "-f",
+        "-w",
+    }
+)
 
 def _important_lines(
     text: str,
@@ -671,6 +936,14 @@ def _line_budgeted_important_excerpt(
 def _failure_detail_rank(line: str) -> int:
     """Prefer diagnostic detail over progress/status lines when budgets are tight."""
     if _is_diagnostic_detail_line(line):
+        return 0
+    if re.search(
+        r"unable to locate package|no matching distribution|no match for argument"
+        r"|no packages? available|package .* not found|target not found"
+        r"|resolutionimpossible|no solution found|eresolve",
+        line,
+        re.IGNORECASE,
+    ):
         return 0
     if re.search(r"npm err!|pnpm err!|err_pnpm|elifecycle|yarn.*error", line, re.IGNORECASE):
         return 0
@@ -941,6 +1214,11 @@ def _line_centered_excerpt(
     while True:
         candidate = _lines_with_surrounding_omission_markers(lines, start_line, end_line)
         if _fits_budget(candidate, options):
+            if (
+                (start_line > 0 or end_line + 1 < len(lines))
+                and "[noisegate: omitted" not in candidate
+            ):
+                return None
             return candidate
         if start_line == match_line and end_line == match_line:
             return None
@@ -1460,6 +1738,667 @@ def _has_bypass_marker(text: str) -> bool:
     return any(marker in sample for marker in BYPASS_MARKERS)
 
 
+def _looks_like_pytest_command(command: str) -> bool:
+    tokens = _shell_split(command)
+    index = _skip_command_prefix_tokens(tokens)
+    return _tokens_start_pytest(tokens[index:])
+
+def _looks_like_unittest_command(command: str) -> bool:
+    tokens = _shell_split(command)
+    index = _skip_command_prefix_tokens(tokens)
+    return _tokens_start_unittest(tokens[index:])
+
+def _contains_pytest_invocation(command: str) -> bool:
+    return any(_looks_like_pytest_command(segment) for segment in _shell_command_segments(command))
+
+def _contains_unittest_invocation(command: str) -> bool:
+    return any(
+        _looks_like_unittest_command(segment) for segment in _shell_command_segments(command)
+    )
+
+def _looks_like_pytest_output(sample: str) -> bool:
+    return bool(
+        "=== failures ===" in sample
+        or "short test summary info" in sample
+        or re.search(r"(^|\n)failed\s+tests?[/\\]", sample)
+        or re.search(r"(^|\n)e\s+assertionerror\b", sample)
+    )
+
+def _looks_like_unittest_output(sample: str) -> bool:
+    return bool(re.search(r"ran \d+ tests?", sample) or re.search(r"(^|\n)fail: test_", sample))
+
+
+def _looks_like_package_failure_output(sample: str) -> bool:
+    return bool(
+        re.search(r"(^|\n)\s*(e:|err:\d+|error:|fatal:)", sample)
+        or re.search(
+            r"unable to locate package|no matching distribution|no match for argument",
+            sample,
+        )
+        or re.search(r"no packages? available|packages? .* not available", sample)
+        or re.search(r"package .* not found|target not found|no such package", sample)
+        or re.search(r"resolutionimpossible|no solution found|eresolve", sample)
+        or re.search(r"could not find a version|failed to build|dependency conflict", sample)
+        or re.search(r"failed to fetch|gpg error|could not get lock|no_pubkey", sample)
+        or re.search(r"no provider .* found|nothing provides|broken dependencies", sample)
+        or re.search(r"no available formula|could not resolve|peer dep|lockfile", sample)
+        or re.search(r"e404|enotfound|hash sum mismatch|repository .* not signed", sample)
+    )
+
+
+def _shell_split(command: str) -> list[str]:
+    if not command:
+        return []
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return command.split()
+
+def _shell_command_segments(command: str) -> list[str]:
+    return [
+        segment.strip()
+        for segment in re.split(r"&&|\|\||[|;]|\r?\n", command)
+        if segment.strip()
+    ]
+
+def _skip_command_prefix_tokens(tokens: list[str]) -> int:
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        executable = token.rsplit("/", 1)[-1]
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+            index += 1
+            continue
+        if executable in {"env", "command", "sudo"}:
+            if executable == "env":
+                index = _skip_env_tokens(tokens, index + 1)
+            elif executable == "sudo":
+                index = _skip_sudo_tokens(tokens, index + 1)
+            else:
+                index += 1
+            continue
+        if executable == "timeout" and index + 1 < len(tokens):
+            index = _skip_timeout_tokens(tokens, index + 1)
+            continue
+        break
+    return index
+
+def _option_key_for_value_skip(option: str) -> str:
+    key = option.split("=", 1)[0]
+    return key.lower() if key.startswith("--") else key
+
+def _skip_env_tokens(tokens: list[str], index: int) -> int:
+    while index < len(tokens) and tokens[index].startswith("-"):
+        option = tokens[index]
+        index += 1
+        if "=" not in option and _option_key_for_value_skip(option) in ENV_OPTIONS_WITH_VALUE:
+            index += 1
+    return index
+
+def _skip_sudo_tokens(tokens: list[str], index: int) -> int:
+    while index < len(tokens) and tokens[index].startswith("-"):
+        option = tokens[index]
+        index += 1
+        if "=" not in option and _option_key_for_value_skip(option) in SUDO_OPTIONS_WITH_VALUE:
+            index += 1
+    return index
+
+def _skip_timeout_tokens(tokens: list[str], index: int) -> int:
+    while index < len(tokens) and tokens[index].startswith("-"):
+        option = tokens[index]
+        index += 1
+        if "=" not in option and _option_key_for_value_skip(option) in TIMEOUT_OPTIONS_WITH_VALUE:
+            index += 1
+    if index < len(tokens):
+        index += 1
+    return index
+
+def _tokens_start_pytest(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    executable = tokens[0].rsplit("/", 1)[-1]
+    if executable in {"pytest", "py.test"}:
+        return True
+    if executable in {"python", "python3"}:
+        return _python_runs_module(tokens, "pytest")
+    if executable in {"npx", "pnpx", "uvx"}:
+        return _tokens_start_pytest(_skip_package_runner_options(tokens[1:]))
+    if executable in {"npm-exec", "pnpm-dlx"}:
+        return _tokens_start_pytest(_skip_package_runner_options(tokens[1:]))
+    if executable in {"npm", "pnpm", "yarn"}:
+        return _tokens_start_package_exec_pytest(tokens[1:])
+    if executable == "uv":
+        run_index = _uv_run_index(tokens[1:])
+        if run_index is not None:
+            return _tokens_start_pytest(_uv_run_command_tokens(tokens[run_index + 2 :]))
+    return False
+
+def _tokens_start_unittest(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    executable = tokens[0].rsplit("/", 1)[-1]
+    if executable in {"python", "python3"}:
+        return _python_runs_module(tokens, "unittest")
+    if executable == "uv":
+        run_index = _uv_run_index(tokens[1:])
+        if run_index is not None:
+            return _tokens_start_unittest(_uv_run_command_tokens(tokens[run_index + 2 :]))
+    return False
+
+def _python_runs_module(tokens: list[str], module: str) -> bool:
+    index = 1
+    while index < len(tokens):
+        arg = tokens[index]
+        if arg == "-m":
+            return index + 1 < len(tokens) and tokens[index + 1] == module
+        if arg == "--" or not arg.startswith("-"):
+            return False
+        option = arg.split("=", 1)[0]
+        index += 1
+        if "=" not in arg and option in PYTHON_OPTIONS_WITH_VALUE:
+            index += 1
+    return False
+
+def _uv_run_command_tokens(args: list[str]) -> list[str]:
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            return args[index + 1 :]
+        if arg == "-m":
+            return ["python", "-m", *args[index + 1 :]]
+        if not arg.startswith("-"):
+            return args[index:]
+        option = arg.split("=", 1)[0].lower()
+        index += 1
+        if "=" not in arg and option in UV_RUN_OPTIONS_WITH_VALUE:
+            index += 1
+    return []
+
+def _uv_run_index(args: list[str]) -> int | None:
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "run":
+            return index
+        if arg == "--":
+            index += 1
+            continue
+        if arg.startswith("--"):
+            option = arg.split("=", 1)[0].lower()
+            index += 1
+            if "=" not in arg and option in UV_GLOBAL_OPTIONS_WITH_VALUE:
+                index += 1
+        elif arg.startswith("-"):
+            option = arg.split("=", 1)[0].lower()
+            index += 1
+            if option in UV_GLOBAL_OPTIONS_WITH_VALUE:
+                index += 1
+        else:
+            return None
+    return None
+
+def _skip_package_runner_options(args: list[str]) -> list[str]:
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            return args[index + 1 :]
+        if not arg.startswith("-"):
+            return args[index:]
+        option = arg.split("=", 1)[0].lower()
+        index += 1
+        if "=" not in arg and option in PACKAGE_RUNNER_OPTIONS_WITH_VALUE:
+            index += 1
+    return []
+
+def _tokens_start_package_exec_pytest(args: list[str]) -> bool:
+    args = _skip_package_runner_options(args)
+    if not args:
+        return False
+    subcommand = args[0]
+    if subcommand in {"exec", "x", "dlx"}:
+        return _tokens_start_pytest(_skip_package_runner_options(args[1:]))
+    return False
+
+def _command_prefix_pattern() -> str:
+    return (
+        r"(^|[\s;&|])"
+        r"(?:(?:env\s+)?[A-Za-z_][A-Za-z0-9_]*=\S+\s+|env\s+|command\s+|timeout\s+\S+\s+|sudo\s+)*"
+    )
+
+def _looks_like_mixed_source_command(command: str) -> bool:
+    if not command:
+        return False
+    source_reader_pattern = r"(?:\S*/)?(cat|sed|head|tail|nl|bat|jq|yq)\b"
+    if re.search(r"(^|[\s;&|])python(?:3)?\s+-\s*<<", command):
+        return True
+    if re.search(
+        rf"(^|[\s;&|])(?:\S*/)?find\b.*\s-exec(?:dir)?\s+{source_reader_pattern}",
+        command,
+    ):
+        return True
+    if _find_exec_invokes_source_reader(command):
+        return True
+    if re.search(rf"\|\s*xargs\b.*\b{source_reader_pattern}", command):
+        return True
+    if re.search(r"(^|[\s;&|])(?:\S*/)?fd\b", command) and re.search(
+        r"\s(-x|-X|--exec(?:-batch)?)(\s|=)",
+        command,
+    ):
+        return bool(re.search(source_reader_pattern, command))
+    if re.search(r"[|;&\n\r]", command) and _contains_safe_source_read_invocation(command):
+        return True
+    return bool(re.search(r"[|;&\n\r]", command) and _contains_source_search_invocation(command))
+
+def _contains_source_search_invocation(command: str) -> bool:
+    if not command:
+        return False
+    boundary = r"(^|[\s;&|\r\n])"
+    if re.search(boundary + r"(?:\S*/)?(rg|grep|ag|ack)\s+--files\b", command):
+        return False
+    return bool(re.search(boundary + r"(?:\S*/)?(rg|grep|ag|ack)\b", command))
+
+def _contains_source_read_invocation(command: str) -> bool:
+    if not command:
+        return False
+    try:
+        shlex.split(command)
+    except ValueError:
+        return False
+    if _find_exec_invokes_source_reader(command):
+        return True
+    env_s_payload = _env_split_string_payload(command)
+    if env_s_payload is not None and _contains_source_read_invocation(env_s_payload):
+        return True
+    shell_payload = _shell_command_payload(command)
+    if shell_payload is not None and _contains_source_read_invocation(shell_payload):
+        return True
+    for segment in _shell_command_segments(command):
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            tokens = segment.split()
+        if _tokens_start_source_read(tokens):
+            return True
+    # Shell wrappers and environment assignments do not change the intent: these still
+    # display source/content and should stay exact by default.
+    prefix = (
+        r"(^|[;&|\r\n]\s*)"
+        r"(?:(?:env\s+)?[A-Za-z_][A-Za-z0-9_]*=\S+\s+|env\s+|command\s+|timeout\s+\S+\s+|sudo\s+)*"
+    )
+    path_prefix = r"(?:\S*/)?"
+    if bool(re.search(prefix + path_prefix + r"(cat|head|tail|less|more|bat)\b", command)):
+        return True
+    if bool(re.search(prefix + path_prefix + r"nl\b(?:\s+-[a-z0-9]+)*(?:\s+\S+|\s*<)", command)):
+        return True
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    if _tokens_start_source_read(tokens):
+        return True
+    return bool(re.search(prefix + path_prefix + r"(jq|yq)\b", command))
+
+
+def _contains_safe_source_read_invocation(command: str) -> bool:
+    if not command:
+        return False
+    if not _has_unquoted_shell_operator(
+        command,
+        allow_input_redirection=True,
+        allow_stderr_redirection=True,
+    ):
+        env_s_payload = _env_split_string_payload(command)
+        if env_s_payload is not None:
+            return _contains_safe_source_read_invocation(env_s_payload)
+        shell_payload = _shell_command_payload(command)
+        if shell_payload is not None:
+            return _contains_safe_source_read_invocation(shell_payload)
+    for segment in _shell_command_segments(command):
+        if _has_unquoted_shell_operator(
+            segment,
+            allow_input_redirection=True,
+            allow_stderr_redirection=True,
+        ):
+            continue
+        env_s_payload = _env_split_string_payload(segment)
+        if env_s_payload is not None and _contains_safe_source_read_invocation(env_s_payload):
+            return True
+        shell_payload = _shell_command_payload(segment)
+        if shell_payload is not None and _contains_safe_source_read_invocation(shell_payload):
+            return True
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            tokens = segment.split()
+        if _tokens_start_source_read(tokens):
+            return True
+    return False
+
+
+def _find_exec_invokes_source_reader(command: str) -> bool:
+    tokens = _shell_split(command)
+    for index, token in enumerate(tokens):
+        if token not in {"-exec", "-execdir"}:
+            continue
+        exec_tokens: list[str] = []
+        for exec_token in tokens[index + 1 :]:
+            if exec_token == ";":
+                break
+            exec_tokens.append(exec_token)
+        if not exec_tokens:
+            continue
+        if _tokens_start_source_read(exec_tokens):
+            return True
+        executable = exec_tokens[0].rsplit("/", 1)[-1].lower()
+        if executable in {"bash", "sh", "zsh"}:
+            payload = _shell_command_payload(shlex.join(exec_tokens))
+            if payload is not None and _contains_source_read_invocation(payload):
+                return True
+    return False
+
+
+def _tokens_start_source_read(tokens: list[str]) -> bool:
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        executable = token.rsplit("/", 1)[-1].lower()
+        if token in {"&&", "||", ";", "|"}:
+            index += 1
+            continue
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+            index += 1
+            continue
+        if executable == "env":
+            index = _skip_env_tokens(tokens, index + 1)
+            continue
+        if executable == "command":
+            index += 1
+            continue
+        if executable == "sudo":
+            index = _skip_sudo_tokens(tokens, index + 1)
+            continue
+        if executable == "timeout":
+            index = _skip_timeout_tokens(tokens, index + 1)
+            continue
+        break
+    if index >= len(tokens):
+        return False
+    executable = tokens[index].rsplit("/", 1)[-1].lower()
+    args = tokens[index + 1 :]
+    if any("$(" in arg or "`" in arg for arg in args):
+        return False
+    if _looks_like_git_show_file_read_tokens(tokens[index:]):
+        return True
+    if executable in {"cat", "head", "tail", "less", "more", "bat", "jq", "yq"}:
+        return True
+    if executable == "nl":
+        return bool(args)
+    if executable != "sed":
+        return False
+    saw_quiet = False
+    for arg in args:
+        if arg in {"--quiet", "--silent"} or (arg.startswith("-") and "n" in arg):
+            saw_quiet = True
+            continue
+        if not arg.startswith("-"):
+            return saw_quiet and _looks_like_sed_print_script(arg)
+    return False
+
+def _env_split_string_payload(command: str) -> str | None:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        executable = token.rsplit("/", 1)[-1].lower()
+        if executable == "command" or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+            index += 1
+            continue
+        if executable == "sudo":
+            index = _skip_sudo_tokens(tokens, index + 1)
+            continue
+        if executable == "timeout" and index + 1 < len(tokens):
+            index = _skip_timeout_tokens(tokens, index + 1)
+            continue
+        if executable != "env":
+            return None
+        break
+    if index >= len(tokens):
+        return None
+    index += 1
+    while index < len(tokens):
+        arg = tokens[index]
+        option = _option_key_for_value_skip(arg)
+        if option in {"-s", "-S", "--split-string"} and "=" not in arg:
+            if index + 1 >= len(tokens):
+                return None
+            return " ".join([tokens[index + 1], *tokens[index + 2 :]])
+        if option == "--split-string" and "=" in arg:
+            return " ".join([arg.split("=", 1)[1], *tokens[index + 1 :]])
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", arg):
+            index += 1
+            continue
+        if not arg.startswith("-"):
+            return None
+        index += 1
+        if "=" not in arg and option in ENV_OPTIONS_WITH_VALUE:
+            index += 1
+    return None
+
+def _shell_command_payload(command: str) -> str | None:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        executable = token.rsplit("/", 1)[-1].lower()
+        if executable == "command":
+            index += 1
+            continue
+        if executable == "env":
+            index = _skip_env_tokens(tokens, index + 1)
+            continue
+        if executable == "sudo":
+            index = _skip_sudo_tokens(tokens, index + 1)
+            continue
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+            index += 1
+            continue
+        if executable == "timeout":
+            index = _skip_timeout_tokens(tokens, index + 1)
+            continue
+        break
+    if index >= len(tokens):
+        return None
+    shell_executable = tokens[index].rsplit("/", 1)[-1].lower()
+    if shell_executable not in {"bash", "sh", "zsh"}:
+        return None
+    args = tokens[index + 1 :]
+    arg_index = 0
+    while arg_index < len(args):
+        arg = args[arg_index]
+        if not arg.startswith("-"):
+            return None
+        if (
+            (arg.startswith("-") and not arg.startswith("--") and "c" in arg.lstrip("-"))
+            or arg == "--command"
+        ) and arg_index + 1 < len(args):
+            return args[arg_index + 1]
+        takes_value = arg in {"--rcfile", "--init-file", "-o", "+o"} or (
+            arg.startswith("-") and not arg.startswith("--") and "o" in arg.lstrip("-")
+        )
+        arg_index += 1
+        if takes_value and arg_index < len(args):
+            arg_index += 1
+    return None
+
+def _is_inventory_command(command: str) -> bool:
+    if not command:
+        return False
+    tokens = _shell_split(command)
+    prefix_index = _skip_command_prefix_tokens(tokens)
+    if 0 < prefix_index < len(tokens):
+        return _is_inventory_command(" ".join(tokens[prefix_index:]))
+    if re.search(r"[;&]", command):
+        parts = [part.strip() for part in re.split(r"&&|;", command) if part.strip()]
+        return bool(
+            len(parts) > 1
+            and all(_is_inventory_prefix_segment(part) for part in parts[:-1])
+            and _is_inventory_command(parts[-1])
+        )
+    if re.search(r"[|><]", command):
+        return False
+    if not tokens:
+        return False
+    executable = tokens[0].rsplit("/", 1)[-1]
+    args = tokens[1:]
+    if executable == "ls":
+        return True
+    if executable == "tree":
+        return True
+    if executable == "fd":
+        return not any(
+            arg in {"-x", "-X", "--exec", "--exec-batch"}
+            or arg.startswith("--exec=")
+            or arg.startswith("--exec-batch=")
+            for arg in args
+        )
+    if executable == "rg":
+        return bool(args and args[0] == "--files")
+    if executable == "git":
+        index = 0
+        while index < len(args) and args[index] == "-c":
+            index += 2
+        return index < len(args) and args[index] == "ls-files"
+    return bool(executable == "find" and "-exec" not in args and "-execdir" not in args)
+
+def _is_inventory_prefix_segment(command: str) -> bool:
+    return bool(
+        re.match(r"^(cd|pushd)\b", command)
+        or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=\S+$", command)
+    )
+
+def _is_os_package_command(command: str) -> bool:
+    if not command:
+        return False
+    opt_before_update_install = (
+        r"(?:\s+-{1,2}[\w-]+(?:=\S+)?(?:\s+(?!(?:update|install)\b)\S+)?)"
+    )
+    opt_before_add = r"(?:\s+-{1,2}[\w-]+(?:=\S+)?(?:\s+(?!add\b)\S+)?)"
+    return bool(
+        re.search(
+            rf"(^|[\s;&|])(?:\S*/)?apt(-get)?(?:{opt_before_update_install})*\s+"
+            r"(update|install)\b",
+            command,
+        )
+        or re.search(
+            rf"(^|[\s;&|])(?:\S*/)?(dnf|yum)(?:{opt_before_update_install})*\s+install\b",
+            command,
+        )
+        or re.search(rf"(^|[\s;&|])(?:\S*/)?apk(?:{opt_before_add})*\s+add\b", command)
+        or re.search(rf"(^|[\s;&|])(?:\S*/)?pkg(?:{opt_before_add})*\s+install\b", command)
+        or re.search(r"(^|[\s;&|])(?:\S*/)?pacman(?:\s+-[a-z]*s[a-z]*)\b", command)
+        or re.search(
+            rf"(^|[\s;&|])(?:\S*/)?zypper(?:{opt_before_update_install})*\s+install\b",
+            command,
+        )
+        or re.search(
+            rf"(^|[\s;&|])(?:\S*/)?brew(?:{opt_before_update_install})*\s+"
+            r"(install|update|upgrade)\b",
+            command,
+        )
+    )
+
+def _is_dependency_install_command(command: str) -> bool:
+    if not command:
+        return False
+    uv_opt = r"(?:\s+-{1,2}[\w-]+(?:=\S+)?(?:\s+(?!(?:sync|pip|add|lock)\b)\S+)?)"
+    pip_opt = r"(?:\s+-{1,2}[\w-]+(?:=\S+)?(?:\s+(?!install\b)\S+)?)"
+    return bool(
+        re.search(
+            rf"(^|[\s;&|])(?:\S*/)?uv(?:{uv_opt})*\s+(sync|pip\s+install|add|lock)\b",
+            command,
+        )
+        or re.search(rf"(^|[\s;&|])(?:\S*/)?pip(?:3)?(?:{pip_opt})*\s+install\b", command)
+        or re.search(
+            rf"(^|[\s;&|])(?:\S*/)?python(?:3)?\s+-m\s+pip(?:{pip_opt})*\s+install\b",
+            command,
+        )
+        or _is_npm_family_dependency_command(command)
+    )
+
+def _is_npm_family_dependency_command(command: str) -> bool:
+    for segment in re.split(r"[;&|]", command):
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            tokens = segment.split()
+        for index, token in enumerate(tokens):
+            executable = token.rsplit("/", 1)[-1]
+            if executable not in {"npm", "pnpm", "yarn"}:
+                continue
+            subcommand = _first_npm_family_subcommand(tokens[index + 1 :])
+            if subcommand is None:
+                return executable == "yarn"
+            if subcommand in NPM_FAMILY_INSTALL_SUBCOMMANDS:
+                return True
+    return False
+
+def _first_npm_family_subcommand(args: list[str]) -> str | None:
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            index += 1
+            continue
+        if arg.startswith("--"):
+            option = arg.split("=", 1)[0]
+            index += 1
+            if "=" not in arg and option in NPM_FAMILY_OPTIONS_WITH_VALUE:
+                index += 1
+            continue
+        if arg == "-f":
+            # Lower-cased command text means npm's flag-style -f and pnpm's
+            # value-taking -F both arrive here. If the next token is an install
+            # subcommand, keep -f as valueless; otherwise treat it as filter.
+            if index + 1 < len(args) and args[index + 1] in NPM_FAMILY_INSTALL_SUBCOMMANDS:
+                index += 1
+            else:
+                index += 2
+            continue
+        if arg in NPM_FAMILY_OPTIONS_WITH_VALUE:
+            index += 2
+            continue
+        if arg.startswith("-"):
+            index += 1
+            continue
+        return arg
+    return None
+
+def _is_node_runtime_or_test_command(command: str) -> bool:
+    executable = r"(?:\S*/)?"
+    if re.search(rf"(^|[\s;&|]){executable}(node|npx|vitest|jest|tsx|mocha)\b", command):
+        return True
+    test_subcommands = {"build", "run", "start", "test"}
+    for segment in re.split(r"[;&|]", command):
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            tokens = segment.split()
+        for index, token in enumerate(tokens):
+            if token.rsplit("/", 1)[-1] not in {"npm", "pnpm", "yarn"}:
+                continue
+            subcommand = _first_npm_family_subcommand(tokens[index + 1 :])
+            if subcommand in test_subcommands:
+                return True
+    return False
+
 def _contains_command(command: str, names: tuple[str, ...]) -> bool:
     tokens = re.split(r"[\s;&|()]+", command)
     return any(name in tokens for name in names)
@@ -1468,11 +2407,18 @@ def _contains_command(command: str, names: tuple[str, ...]) -> bool:
 def _looks_like_diff_command(command: str) -> bool:
     if not command:
         return False
-    if bool(re.search(r"(^|[\s;&|])git\b.*\bdiff\b", command)) or command.startswith("diff "):
+    git_executable = r"(?:\S*/)?git"
+    diff_executable = r"(?:\S*/)?diff"
+    if bool(re.search(rf"(^|[\s;&|]){git_executable}\b.*\bdiff\b", command)) or bool(
+        re.search(rf"(^|[\s;&|]){diff_executable}\s", command)
+    ):
         return True
-    if re.search(r"(^|[\s;&|])git\b.*\blog\b.*?(\s-p\b|\s--patch\b)", command):
+    if re.search(
+        rf"(^|[\s;&|]){git_executable}\b.*\blog\b.*?(\s-p\b|\s--patch\b)",
+        command,
+    ):
         return True
-    return bool(re.search(r"(^|[\s;&|])git\b.*\bshow\b", command)) and not bool(
+    return bool(re.search(rf"(^|[\s;&|]){git_executable}\b.*\bshow\b", command)) and not bool(
         re.search(
             r"\s--(no-patch|stat|summary|name-only|name-status)\b",
             command,
@@ -1494,27 +2440,21 @@ def _looks_like_v4a_patch(text: str) -> bool:
 
 
 def _looks_like_file_read_command(command: str) -> bool:
-    if not command or _has_unquoted_shell_operator(command):
+    if not command or _has_unquoted_shell_operator(
+        command,
+        allow_input_redirection=True,
+        allow_stderr_redirection=True,
+    ):
         return False
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        tokens = command.split()
-    if not tokens:
-        return False
-    executable = tokens[0]
-    if executable in {"cat", "head", "tail", "less", "more", "bat", "nl"}:
-        return True
-    if _looks_like_git_show_file_read_tokens(tokens):
-        return True
-    if executable != "sed":
-        return False
-    if "-i" in tokens or any(token.startswith("-i") and token != "-i" for token in tokens):
-        return False
-    return any(_looks_like_sed_print_script(token) for token in tokens[1:])
+    return _contains_source_read_invocation(command)
 
 
-def _has_unquoted_shell_operator(command: str) -> bool:
+def _has_unquoted_shell_operator(
+    command: str,
+    *,
+    allow_input_redirection: bool = False,
+    allow_stderr_redirection: bool = False,
+) -> bool:
     quote: str | None = None
     escaped = False
     for index, char in enumerate(command):
@@ -1541,7 +2481,26 @@ def _has_unquoted_shell_operator(command: str) -> bool:
         if char in {"'", '"'}:
             quote = char
             continue
-        if char in "|;&><`\n\r" or (char == "$" and command[index + 1 : index + 2] == "("):
+        if char in "|;&`\n\r" or (char == "$" and command[index + 1 : index + 2] == "("):
+            if (
+                char == "&"
+                and allow_stderr_redirection
+                and index >= 2
+                and command[index - 1] == ">"
+                and command[index - 2].isdigit()
+                and command[index - 2] != "1"
+                and command[index + 1 : index + 2].isdigit()
+            ):
+                continue
+            return True
+        if char == ">" and not (
+            allow_stderr_redirection
+            and index > 0
+            and command[index - 1].isdigit()
+            and command[index - 1] != "1"
+        ):
+            return True
+        if char == "<" and not allow_input_redirection:
             return True
     return False
 
@@ -1556,7 +2515,7 @@ def _looks_like_sed_print_script(token: str) -> bool:
 
 
 def _looks_like_git_show_file_read_tokens(tokens: list[str]) -> bool:
-    if not tokens or tokens[0] != "git" or "show" not in tokens:
+    if not tokens or tokens[0].rsplit("/", 1)[-1].lower() != "git" or "show" not in tokens:
         return False
     show_index = tokens.index("show")
     skip_next = False
@@ -1566,6 +2525,8 @@ def _looks_like_git_show_file_read_tokens(tokens: list[str]) -> bool:
             continue
         if token == "--":
             continue
+        if token in {"-L", "--line-range"}:
+            return False
         if token in {"-l", "--format", "--pretty", "--date"}:
             skip_next = True
             continue
@@ -1580,15 +2541,24 @@ def _looks_like_git_show_file_read_tokens(tokens: list[str]) -> bool:
 
 
 def _is_node_command(command: str, sample: str) -> bool:
-    if re.search(r"(^|[\s;&|])(npm|pnpm|yarn)\s+", command):
+    executable = r"(?:\S*/)?"
+    if re.search(rf"(^|[\s;&|]){executable}(npm|pnpm|yarn)\s+", command):
         return True
-    if re.search(r"(^|[\s;&|])(node|npx|vitest|jest|tsx|mocha)\b", command):
+    if re.search(rf"(^|[\s;&|]){executable}(node|npx|vitest|jest|tsx|mocha)\b", command):
         return True
     return "npm err!" in sample or "err_pnpm" in sample or "yarn run" in sample
 
 
 def _is_search_command(command: str) -> bool:
-    return bool(re.search(r"(^|[\s;&|])(rg|grep|ag|ack)(\s|$)", command))
+    if not command or re.search(r"[;&|]", command):
+        return False
+    tokens = _shell_split(command)
+    prefix_index = _skip_command_prefix_tokens(tokens)
+    if 0 < prefix_index < len(tokens):
+        return _is_search_command(" ".join(tokens[prefix_index:]))
+    if not tokens:
+        return False
+    return tokens[0].rsplit("/", 1)[-1] in {"rg", "grep", "ag", "ack"}
 
 
 def _option_key(key: str) -> str:

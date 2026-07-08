@@ -51,9 +51,11 @@ Noisegate gives you two surfaces:
 It knows how to reduce common noisy outputs:
 
 - `pytest` and `unittest`
+- OS package managers (`apt`, `apk`, `dnf`, `yum`, `pacman`, `zypper`, `brew`) plus `pip` and `uv` install/update spam
 - `npm`, `pnpm`, and `yarn`
 - `git status` and `git log`
 - search output from `rg`, `grep`, `ag`, and `ack`
+- inventory output from `ls`, `find`, `git ls-files`, `fd`, and `tree`
 - Docker build-style logs
 - generic long output with deterministic head/tail fallback
 

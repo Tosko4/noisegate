@@ -12,7 +12,13 @@ from typing import Any
 
 from ._version import __version__
 from .artifacts import ArtifactError, ArtifactStore
-from .engine import NoisegateOptions, _is_compactable_tool_name, env_diagnostics, reduce_text
+from .engine import (
+    NoisegateOptions,
+    _is_compactable_tool_name,
+    classify_command,
+    env_diagnostics,
+    reduce_text,
+)
 from .installer import DEFAULT_PACKAGE_SPEC, InstallHermesError, install_hermes
 from .plugin import transform_tool_result
 from .wrap import DEFAULT_MAX_CAPTURE_BYTES, WrappedCommandInterrupted, run_wrapped_command
@@ -337,7 +343,7 @@ def _reduce_json_value(
             and _is_compactable_tool_name(tool_name)
             and not _is_json_text(result_text)
         ):
-            command = _extract_command_arg(call_args)
+            command = _command_from_payload_or_args(parsed, call_args)
             reduced = reduce_text(
                 result_text,
                 command=command,
@@ -373,6 +379,17 @@ def _reduce_json_value(
     return transformed if transformed is not None else raw
 
 
+def _command_from_payload_or_args(parsed: dict[Any, Any], call_args: dict[Any, Any]) -> str:
+    commands = [
+        command
+        for source in (call_args, parsed)
+        if (command := _extract_command_arg(source))
+    ]
+    for command in commands:
+        if classify_command(command, "") in {"file_read", "source_mixed", "git_diff"}:
+            return command
+    return commands[0] if commands else ""
+
 def _looks_terminal_payload(payload: dict[Any, Any]) -> bool:
     return any(key in payload for key in ("stdout", "stderr", "output")) and any(
         key in payload for key in ("command", "exit", "exit_code", "status")
@@ -389,21 +406,40 @@ def _combined_call_args(args: object, arguments: object) -> dict[Any, Any]:
     arguments_map = arguments if isinstance(arguments, dict) else {}
     combined.update(arguments_map)
     combined.update(args_map)
-    command = _extract_command_arg(args_map) or _extract_command_arg(arguments_map)
+    command = _preferred_command_arg(args_map, arguments_map)
     if command:
         combined["command"] = command
     return combined
 
 
+def _preferred_command_arg(*sources: dict[Any, Any]) -> str:
+    commands: list[str] = []
+    for source in sources:
+        commands.extend(_command_candidates_from_mapping(source))
+    for command in commands:
+        if classify_command(command, "") in {"file_read", "source_mixed", "git_diff"}:
+            return command
+    return commands[0] if commands else ""
+
+
 def _extract_command_arg(args: dict[Any, Any]) -> str:
+    commands = _command_candidates_from_mapping(args)
+    for command in commands:
+        if classify_command(command, "") in {"file_read", "source_mixed", "git_diff"}:
+            return command
+    return commands[0] if commands else ""
+
+
+def _command_candidates_from_mapping(args: dict[Any, Any]) -> list[str]:
+    commands: list[str] = []
     for key in ("command", "cmd", "shell_command", "code"):
         value = args.get(key)
         if isinstance(value, str) and value.strip():
-            return value
+            commands.append(value)
     argv = args.get("argv")
     if isinstance(argv, list) and argv and all(isinstance(item, str) for item in argv):
-        return shlex.join(argv)
-    return ""
+        commands.append(shlex.join(argv))
+    return commands
 
 
 def _is_json_text(value: str) -> bool:

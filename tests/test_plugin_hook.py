@@ -688,3 +688,121 @@ def test_transform_terminal_output_does_not_store_artifacts_before_redaction(
     assert isinstance(transformed, str)
     assert "[noisegate artifact:" not in transformed
     assert not (tmp_path / "artifacts").exists()
+
+
+def test_transform_tool_result_merges_arguments_when_args_has_no_command() -> None:
+    raw = json.dumps({"stdout": source_like_payload(), "exit_code": 0})
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        args={"cwd": "/repo"},
+        arguments={"command": "cat fixture.py"},
+        noisegate_max_chars=180,
+    )
+
+    assert transformed is None
+
+
+def test_transform_tool_result_arguments_source_alias_beats_args_test_command() -> None:
+    raw = json.dumps({"stdout": source_like_payload(), "exit_code": 0})
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        args={"command": "pytest -q"},
+        arguments={"cmd": "cat fixture.py"},
+        noisegate_max_chars=180,
+    )
+
+    assert transformed is None
+
+
+def test_transform_tool_result_blank_args_command_does_not_mask_arguments() -> None:
+    raw = json.dumps({"stdout": source_like_payload(), "exit_code": 0})
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        args={"command": ""},
+        arguments={"command": "cat fixture.py"},
+        noisegate_max_chars=180,
+    )
+
+    assert transformed is None
+
+def test_transform_tool_result_args_aliases_beat_arguments_command() -> None:
+    raw = json.dumps({"stdout": source_like_payload(), "exit_code": 0})
+
+    for args in (
+        {"cmd": "cat fixture.py"},
+        {"shell_command": "cat fixture.py"},
+        {"code": "cat fixture.py"},
+        {"argv": ["cat", "fixture.py"]},
+    ):
+        transformed = transform_tool_result(
+            raw,
+            tool_name="terminal",
+            args=args,
+            arguments={"command": "pytest -q"},
+            noisegate_max_chars=180,
+        )
+
+        assert transformed is None
+
+def test_transform_tool_result_uses_nested_payload_args_for_source_reads() -> None:
+    raw = json.dumps(
+        {
+            "args": {"cmd": "cat fixture.py"},
+            "arguments": {"command": "pytest -q"},
+            "stdout": source_like_payload(),
+            "exit_code": 0,
+        }
+    )
+
+    transformed = transform_tool_result(raw, tool_name="terminal", noisegate_max_chars=180)
+
+    assert transformed is None
+
+def test_transform_tool_result_nested_source_read_beats_hook_pytest_command() -> None:
+    raw = json.dumps(
+        {
+            "args": {"cmd": "cat fixture.py"},
+            "stdout": source_like_payload(),
+            "exit_code": 0,
+        }
+    )
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        args={"command": "pytest -q"},
+        noisegate_max_chars=180,
+    )
+
+    assert transformed is None
+
+def test_transform_tool_result_argv_quotes_literal_metacharacter_paths() -> None:
+    raw = json.dumps({"stdout": source_like_payload(), "exit_code": 0})
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        args={"argv": ["cat", "src/A&B.py"]},
+        noisegate_max_chars=180,
+    )
+
+    assert transformed is None
+
+def test_blank_args_do_not_mask_arguments_command_for_source_preservation() -> None:
+    raw = terminal_result(numbered("source line", 120), command="")
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        args={"command": ""},
+        arguments={"command": "cat important.py"},
+        noisegate_max_chars=100,
+    )
+
+    assert transformed is None

@@ -733,7 +733,17 @@ def test_source_like_terminal_file_display_commands_are_protected() -> None:
         "cat 'src/A&B.py'",
         "cat 'src/A>B.py'",
         "nl -ba src/example.py",
+        "nl -ba < src/example.py",
         "bat --paging=never src/example.py",
+        "cat < src/example.py",
+        "sed -n '1,200p' < src/example.py",
+        "jq . < config.json",
+        "cat src/example.py 2>&1",
+        "head -200 src/example.py 2>&1",
+        "tail -200 src/example.py 2>&1",
+        "nl -ba src/example.py 2>&1",
+        "sed -n '1,200p' src/example.py 2>&1",
+        "jq . config.json 2>&1",
     )
     for command in commands:
         result = reduce_text(
@@ -754,11 +764,107 @@ def test_shell_substitution_file_display_commands_are_not_file_read() -> None:
         "cat $(pytest -q)",
         "cat `pytest -q`",
         "cat \"$(pytest -q)\"",
-        "cat 'file\\'; pytest -q",
-        "nl -ba src/foo.py\npytest -q",
-        "nl -ba src/foo.py\r\npytest -q",
+        "cat < $(pytest -q)",
+        "cat source.py > generated.py",
+        "cat $(pytest -q) && echo done",
+        "cat source.py > generated.py && pytest -q",
+        "pytest -q && cat source.py > generated.py",
+        "bash -c 'cat source.py' > generated.py && pytest -q",
+        "bash -lc 'cat source.py' > generated.py && pytest -q",
+        "env -S bash -c 'cat source.py' > generated.py && pytest -q",
+        "bash -c 'cat source.py' $(pytest -q)",
+        "bash -c 'cat source.py' `pytest -q`",
     ):
-        assert engine.classify_command(command, raw) != "file_read", command
+        assert engine.classify_command(command, raw) not in {"file_read", "source_mixed"}, command
+
+
+def test_multiline_source_reader_snippets_are_preserved_exactly() -> None:
+    raw = source_like_python()
+
+    for command in (
+        "cat file.py\npytest -q",
+        "nl -ba src/foo.py\npytest -q",
+        "pytest -q\ncat file.py",
+        "pytest -q\r\ncat file.py",
+        "echo hi\ncat file.py",
+        "bash -lc 'cat source.py' && pytest -q",
+        "nl -ba file.py | sed -n '1,80p'",
+        "cat file.py | head -80",
+        "jq . package.json | head -20",
+    ):
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            options=options(max_chars=220, max_lines=20),
+        )
+
+        assert result.changed is False, command
+        assert result.text == raw
+        assert result.metadata["command_class"] == "source_mixed"
+        assert result.metadata["reducer"] == "protected_file_read"
+
+
+def test_multiline_test_intent_wins_over_inventory_and_git_prefixes() -> None:
+    raw = "\n".join(
+        [
+            *[f"status noise {index}" for index in range(40)],
+            "FAILED tests/test_demo.py::test_breaks",
+            "AssertionError: important signal",
+            *[f"tail noise {index}" for index in range(40)],
+        ]
+    )
+
+    for command in (
+        "git status\npytest -q",
+        "git log --oneline\npytest -q",
+        "rg --files\npytest -q",
+        "ls -la\npytest -q",
+        "pytest -q\nrg --files",
+    ):
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=options(max_chars=220, max_lines=14),
+        )
+
+        assert result.changed is True, command
+        assert result.metadata["command_class"] == "pytest"
+        assert result.metadata["reducer"] == "pytest"
+        assert "FAILED tests/test_demo.py::test_breaks" in result.text
+        assert "AssertionError: important signal" in result.text
+
+
+def test_package_intent_wins_over_test_and_git_prefixes() -> None:
+    raw = "\n".join(
+        [
+            *[f"install noise {index}" for index in range(40)],
+            "E: Unable to locate package missing-pkg",
+            "AssertionError: important signal",
+            *[f"tail noise {index}" for index in range(40)],
+        ]
+    )
+
+    for command, command_class in (
+        ("apt install missing-pkg && pytest -q", "os_package"),
+        ("git status && apt install missing-pkg", "os_package"),
+        ("uv sync && pytest -q", "dependency_install"),
+        ("npm install && pytest -q", "dependency_install"),
+        ("git log --oneline && npm install", "dependency_install"),
+    ):
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=options(max_chars=260, max_lines=14),
+        )
+
+        assert result.changed is True, command
+        assert result.metadata["command_class"] == command_class
+        assert "E: Unable to locate package missing-pkg" in result.text
 
 
 def test_sed_search_scripts_are_not_file_read_passthroughs() -> None:
@@ -1902,3 +2008,617 @@ def test_changed_outputs_always_fit_configured_budgets() -> None:
                 if result.changed:
                     assert len(result.text) <= max_chars
                     assert len(result.text.splitlines()) <= max_lines
+
+
+def test_source_read_detection_does_not_match_arguments() -> None:
+    raw = numbered("ordinary noisy output", 100)
+
+    commands = (
+        ("rg cat src", "search"),
+        ("grep head file.txt", "search"),
+        ("pytest -k cat", "pytest"),
+        ("pip install bat", "dependency_install"),
+        ("npm test -- --grep yq", "node"),
+        ("/bin/bash -o pipefail -c 'npm test'", "node"),
+        ("/usr/bin/node script.js", "node"),
+        ("bash -lc '/usr/bin/node script.js'", "node"),
+        ("env NODE_ENV=test /usr/local/bin/node script.js", "node"),
+    )
+    for command, command_class in commands:
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            options=options(max_chars=120),
+        )
+        assert result.changed is True
+        assert result.metadata["command_class"] == command_class
+        assert result.metadata["reducer"] != "protected_file_read"
+
+def test_pytest_command_intent_beats_package_argument_words() -> None:
+    raw = "\n".join(
+        [
+            *[f"tests/test_{index}.py ." for index in range(80)],
+            "FAILED tests/test_pkg.py::test_yarn",
+            "AssertionError: expected 2 got 1",
+            *[f"tail {index}" for index in range(80)],
+        ]
+    )
+
+    commands = (
+        "pytest -k yarn",
+        "pytest -k 'npm test'",
+        "pytest -k apt install",
+        "python -m pytest -k yarn",
+        "uv run pytest -k yarn",
+        "uv run --group dev pytest -k yarn",
+        "uv run --with pytest pytest -k yarn",
+        "uv run --group dev python -m pytest -k yarn",
+        "uv run -m pytest -k yarn",
+        "uv --quiet run pytest -k yarn",
+        "uv --offline --no-progress run pytest -k yarn",
+        "uv --python 3.13 run pytest -k yarn",
+        "uv --directory . run python -m pytest -k yarn",
+        "python -I -m pytest -k yarn",
+        "npx --yes pytest -k yarn",
+        "npx -p pytest pytest -k yarn",
+        "npm exec pytest -- -k yarn",
+        "npm-exec pytest -k yarn",
+        "pnpm dlx pytest -k yarn",
+        "pnpm-dlx pytest -k yarn",
+    )
+    for command in commands:
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=options(max_chars=220, max_lines=8, head_lines=1, tail_lines=1),
+        )
+        assert result.changed is True
+        assert result.metadata["command_class"] == "pytest"
+        assert result.metadata["reducer"] == "pytest"
+        assert "AssertionError: expected 2 got 1" in result.text
+
+def test_hyphenated_pytest_runner_success_output_keeps_pytest_intent() -> None:
+    raw = "\n".join([*[f"tests/test_{index}.py ." for index in range(80)], "80 passed in 3.12s"])
+
+    for command in ("npm-exec pytest -q", "pnpm-dlx pytest -q"):
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=options(max_chars=160, max_lines=6, head_lines=1, tail_lines=1),
+        )
+
+        assert result.changed is True
+        assert result.metadata["command_class"] == "pytest"
+        assert result.metadata["reducer"] == "pytest"
+
+def test_mixed_source_and_noisy_commands_are_protected_by_default() -> None:
+    raw = numbered("mixed source line", 100)
+
+    commands = (
+        "cat file.py && pytest",
+        "sed -n '1,200p' file.py && npm test",
+        "sed -En '1,20p' file.py && pytest",
+        "bash -lc \"sed -n '1,20p' file.py && pytest\"",
+        "bash -lc \"/bin/cat file.py && pytest\"",
+        "pytest -q; /bin/cat file.py",
+        "pytest -q && /usr/bin/cat file.py",
+        "npm test; /bin/sed -n '1,200p' file.py",
+        "find . -type f -exec /bin/cat {} \\;",
+        "find . -type f -execdir /bin/cat {} \\;",
+        "find . -type f -execdir sed -n '1,20p' {} \\;",
+        "/bin/bash -lc 'cat file.py && pytest'",
+        "bash -o pipefail -c 'cat file.py && pytest'",
+        "bash -euo pipefail -c 'cat file.py && pytest'",
+        "bash --noprofile --rcfile /tmp/bashrc -c 'cat file.py && pytest'",
+        "bash -c 'cat file.py && pytest'",
+        "git diff && pytest",
+        "rg 'pattern' . && npm test",
+        "/usr/bin/rg 'pattern' . && npm test",
+        "/bin/grep -R 'pattern' . && npm test",
+        "/opt/bin/ag pattern . && npm test",
+        "/opt/bin/ack pattern . && npm test",
+        "find . -type f -exec cat {} \\;",
+        "/usr/bin/find . -type f -exec /bin/cat {} \\;",
+        "find . -type f -exec sh -c 'cat \"$1\"' sh {} \\;",
+        "find . -type f -exec bash -c 'sed -n \"1,80p\" \"$1\"' bash {} \\;",
+        "fd -x cat",
+        "/usr/bin/fd -x /bin/cat",
+        "fd --exec sed -n '1,20p'",
+        "/usr/bin/fd --exec=/bin/cat",
+        "fd --exec-batch cat",
+        "/usr/bin/fd --exec-batch=/bin/cat",
+        "rg 'pattern' . | head -50",
+        "git status && git diff",
+        "python - <<'PY'",
+        "find . -exec cat {} \\;",
+        "rg 'pattern' src | xargs sed -n '1,80p'",
+    )
+    for command in commands:
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            options=options(max_chars=120),
+        )
+        assert result.changed is False
+        assert result.text == raw
+        assert result.metadata["reducer"] in {"protected_file_read", "protected_diff"}
+        assert result.metadata["command_class"] in {"source_mixed", "git_diff"}
+
+def test_inventory_commands_can_reduce() -> None:
+    raw = numbered("inventory entry", 100)
+
+    commands = (
+        "ls -la",
+        "find . -maxdepth 3 -type f",
+        "/usr/bin/find . -maxdepth 3 -type f",
+        "/bin/ls -la",
+        "/usr/bin/tree .",
+        "/usr/bin/fd",
+        "bash -lc 'find . -type f'",
+        "git ls-files",
+        "/usr/bin/git ls-files",
+        "/usr/bin/git -c core.quotepath=false ls-files",
+        "rg --files",
+        "/usr/bin/rg --files",
+        "env FOO=bar find . -type f",
+        "/usr/bin/env FOO=bar fd",
+        "command ls -la",
+        "fd",
+        "tree",
+    )
+    for command in commands:
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            options=options(max_chars=120),
+        )
+        assert result.changed is True
+        assert result.metadata["command_class"] == "inventory"
+        assert result.metadata["reducer"] == "inventory"
+
+def test_env_wrapped_inventory_keeps_permission_errors() -> None:
+    raw = "\n".join(
+        [
+            *[f"src/file_{index}.py" for index in range(50)],
+            "find: './private': Permission denied",
+            *[f"tests/file_{index}.py" for index in range(50)],
+        ]
+    )
+
+    for command in ("env FOO=bar find . -type f", "/usr/bin/find . -type f"):
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=options(max_chars=180, max_lines=10, head_lines=1, tail_lines=1),
+        )
+
+        assert result.changed is True
+        assert result.metadata["command_class"] == "inventory"
+        assert result.metadata["reducer"] == "inventory"
+        assert "find: './private': Permission denied" in result.text
+
+def test_inventory_tail_does_not_hide_earlier_test_failures() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(40)],
+            "FAILED tests/test_demo.py::test_breaks",
+            "AssertionError: inventory tail must not hide this",
+            *[f"src/file_{index}.py" for index in range(40)],
+        ]
+    )
+
+    for command in (
+        "pytest -q; find . -type f",
+        "pytest -q && rg --files",
+        "apt install -y curl && pytest -q",
+        "env PYTHONPATH=. pytest -q && find . -type f",
+        "npx pytest && find . -type f",
+    ):
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=options(max_chars=220, max_lines=14, head_lines=2, tail_lines=2),
+        )
+        assert result.changed is True
+        assert result.metadata["command_class"] == "pytest"
+        assert result.metadata["reducer"] == "pytest"
+        assert "FAILED tests/test_demo.py::test_breaks" in result.text
+        assert "AssertionError: inventory tail must not hide this" in result.text
+
+def test_node_wrapped_pytest_output_uses_test_reducer() -> None:
+    raw = "\n".join(
+        [
+            *[f"node wrapper noise {index}" for index in range(50)],
+            "=================================== FAILURES ===================================",
+            "____________________________ test_wrapped_failure ____________________________",
+            "E       AssertionError: wrapped pytest detail",
+            "tests/test_wrapped.py:12: AssertionError",
+            *[f"tail noise {index}" for index in range(50)],
+            "FAILED tests/test_wrapped.py::test_wrapped_failure - AssertionError",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="npm test",
+        tool_name="terminal",
+        exit_code=1,
+        options=options(max_chars=260, max_lines=14, head_lines=1, tail_lines=1),
+    )
+
+    assert result.changed is True
+    assert result.metadata["command_class"] == "pytest"
+    assert result.metadata["reducer"] == "pytest"
+    assert "E       AssertionError: wrapped pytest detail" in result.text
+    assert "tests/test_wrapped.py:12: AssertionError" in result.text
+
+def test_code_search_commands_can_reduce_cautiously() -> None:
+    raw = "\n".join(f"src/file_{index}.py:match {index}" for index in range(1, 60))
+
+    for command in (
+        "rg 'pattern' src tests",
+        "/usr/bin/rg 'pattern' src tests",
+        "grep -R 'pattern' .",
+        "/bin/grep -R 'pattern' .",
+        "ag pattern",
+        "/opt/bin/ag pattern",
+        "ack pattern",
+        "/opt/bin/ack pattern",
+    ):
+        result = reduce_text(raw, command=command, tool_name="terminal", options=options())
+        assert result.changed is True
+        assert result.metadata["command_class"] == "search"
+        assert result.metadata["reducer"] == "search"
+
+def test_search_command_intent_beats_log_like_hits() -> None:
+    raw = "\n".join(
+        f"src/file_{index}.js:{index}: console.log('npm ERR! synthetic {index}')"
+        for index in range(1, 80)
+    )
+
+    result = reduce_text(
+        raw,
+        command="/usr/bin/rg 'npm ERR' src",
+        tool_name="terminal",
+        options=options(max_chars=500, max_lines=12, head_lines=2, tail_lines=2),
+    )
+
+    assert result.changed is True
+    assert result.metadata["command_class"] == "search"
+    assert result.metadata["reducer"] == "search"
+    assert "src/file_1.js" in result.text
+    assert "src/file_79.js" in result.text
+
+def test_package_manager_option_forms_keep_specialized_reducers() -> None:
+    raw = "\n".join(
+        [
+            *[f"noise {index}" for index in range(40)],
+            "ERROR: ResolutionImpossible",
+            "No match for argument: missing",
+            *[f"tail {index}" for index in range(40)],
+        ]
+    )
+
+    commands = (
+        ("apt-get -y install curl", "os_package"),
+        ("/usr/bin/apt-get -y install curl", "os_package"),
+        ("apt --yes install curl", "os_package"),
+        ("dnf install missing", "os_package"),
+        ("/usr/bin/dnf install missing", "os_package"),
+        ("apk add missing", "os_package"),
+        ("pkg install missing", "os_package"),
+        ("/usr/sbin/pkg install missing", "os_package"),
+        ("brew install missing", "os_package"),
+        ("pip --disable-pip-version-check install foo", "dependency_install"),
+        ("/usr/bin/pip --disable-pip-version-check install foo", "dependency_install"),
+        ("python -m pip --no-cache-dir install foo", "dependency_install"),
+        ("/usr/bin/python3 -m pip --no-cache-dir install foo", "dependency_install"),
+        ("uv --directory app sync", "dependency_install"),
+        ("pacman -Sy broken-package", "os_package"),
+        ("pip --proxy https://proxy.example install foo", "dependency_install"),
+        ("bash -lc 'apt-get update'", "os_package"),
+        ("bash -lc 'pip install bad'", "dependency_install"),
+        ("uv --directory=app sync", "dependency_install"),
+        ("npm --prefix web install", "dependency_install"),
+        ("npm -f install", "dependency_install"),
+        ("npm --loglevel warn install", "dependency_install"),
+        ("npm --omit dev install", "dependency_install"),
+        ("pnpm --store-dir .pnpm-store install", "dependency_install"),
+        ("npm i", "dependency_install"),
+        ("pnpm --filter app install", "dependency_install"),
+        ("pnpm -C web install", "dependency_install"),
+        ("pnpm -F app install", "dependency_install"),
+        ("pnpm i", "dependency_install"),
+        ("yarn --cwd web install", "dependency_install"),
+        ("yarn", "dependency_install"),
+    )
+    for command, command_class in commands:
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            options=options(max_chars=220, max_lines=10),
+        )
+        assert result.changed is True
+        assert result.metadata["command_class"] == command_class
+        assert result.metadata["reducer"] == command_class
+
+def test_os_package_reducer_preserves_unavailable_package_errors() -> None:
+    raw = "\n".join(
+        [
+            *[f"install noise {index}" for index in range(40)],
+            "No packages available to install matching 'missing-package'",
+            *[f"tail {index}" for index in range(40)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pkg install missing-package",
+        tool_name="terminal",
+        exit_code=1,
+        options=options(max_chars=180, max_lines=10, head_lines=1, tail_lines=1),
+    )
+
+    assert result.changed is True
+    assert result.metadata["command_class"] == "os_package"
+    assert result.metadata["reducer"] == "os_package"
+    assert "No packages available to install matching" in result.text
+
+def test_package_command_intent_beats_test_like_output() -> None:
+    raw = "\n".join(
+        [
+            *[f"install noise {index}" for index in range(50)],
+            "FAILED tests/metadata fixture copied from package docs",
+            *[f"middle noise {index}" for index in range(50)],
+            "E: Unable to locate package definitely-missing-package",
+            *[f"tail noise {index}" for index in range(50)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="apt-get install definitely-missing-package",
+        tool_name="terminal",
+        exit_code=100,
+        options=options(max_chars=260, max_lines=12, head_lines=1, tail_lines=1),
+    )
+
+    assert result.changed is True
+    assert result.metadata["command_class"] == "os_package"
+    assert result.metadata["reducer"] == "os_package"
+    assert "Unable to locate package" in result.text
+
+def test_noisy_maintenance_commands_can_reduce() -> None:
+    raw = numbered("install noise", 100)
+
+    commands = (
+        ("apt-get update", "os_package"),
+        ("apt install curl", "os_package"),
+        ("pip install noisegate-hermes", "dependency_install"),
+        ("uv sync", "dependency_install"),
+        ("uv pip install -e .", "dependency_install"),
+        ("npm install", "dependency_install"),
+        ("pnpm install", "dependency_install"),
+        ("yarn install", "dependency_install"),
+        ("docker build .", "docker_build"),
+        ("docker compose build", "docker_build"),
+    )
+    for command, command_class in commands:
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            options=options(max_chars=120),
+        )
+        assert result.changed is True
+        assert result.metadata["command_class"] == command_class
+
+def test_path_qualified_diff_command_is_protected_without_diff_markers() -> None:
+    raw = "\n".join(
+        f"Files old/file_{index}.py and new/file_{index}.py differ" for index in range(80)
+    )
+
+    for command in ("/usr/bin/diff -q old new", "/usr/bin/git diff --name-only"):
+        result = reduce_text(raw, command=command, tool_name="terminal", options=options())
+
+        assert result.changed is False
+        assert result.text == raw
+        assert result.metadata["command_class"] == "git_diff"
+        assert result.metadata["reducer"] == "protected_diff"
+
+def test_node_reducer_preserves_common_runtime_error_names() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(30)],
+            "TypeError: Cannot read properties of undefined (reading 'id')",
+            "    at run (/repo/src/index.js:12:3)",
+            "ReferenceError: missingValue is not defined",
+            *[f"tail {index}" for index in range(30)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="/usr/bin/node src/index.js",
+        exit_code=1,
+        options=options(max_chars=320, max_lines=14, head_lines=2, tail_lines=2),
+    )
+
+    assert result.changed is True
+    assert result.metadata["command_class"] == "node"
+    assert result.metadata["reducer"] == "node"
+    assert "TypeError: Cannot read properties" in result.text
+    assert "ReferenceError: missingValue" in result.text
+
+def test_node_command_intent_beats_package_words_in_arguments() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(40)],
+            "TypeError: Cannot read properties of undefined (reading 'id')",
+            "    at run (/repo/src/index.js:12:3)",
+            *[f"tail {index}" for index in range(40)],
+        ]
+    )
+
+    for command in (
+        "node script.js --query pip install",
+        "npm test -- --grep apt install",
+    ):
+        result = reduce_text(
+            raw,
+            command=command,
+            exit_code=1,
+            options=options(max_chars=260, max_lines=12, head_lines=1, tail_lines=1),
+        )
+
+        assert result.changed is True
+        assert result.metadata["command_class"] == "node"
+        assert result.metadata["reducer"] == "node"
+        assert "TypeError: Cannot read properties" in result.text
+
+def _real_agent_lines(prefix: str, count: int) -> list[str]:
+    return [f"{prefix} {index:03d}" for index in range(1, count + 1)]
+
+
+def _with_noise(before: list[str], signal: list[str], after: list[str] | None = None) -> str:
+    return "\n".join([*before, *signal, *(after or [])])
+
+
+@pytest.mark.parametrize(
+    ("command", "raw", "expected_reducer"),
+    [
+        (
+            "apt-get update",
+            _with_noise(
+                _real_agent_lines("Hit: package index mirror", 35),
+                ["Reading package lists... Done"],
+                _real_agent_lines("Fetched translation metadata", 35),
+            ),
+            "os_package",
+        ),
+        (
+            "pytest -q",
+            _with_noise(
+                _real_agent_lines("tests/test_module.py .", 35),
+                ["84 passed in 3.42s"],
+                _real_agent_lines("tests/test_more.py .", 35),
+            ),
+            "pytest",
+        ),
+        (
+            "find . -type f",
+            _with_noise(
+                _real_agent_lines("./src/file", 40),
+                ["./pyproject.toml"],
+                _real_agent_lines("./tests/test_file", 40),
+            ),
+            "inventory",
+        ),
+    ],
+)
+def test_real_agent_slop_success_outputs_are_strongly_compacted(
+    command: str,
+    raw: str,
+    expected_reducer: str,
+) -> None:
+    result = reduce_text(
+        raw,
+        command=command,
+        exit_code=0,
+        options=options(max_chars=500, max_lines=12, head_lines=2, tail_lines=2),
+    )
+
+    assert result.changed is True
+    assert result.metadata["reducer"] == expected_reducer
+    assert result.metadata["reducer"] != "generic_head_tail"
+    assert len(result.text) < len(raw) // 2
+    assert len(result.text.splitlines()) <= 12
+    assert "[noisegate: omitted" in result.text
+
+
+@pytest.mark.parametrize(
+    ("command", "raw", "expected_reducer", "signals"),
+    [
+        (
+            "apt-get install definitely-missing-package",
+            _with_noise(
+                _real_agent_lines("install noise", 40),
+                ["E: Unable to locate package definitely-missing-package"],
+                _real_agent_lines("tail noise", 40),
+            ),
+            "os_package",
+            ("Unable to locate package",),
+        ),
+        (
+            "node src/index.js",
+            _with_noise(
+                _real_agent_lines("setup", 40),
+                ["TypeError: Cannot read properties of undefined (reading 'id')"],
+                _real_agent_lines("tail", 40),
+            ),
+            "node",
+            ("TypeError: Cannot read properties",),
+        ),
+        (
+            "find . -type f",
+            _with_noise(
+                _real_agent_lines("./src/file", 40),
+                ["find: './secret': Permission denied"],
+                _real_agent_lines("./tests/test_file", 40),
+            ),
+            "inventory",
+            ("Permission denied",),
+        ),
+    ],
+)
+def test_real_agent_slop_failures_keep_actionable_error_signals(
+    command: str,
+    raw: str,
+    expected_reducer: str,
+    signals: tuple[str, ...],
+) -> None:
+    result = reduce_text(
+        raw,
+        command=command,
+        exit_code=1,
+        options=options(max_chars=650, max_lines=16, head_lines=2, tail_lines=2),
+    )
+
+    assert result.changed is True
+    assert result.metadata["reducer"] == expected_reducer
+    assert result.metadata["reducer"] != "generic_head_tail"
+    assert len(result.text) < len(raw) // 2
+    assert len(result.text.splitlines()) <= 16
+    assert "[noisegate: omitted" in result.text
+    for signal in signals:
+        assert signal in result.text
+
+def test_noisy_compound_inventory_keeps_noisy_reducer() -> None:
+    raw = "\n".join(
+        [f"setup line {index}" for index in range(50)]
+        + ["FAILED tests/test_app.py::test_app", "AssertionError: boom"]
+        + [f"inventory file {index}" for index in range(50)]
+    )
+    result = reduce_text(
+        raw,
+        command="pytest -q && ls -R",
+        tool_name="terminal",
+        exit_code=1,
+        options=options(max_chars=180, max_lines=16),
+    )
+    assert result.changed is True
+    assert result.metadata["command_class"] == "pytest"
+    assert "FAILED tests/test_app.py::test_app" in result.text
+    assert "AssertionError: boom" in result.text
