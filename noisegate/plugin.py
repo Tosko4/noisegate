@@ -72,7 +72,9 @@ def transform_tool_result(
         exit_code_override = (
             override if isinstance(override, int) and not isinstance(override, bool) else None
         )
-        if not _is_compactable_tool_name(tool_name) or not isinstance(result, str):
+        if not isinstance(result, str):
+            return None
+        if tool_name and not _is_compactable_tool_name(tool_name):
             return None
         options = NoisegateOptions.from_env().with_mapping(kwargs)
         if not options.enabled or options.mode == "off":
@@ -81,10 +83,27 @@ def transform_tool_result(
         parsed = json.loads(result)
         args_map = args if isinstance(args, Mapping) else {}
         arguments_map = arguments if isinstance(arguments, Mapping) else {}
+        call_args = _call_args(
+            args,
+            arguments,
+            parsed,
+            prefer_host_args=bool(tool_name),
+        )
+        if not tool_name and isinstance(parsed, Mapping):
+            embedded_tool_name = _payload_tool_name(parsed)
+            if embedded_tool_name:
+                if not _is_compactable_tool_name(embedded_tool_name):
+                    return None
+                tool_name = embedded_tool_name
+        if not tool_name:
+            if not _looks_terminal_payload(parsed, call_args):
+                return None
+            tool_name = "terminal"
 
         if isinstance(parsed, str):
             command = _select_command(
                 parsed,
+                call_args,
                 args_map,
                 arguments_map,
                 exit_code=exit_code_override,
@@ -154,6 +173,7 @@ def transform_tool_result(
         )
         command = _select_command(
             command_text,
+            call_args,
             args_map,
             arguments_map,
             payload,
@@ -337,6 +357,91 @@ def _commands_from_source(source: Mapping[str, Any]) -> tuple[str, ...]:
     if isinstance(argv, list) and argv and all(isinstance(item, str) for item in argv):
         commands += (shlex.join(argv),)
     return commands
+def _call_args(
+    args: Mapping[str, Any] | None,
+    arguments: Mapping[str, Any] | None,
+    parsed: Any,
+    *,
+    prefer_host_args: bool = False,
+) -> Mapping[str, Any]:
+    parsed_sources: list[Mapping[str, Any]] = []
+    if isinstance(parsed, Mapping):
+        for key in ("args", "arguments"):
+            candidate = parsed.get(key)
+            if isinstance(candidate, Mapping):
+                parsed_sources.append(candidate)
+    host_sources = [
+        candidate for candidate in (args, arguments) if isinstance(candidate, Mapping)
+    ]
+    if prefer_host_args and host_sources:
+        sources = host_sources
+    else:
+        sources = [
+            *host_sources,
+            *parsed_sources,
+        ] if prefer_host_args else [*parsed_sources, *host_sources]
+    return _merge_command_hints(sources)
+
+
+def _merge_command_hints(sources: list[Mapping[str, Any]]) -> Mapping[str, Any]:
+    merged: dict[str, Any] = {}
+    for source in sources:
+        if _has_command_hint(merged):
+            break
+        for key in ("command", "cmd", "shell_command", "code"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                merged[key] = value
+        argv = source.get("argv")
+        if _usable_argv(argv):
+            merged["argv"] = argv
+    return merged
+
+
+def _payload_tool_name(payload: Mapping[str, Any]) -> str:
+    return str(
+        payload.get("tool_name")
+        or payload.get("toolName")
+        or payload.get("tool")
+        or ""
+    )
+
+
+def _looks_terminal_payload(payload: Any, args: Mapping[str, Any] | None = None) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    return any(key in payload for key in ("stdout", "stderr", "output")) and (
+        _has_command_hint(payload)
+        or _has_command_hint(args or {})
+        or _has_numeric_exit_hint(payload)
+    )
+
+
+def _has_numeric_exit_hint(payload: Mapping[str, Any]) -> bool:
+    for key in ("exit", "exit_code", "returncode", "return_code"):
+        value = payload.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return True
+    return False
+
+
+def _has_command_hint(payload: Mapping[str, Any]) -> bool:
+    for key in ("command", "cmd", "shell_command", "code"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    return _usable_argv(payload.get("argv"))
+
+
+def _usable_argv(argv: object) -> bool:
+    return (
+        isinstance(argv, list)
+        and bool(argv)
+        and all(isinstance(item, str) for item in argv)
+        and bool(argv[0].strip())
+    )
 
 
 def _select_command(
@@ -416,6 +521,8 @@ def _extract_command(payload: Mapping[str, JsonValue], args: Mapping[str, Any]) 
             isinstance(argv, list)
             and argv
             and all(isinstance(item, str) for item in argv)
+            and isinstance(argv[0], str)
+            and argv[0].strip()
         ):
             return shlex.join([str(item) for item in argv])
     return ""

@@ -867,6 +867,201 @@ def test_transform_tool_result_does_not_treat_http_status_code_as_exit_code() ->
     assert "exit_code" not in payload["noisegate"]["fields"]["content"]
 
 
+def test_transform_tool_result_rejects_protected_tool_before_json_parse(monkeypatch) -> None:
+    def boom(_value: str) -> object:
+        raise AssertionError("protected tool should not be parsed")
+
+    monkeypatch.setattr(plugin.json, "loads", boom)
+
+    assert transform_tool_result("{not actually parsed", tool_name="read_file") is None
+
+
+def test_transform_tool_result_uses_args_command_when_payload_argv_empty() -> None:
+    raw = json.dumps({"argv": [], "stdout": numbered("exact", 100)})
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="terminal",
+            args={"command": "cat important.txt"},
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_transform_tool_result_falls_back_from_empty_args_argv_to_arguments_command() -> None:
+    raw = json.dumps({"stdout": numbered("exact", 100)})
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="terminal",
+            args={"argv": []},
+            arguments={"command": "cat important.txt"},
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_transform_tool_result_preserves_embedded_protected_tool_without_tool_name() -> None:
+    raw = json.dumps(
+        {
+            "tool_name": "read_file",
+            "output": numbered("exact", 100),
+            "status": "ok",
+        }
+    )
+
+    assert transform_tool_result(raw, noisegate_max_chars=120) is None
+
+
+def test_transform_tool_result_uses_embedded_args_for_blank_tool_name() -> None:
+    raw = json.dumps(
+        {
+            "tool_name": "terminal",
+            "args": {"command": "pytest"},
+            "stdout": numbered("line", 100),
+        }
+    )
+
+    transformed = transform_tool_result(raw, noisegate_max_chars=120)
+
+    payload = parse_hook_result(transformed)
+    stdout = payload["stdout"]
+    assert isinstance(stdout, str)
+    assert "[noisegate: omitted" in stdout
+    assert payload["noisegate"]["fields"]["stdout"]["reducer"] == "pytest"
+
+
+def test_transform_tool_result_prefers_embedded_args_over_outer_args() -> None:
+    raw = json.dumps(
+        {
+            "tool_name": "terminal",
+            "args": {"command": "cat important.txt"},
+            "stdout": numbered("exact", 100),
+        }
+    )
+
+    assert (
+        transform_tool_result(
+            raw,
+            args={"command": "pytest"},
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_transform_tool_result_prefers_host_args_for_explicit_tool_name() -> None:
+    raw = json.dumps(
+        {
+            "args": {"command": "pytest"},
+            "stdout": numbered("exact", 100),
+        }
+    )
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="terminal",
+            args={"command": "cat important.txt"},
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_transform_tool_result_ignores_embedded_args_when_explicit_host_args_empty() -> None:
+    raw = json.dumps(
+        {
+            "args": {"command": "pytest"},
+            "stdout": numbered("line", 100),
+        }
+    )
+
+    for kwargs in (
+        {"args": {}},
+        {"args": {"command": ""}},
+        {"arguments": {"argv": []}},
+    ):
+        transformed = transform_tool_result(
+            raw,
+            tool_name="terminal",
+            noisegate_max_chars=120,
+            **kwargs,
+        )
+
+        payload = parse_hook_result(transformed)
+        metadata = payload["noisegate"]["fields"]["stdout"]
+        assert metadata["command_class"] == "generic"
+        assert metadata["reducer"] == "generic_head_tail"
+
+
+def test_transform_tool_result_prefers_args_over_top_level_command() -> None:
+    raw = json.dumps(
+        {
+            "command": "pytest",
+            "args": {"command": "cat important.txt"},
+            "stdout": numbered("exact", 100),
+        }
+    )
+
+    assert transform_tool_result(raw, tool_name="terminal", noisegate_max_chars=120) is None
+
+
+def test_transform_tool_result_infers_terminal_payload_without_tool_name() -> None:
+    raw = json.dumps({"stdout": numbered("line", 100), "returncode": 1})
+
+    transformed = transform_tool_result(raw, noisegate_max_chars=120)
+
+    payload = parse_hook_result(transformed)
+    stdout = payload["stdout"]
+    assert isinstance(stdout, str)
+    assert "[noisegate: omitted" in stdout
+    assert "[noisegate: exit_code=1]" in stdout
+    assert payload["noisegate"]["fields"]["stdout"]["exit_code"] == 1
+
+
+def test_transform_tool_result_infers_terminal_payload_from_args_command() -> None:
+    raw = json.dumps({"stdout": numbered("line", 100)})
+
+    transformed = transform_tool_result(
+        raw,
+        args={"command": "pytest"},
+        noisegate_max_chars=120,
+    )
+
+    payload = parse_hook_result(transformed)
+    stdout = payload["stdout"]
+    assert isinstance(stdout, str)
+    assert "[noisegate: omitted" in stdout
+    assert payload["noisegate"]["fields"]["stdout"]["reducer"] == "pytest"
+
+
+def test_transform_tool_result_keeps_blank_tool_name_non_terminal_payload() -> None:
+    raw = json.dumps({"content": numbered("exact", 100)})
+
+    assert transform_tool_result(raw, noisegate_max_chars=120) is None
+
+
+def test_transform_tool_result_keeps_ambiguous_blank_tool_payloads_exact() -> None:
+    cases = [
+        {"output": numbered("exact", 100), "status": "ok"},
+        {"output": numbered("exact", 100), "status": "failed"},
+        {"stdout": numbered("exact", 100), "command": ""},
+        {"stdout": numbered("exact", 100), "argv": []},
+        {"stdout": numbered("exact", 100), "argv": [""]},
+        {"stdout": numbered("exact", 100), "argv": ["", "file.txt"]},
+        {"stdout": numbered("exact", 100), "exit": True},
+        {"stdout": numbered("exact", 100), "returncode": False},
+    ]
+
+    for payload in cases:
+        assert transform_tool_result(json.dumps(payload), noisegate_max_chars=120) is None
+
+
 def test_terminal_status_failed_is_treated_as_error_exit_code() -> None:
     raw = json.dumps({"status": "failed", "output": numbered("line", 100)})
 
