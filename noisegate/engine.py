@@ -1352,7 +1352,7 @@ def _has_unquoted_shell_operator(command: str) -> bool:
         if char in {"'", '"'}:
             quote = char
             continue
-        if char in "|;&><`" or (char == "$" and command[index + 1 : index + 2] == "("):
+        if char in "|;&><`\n\r" or (char == "$" and command[index + 1 : index + 2] == "("):
             return True
     return False
 

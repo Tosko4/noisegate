@@ -295,6 +295,8 @@ def test_shell_substitution_file_display_commands_are_not_file_read() -> None:
         "cat `pytest -q`",
         "cat \"$(pytest -q)\"",
         "cat 'file\\'; pytest -q",
+        "nl -ba src/foo.py\npytest -q",
+        "nl -ba src/foo.py\r\npytest -q",
     ):
         assert engine.classify_command(command, raw) != "file_read", command
 
