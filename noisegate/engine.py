@@ -43,6 +43,16 @@ PROTECTED_TOOL_NAMES = frozenset(
 )
 PROTECTED_TOOL_PREFIXES = ("hindsight_", "lcm_", "mcp_", "mcp__")
 COMPACTABLE_TOOL_NAMES = frozenset({"terminal", "process", "read_terminal", "browser_console"})
+LCM_EXTERNALIZED_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\[(?:Externalized|GC'd externalized) (?:tool output|payload):"
+        r"[^\]\n]*\bref=[^;\]\s]+[^\]\n]*\]",
+        r"\[Externalized LCM ingest payload:[^\]\n]*\bref=[^;\]\s]+[^\]\n]*\]",
+        r'"externalized_ref"\s*:\s*"[^"\n]+"',
+        r"\bexternalized_ref\b\s*[:=]\s*[^,\s}\]]+",
+    )
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,12 +243,9 @@ def _reduce_text(
         return _unchanged(text, "below_threshold", command_class, reason="below_threshold")
 
     reducer_name, compacted = _apply_reducer(text, command_class, options, exit_code)
-    if command_class in {"pytest", "unittest"}:
-        preserve_patterns = CRITICAL_PATTERNS
-    elif command_class == "node":
-        preserve_patterns = NODE_PATTERNS
-    else:
-        preserve_patterns = None
+    if compacted is not None and _dropped_lcm_externalized_match(before=text, after=compacted):
+        compacted = None
+    preserve_patterns = _preserve_patterns_for_output(command_class, text)
     if compacted is not None:
         compacted = _enforce_final_budget(
             compacted,
@@ -393,6 +400,24 @@ def _is_compactable_tool_name(tool_name: str | None) -> bool:
     return tool_name in COMPACTABLE_TOOL_NAMES
 
 
+def _lcm_externalized_patterns_for(text: str) -> tuple[re.Pattern[str], ...]:
+    if _first_pattern_match(text, LCM_EXTERNALIZED_PATTERNS):
+        return LCM_EXTERNALIZED_PATTERNS
+    return ()
+
+
+def _preserve_patterns_for_output(
+    command_class: str,
+    text: str,
+) -> tuple[re.Pattern[str], ...] | None:
+    lcm_patterns = _lcm_externalized_patterns_for(text)
+    if command_class in {"pytest", "unittest"}:
+        return CRITICAL_PATTERNS + lcm_patterns
+    if command_class == "node":
+        return NODE_PATTERNS + lcm_patterns
+    return lcm_patterns or None
+
+
 def _apply_reducer(
     text: str,
     command_class: str,
@@ -400,20 +425,27 @@ def _apply_reducer(
     exit_code: int | None,
 ) -> tuple[str, str | None]:
     del exit_code
+    lcm_patterns = _lcm_externalized_patterns_for(text)
     if options.mode == "head_tail":
+        if lcm_patterns:
+            return "generic_head_tail", _important_lines(text, options, lcm_patterns)
         return "generic_head_tail", _head_tail(text, options)
     if command_class in {"pytest", "unittest"}:
-        return command_class, _important_lines(text, options, TEST_PATTERNS)
+        return command_class, _important_lines(text, options, TEST_PATTERNS + lcm_patterns)
     if command_class == "node":
-        return "node", _important_lines(text, options, NODE_PATTERNS)
+        return "node", _important_lines(text, options, NODE_PATTERNS + lcm_patterns)
     if command_class == "docker_build":
-        return "docker_build", _important_lines(text, options, DOCKER_PATTERNS)
+        return "docker_build", _important_lines(text, options, DOCKER_PATTERNS + lcm_patterns)
     if command_class == "git_status":
-        return "git_status", _important_lines(text, options, GIT_STATUS_PATTERNS)
+        return "git_status", _important_lines(text, options, GIT_STATUS_PATTERNS + lcm_patterns)
     if command_class == "git_log":
         return "git_log", _head_tail(text, replace(options, head_lines=40, tail_lines=8))
     if command_class == "search":
+        if lcm_patterns:
+            return "search", _important_lines(text, options, lcm_patterns)
         return "search", _head_tail(text, options)
+    if lcm_patterns:
+        return "generic_head_tail", _important_lines(text, options, lcm_patterns)
     return "generic_head_tail", _head_tail(text, options)
 
 
@@ -495,15 +527,11 @@ def _important_lines(
             important.append(index)
 
     if len(important) > options.max_important_lines:
-        critical = [
-            index
-            for index in important
-            if any(pattern.search(lines[index]) for pattern in CRITICAL_PATTERNS)
-        ]
-        if critical:
+        priority = _important_priority_indices(lines, important)
+        if priority:
             important = _trim_indices_around_priority(
                 important,
-                critical,
+                priority,
                 options.max_important_lines,
             )
         else:
@@ -552,6 +580,9 @@ def _preservation_patterns(
     text: str,
     patterns: tuple[re.Pattern[str], ...],
 ) -> tuple[re.Pattern[str], ...]:
+    lcm_patterns = _lcm_externalized_patterns_for(text)
+    if lcm_patterns:
+        return lcm_patterns + tuple(pattern for pattern in patterns if pattern not in lcm_patterns)
     return CRITICAL_PATTERNS if _first_pattern_match(text, CRITICAL_PATTERNS) else patterns
 
 
@@ -562,12 +593,31 @@ def _line_budgeted_important_excerpt(
 ) -> str | None:
     if not important:
         return None
-    priority = [
-        index
-        for index in important
-        if any(pattern.search(lines[index]) for pattern in CRITICAL_PATTERNS)
-    ] or important
+    lcm_priority = _matching_indices(lines, important, LCM_EXTERNALIZED_PATTERNS)
+    critical_priority = _matching_indices(lines, important, CRITICAL_PATTERNS)
+    priority = _important_priority_indices(lines, important)
+    priority = priority or important
     max_context = max(0, options.important_context_lines)
+
+    # Externalized payload refs are recovery handles, not just interesting log
+    # lines. If they appear alongside a failure cluster, keep the refs and at
+    # least one failure anchor together when the line budget allows it. If the
+    # budget is too tight for both, the fallback below prioritizes the refs so
+    # the externalized-payload recovery path stays intact.
+    multi_anchor_priority = lcm_priority + [
+        index for index in critical_priority[:1] if index not in lcm_priority
+    ]
+    if len(multi_anchor_priority) > 1:
+        for context in range(max_context, -1, -1):
+            keep: set[int] = set()
+            for anchor in multi_anchor_priority:
+                start = max(0, anchor - context)
+                end = min(len(lines), anchor + context + 1)
+                keep.update(range(start, end))
+            candidate = _lines_with_markers(lines, sorted(keep))
+            if _line_count(candidate) <= options.max_lines:
+                return candidate
+
     for anchor in priority:
         for context in range(max_context, -1, -1):
             start = max(0, anchor - context)
@@ -576,6 +626,24 @@ def _line_budgeted_important_excerpt(
             if _line_count(candidate) <= options.max_lines:
                 return candidate
     return None
+
+
+def _important_priority_indices(lines: list[str], indices: list[int]) -> list[int]:
+    lcm_priority = _matching_indices(lines, indices, LCM_EXTERNALIZED_PATTERNS)
+    critical_priority = _matching_indices(lines, indices, CRITICAL_PATTERNS)
+    return lcm_priority + [index for index in critical_priority if index not in lcm_priority]
+
+
+def _matching_indices(
+    lines: list[str],
+    indices: list[int],
+    patterns: tuple[re.Pattern[str], ...],
+) -> list[int]:
+    return [
+        index
+        for index in indices
+        if any(pattern.search(lines[index]) for pattern in patterns)
+    ]
 
 
 def _trim_indices_around_priority(
@@ -647,6 +715,8 @@ def _enforce_final_budget(
         else:
             line_capped = _head_tail(compacted, options)
         if line_capped is not None and len(line_capped) < len(compacted):
+            if _dropped_lcm_externalized_match(before=compacted, after=line_capped):
+                return None
             compacted = line_capped
     if len(compacted) > options.max_chars:
         if preserve_patterns is not None and _first_pattern_match(compacted, preserve_patterns):
@@ -658,6 +728,8 @@ def _enforce_final_budget(
         else:
             char_capped = _char_head_tail(compacted, options)
         if char_capped is not None and len(char_capped) < len(compacted):
+            if _dropped_lcm_externalized_match(before=compacted, after=char_capped):
+                return None
             compacted = char_capped
     if not _fits_budget(compacted, options):
         return None
@@ -678,6 +750,20 @@ def _char_head_tail_preserving_patterns(
     if line_excerpt is not None:
         return line_excerpt
     return None
+
+
+def _dropped_lcm_externalized_match(*, before: str, after: str) -> bool:
+    return any(match not in after for match in _lcm_externalized_matches(before))
+
+
+def _lcm_externalized_matches(text: str) -> list[str]:
+    matches: list[str] = []
+    for pattern in LCM_EXTERNALIZED_PATTERNS:
+        for match in pattern.finditer(text):
+            value = match.group(0)
+            if value not in matches:
+                matches.append(value)
+    return matches
 
 
 def _match_centered_excerpt(

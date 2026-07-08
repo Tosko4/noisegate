@@ -67,6 +67,12 @@ And it refuses to touch things that should stay exact:
 
 That last bit matters. A compactor that damages retrieved context is worse than no compactor.
 
+Hermes-LCM stays a separate recovery layer. Noisegate does not depend on it and does not replace it:
+`lcm_*` tool results stay exact, `externalized_ref` metadata is left alone, and compacted
+terminal-style output preserves LCM externalized payload placeholders such as
+`[Externalized tool output: ... ref=...]`. The early terminal hook still disables Noisegate raw
+artifacts, so pre-redaction terminal output is not persisted just because an LCM ref appears.
+
 ## Install or update
 
 Noisegate is distributed as the Python package `noisegate-hermes`. The Hermes plugin must be installed into the same Python environment that runs `hermes`.
@@ -306,6 +312,8 @@ simple direct terminal file-display commands (`cat`, `sed -n`, `head`, `tail`, `
 git diff / unified diffs / V4A patches
 unknown future tools
 ```
+
+`execute_code` is protected even when its printed output looks like compactable test, dependency, package-manager, or log spam. That boundary is deliberate: `execute_code` only returns script stdout, and stdout can be source code, JSON, configs, diffs, copied web excerpts, or other exact context. If a script intentionally wants compaction for a known noisy command, use an explicit command-aware route instead, such as the `terminal` tool, `noisegate wrap -- <command>`, or a `reduce-json` envelope labeled as a noisy command/tool. When in doubt, keep `execute_code` raw.
 
 Bypass controls:
 
