@@ -309,6 +309,107 @@ def test_line_budget_prefers_pytest_exception_summary_over_count_summary() -> No
     assert "1 failed in 0.12s" not in result.text
 
 
+def test_line_budget_prefers_pytest_progress_failure_over_count_summary() -> None:
+    raw = "\n".join(
+        [
+            *[f"tests/test_widget.py::test_ok_{index} PASSED" for index in range(10)],
+            "tests/test_widget.py::test_widget FAILED [100%]",
+            *[f"noise {index}" for index in range(10)],
+            "========================= 1 failed in 0.12s =========================",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            max_important_lines=10,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "tests/test_widget.py::test_widget FAILED" in result.text
+    assert "1 failed in 0.12s" not in result.text
+
+
+def test_char_budget_prefers_real_pytest_failure_over_incidental_exception_log() -> None:
+    raw = "\n".join(
+        [
+            "Exception ignored in: <function _cleanup at 0xabc>",
+            *[f"captured log noise {index} " + ("x" * 50) for index in range(10)],
+            "tests/test_widget.py::test_widget FAILED [100%]",
+            "E       AssertionError: real failure detail",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(max_chars=180, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert "AssertionError: real failure detail" in result.text
+    assert "Exception ignored" not in result.text
+
+
+def test_char_budget_falls_back_to_lower_ranked_pytest_line_that_fits() -> None:
+    raw = "\n".join(
+        [
+            "E       AssertionError: " + ("x" * 200),
+            *[f"noise {index}" for index in range(10)],
+            "tests/test_widget.py::test_widget FAILED",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(max_chars=120, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 120
+    assert "tests/test_widget.py::test_widget FAILED" in result.text
+
+
+def test_line_budget_prefers_pytest_pass_summary_over_progress_line() -> None:
+    raw = "\n".join(
+        [
+            *[
+                f"tests/test_widget.py::test_ok_{index} PASSED [ {index}%]"
+                for index in range(20)
+            ],
+            "========================= 40 passed in 1.23s =========================",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            max_important_lines=10,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "40 passed in 1.23s" in result.text
+    assert "tests/test_widget.py::test_ok_0 PASSED" not in result.text
+
+
 def test_first_pattern_match_short_circuits_after_first_matching_pattern() -> None:
     match = _first_pattern_match("FIRST then SECOND", (re.compile("FIRST"), re.compile("SECOND")))
 
