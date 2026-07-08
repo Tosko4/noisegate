@@ -67,6 +67,12 @@ And it refuses to touch things that should stay exact:
 
 That last bit matters. A compactor that damages retrieved context is worse than no compactor.
 
+Hermes-LCM stays a separate recovery layer. Noisegate does not depend on it and does not replace it:
+`lcm_*` tool results stay exact, `externalized_ref` metadata is left alone, and compacted
+terminal-style output preserves LCM externalized payload placeholders such as
+`[Externalized tool output: ... ref=...]`. The early terminal hook still disables Noisegate raw
+artifacts, so pre-redaction terminal output is not persisted just because an LCM ref appears.
+
 ## Install or update
 
 Noisegate is distributed as the Python package `noisegate-hermes`. The Hermes plugin must be installed into the same Python environment that runs `hermes`.
