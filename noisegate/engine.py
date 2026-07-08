@@ -395,7 +395,7 @@ TEST_PATTERNS = tuple(
 CRITICAL_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
-        r"assertionerror|traceback|exception",
+        r"assertionerror|traceback|exceptiongroup|baseexception|\bexception\b\s*:",
         r"^\s*E\s+",
         r"\d+\s+failed",
         r"^(failed|error)\s+",
@@ -550,7 +550,11 @@ def _line_budgeted_important_excerpt(
                     options,
                     _preservation_patterns(candidate, patterns),
                 )
-                if char_capped is not None and _fits_budget(char_capped, options):
+                if (
+                    char_capped is not None
+                    and _fits_budget(char_capped, options)
+                    and _contains_full_line(char_capped, lines[anchor])
+                ):
                     return char_capped
                 continue
     return None
@@ -564,7 +568,7 @@ def _failure_detail_rank(line: str) -> int:
         return 0
     if re.search(r"\bFAILED\b.*tests?/.*::|tests?/.*::.*\bFAILED\b", line, re.IGNORECASE):
         return 1
-    if re.search(r"^(failed|error)\s+", line, re.IGNORECASE):
+    if re.search(r"^failed\s+|^error\s+tests?/.*::", line, re.IGNORECASE):
         return 1
     if re.search(r"={2,}.*(failures|errors|short test summary)", line, re.IGNORECASE):
         return 2
@@ -584,7 +588,7 @@ def _is_diagnostic_detail_line(line: str) -> bool:
         return False
     return bool(
         re.search(
-            r"\b(assertionerror|[a-z0-9_]*error|exceptiongroup|baseexception)\b(?::|\s|$)"
+            r"\b(assertionerror|[a-z0-9_]*error|exceptiongroup|baseexception)\b(?::|$)"
             r"|\bexception\b\s*:",
             line,
             re.IGNORECASE,
@@ -785,6 +789,11 @@ def _lines_with_surrounding_omission_markers(
     if end_line + 1 < len(lines):
         selected = f"{selected}\n[noisegate: omitted {len(lines) - end_line - 1} lines]"
     return selected
+
+
+def _contains_full_line(text: str, line: str) -> bool:
+    return line in text.splitlines()
+
 
 def _match_centered_slice(
     text: str,

@@ -360,6 +360,32 @@ def test_char_budget_prefers_real_pytest_failure_over_incidental_exception_log()
     assert "Exception ignored" not in result.text
 
 
+def test_recovery_notice_survives_when_incidental_exception_name_is_dropped() -> None:
+    raw = "\n".join(
+        [
+            *[
+                "tests/test_widget.py::test_exception_name PASSED " + ("p" * 20)
+                for _ in range(4)
+            ],
+            "FAILED tests/test_widget.py::test_widget - TypeError: unsupported operand type",
+            *[f"noise {index} " + ("x" * 20) for index in range(6)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(max_chars=170, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 170
+    assert "TypeError: unsupported operand type" in result.text
+    assert "test_exception_name PASSED" not in result.text
+    assert "[noisegate: exit_code=1]" in result.text
+
+
 def test_char_budget_falls_back_to_lower_ranked_pytest_line_that_fits() -> None:
     raw = "\n".join(
         [
@@ -379,6 +405,35 @@ def test_char_budget_falls_back_to_lower_ranked_pytest_line_that_fits() -> None:
     assert result.changed is True
     assert len(result.text) <= 120
     assert "tests/test_widget.py::test_widget FAILED" in result.text
+
+
+def test_char_budget_keeps_trying_anchors_when_capped_context_loses_anchor() -> None:
+    raw = "\n".join(
+        [
+            "E       AssertionError: " + ("x" * 200),
+            "captured ERROR local log recovered successfully",
+            *[f"noise {index}" for index in range(8)],
+            "tests/test_widget.py::test_widget FAILED [100%]",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=135,
+            max_lines=80,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=2,
+        ),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 135
+    assert "tests/test_widget.py::test_widget FAILED" in result.text
+    assert "captured ERROR local log" not in result.text
 
 
 def test_line_budget_falls_back_to_lower_ranked_pytest_line_that_fits() -> None:
@@ -409,6 +464,28 @@ def test_line_budget_falls_back_to_lower_ranked_pytest_line_that_fits() -> None:
     assert len(result.text) <= 120
     assert len(result.text.splitlines()) <= 3
     assert "tests/test_widget.py::test_widget FAILED" in result.text
+
+
+def test_char_budget_prefers_pytest_failure_over_benign_error_log() -> None:
+    raw = "\n".join(
+        [
+            "ERROR monitoring task recovered successfully",
+            *[f"captured log noise {index} " + ("x" * 20) for index in range(10)],
+            "tests/test_widget.py::test_widget FAILED [100%]",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(max_chars=120, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 120
+    assert "tests/test_widget.py::test_widget FAILED" in result.text
+    assert "ERROR monitoring task recovered successfully" not in result.text
 
 
 def test_line_budget_prefers_traceback_over_failed_progress_line() -> None:
