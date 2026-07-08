@@ -234,7 +234,7 @@ def _reduce_text(
     if command_class in {"pytest", "unittest"}:
         preserve_patterns = CRITICAL_PATTERNS
     elif command_class == "node":
-        preserve_patterns = NODE_PATTERNS
+        preserve_patterns = NODE_PRESERVATION_PATTERNS
     else:
         preserve_patterns = None
     if compacted is not None:
@@ -367,7 +367,7 @@ def _apply_reducer(
     if command_class in {"pytest", "unittest"}:
         return command_class, _important_lines(text, options, TEST_PATTERNS)
     if command_class == "node":
-        return "node", _important_lines(text, options, NODE_PATTERNS)
+        return "node", _important_lines(text, options, NODE_PRESERVATION_PATTERNS)
     if command_class == "docker_build":
         return "docker_build", _important_lines(text, options, DOCKER_PATTERNS)
     if command_class == "git_status":
@@ -396,6 +396,7 @@ CRITICAL_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
         r"assertionerror|traceback|exceptiongroup|baseexception|\bexception\b\s*:",
+        r"\bexception\s+in\b",
         r"^\s*E\s+",
         r"\d+\s+failed",
         r"^(failed|error)\s+",
@@ -413,6 +414,8 @@ NODE_PATTERNS = tuple(
         r"tests?.*(failed|passed)",
     )
 )
+
+NODE_PRESERVATION_PATTERNS = (*NODE_PATTERNS, *CRITICAL_PATTERNS)
 
 DOCKER_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
@@ -514,7 +517,9 @@ def _preservation_patterns(
     text: str,
     patterns: tuple[re.Pattern[str], ...],
 ) -> tuple[re.Pattern[str], ...]:
-    if patterns is NODE_PATTERNS:
+    if patterns in {NODE_PATTERNS, NODE_PRESERVATION_PATTERNS}:
+        if _first_pattern_match(text, CRITICAL_PATTERNS):
+            return NODE_PRESERVATION_PATTERNS
         return patterns
     return CRITICAL_PATTERNS if _first_pattern_match(text, CRITICAL_PATTERNS) else patterns
 
@@ -536,8 +541,11 @@ def _line_budgeted_important_excerpt(
         priority,
         key=lambda index: (_failure_detail_rank(lines[index]), index),
     )
+    best_rank = _failure_detail_rank(lines[priority[0]])
     max_context = max(0, options.important_context_lines)
     for anchor in priority:
+        if _would_hide_better_failure_anchor(best_rank, _failure_detail_rank(lines[anchor])):
+            return None
         for context in range(max_context, -1, -1):
             start = max(0, anchor - context)
             end = min(len(lines), anchor + context + 1)
@@ -564,6 +572,8 @@ def _failure_detail_rank(line: str) -> int:
     """Prefer diagnostic detail over progress/status lines when budgets are tight."""
     if _is_diagnostic_detail_line(line):
         return 0
+    if re.search(r"npm err!|pnpm err!|err_pnpm|elifecycle|yarn.*error", line, re.IGNORECASE):
+        return 0
     if re.search(r"\btraceback\b", line, re.IGNORECASE):
         return 0
     if re.search(r"\bFAILED\b.*tests?/.*::|tests?/.*::.*\bFAILED\b", line, re.IGNORECASE):
@@ -589,7 +599,8 @@ def _is_diagnostic_detail_line(line: str) -> bool:
     return bool(
         re.search(
             r"\b(assertionerror|[a-z0-9_]*error|exceptiongroup|baseexception)\b(?::|$)"
-            r"|\bexception\b\s*:",
+            r"|\bexception\b\s*:"
+            r"|\bexception\s+in\b",
             line,
             re.IGNORECASE,
         )
@@ -697,11 +708,25 @@ def _char_head_tail_preserving_patterns(
     if not matches:
         return _char_head_tail(text, options)
     layout = _line_layout(text)
+    best_rank = min(_rank_for_span_match(match, layout) for match in matches)
     for match in matches:
+        if _would_hide_better_failure_anchor(best_rank, _rank_for_span_match(match, layout)):
+            return None
         line_excerpt = _line_centered_excerpt(text, options, match, layout=layout)
         if line_excerpt is not None:
             return line_excerpt
     return None
+
+
+def _rank_for_span_match(match: _SpanMatch, layout: _LineLayout) -> int:
+    for index, (start, end) in enumerate(layout.offsets):
+        if start <= match.start() <= end:
+            return _failure_detail_rank(layout.lines[index])
+    return 5
+
+
+def _would_hide_better_failure_anchor(best_rank: int, candidate_rank: int) -> bool:
+    return best_rank <= 1 and candidate_rank > 1
 
 
 def _match_centered_excerpt(

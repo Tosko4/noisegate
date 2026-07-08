@@ -546,6 +546,33 @@ def test_line_budget_recognizes_exception_group_as_diagnostic_detail() -> None:
     assert "FAILED tests/test_widget.py::test_widget" not in result.text
 
 
+def test_line_budget_recognizes_exception_in_header_as_diagnostic_detail() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(20)],
+            "Exception in thread worker-1:",
+            *[f"noise {index}" for index in range(20)],
+            "========================= 1 failed in 0.12s =========================",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "Exception in thread worker-1:" in result.text
+    assert "1 failed in 0.12s" not in result.text
+
+
 def test_line_budget_prefers_pytest_pass_summary_over_progress_line() -> None:
     raw = "\n".join(
         [
@@ -1213,6 +1240,27 @@ def test_tight_important_excerpt_does_not_slice_numeric_marker_suffixes() -> Non
     assert result.metadata["reason"] == "no_gain"
 
 
+def test_char_budget_fails_open_instead_of_count_only_pytest_summary() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index} " + ("x" * 20) for index in range(10)],
+            "E       AssertionError: " + ("x" * 90),
+            *[f"noise {index} " + ("y" * 20) for index in range(10)],
+            "========================= 1 failed in 0.12s =========================",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        options=options(max_chars=100, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reason"] == "no_gain"
+
+
 def test_node_reducer_tight_budget_fails_open_when_node_error_line_cannot_fit() -> None:
     raw = "\n".join(
         [
@@ -1227,6 +1275,76 @@ def test_node_reducer_tight_budget_fails_open_when_node_error_line_cannot_fit() 
         command="npm test",
         exit_code=1,
         options=options(max_chars=80, max_lines=10, head_lines=1, tail_lines=1),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reason"] == "no_gain"
+
+
+def test_node_char_budget_preserves_python_exception_over_warning() -> None:
+    raw = "\n".join(
+        [
+            "warning package.json: deprecated dependency",
+            *[f"build noise {index} " + ("x" * 20) for index in range(12)],
+            "Exception: plugin crashed",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="npm test",
+        exit_code=1,
+        options=options(max_chars=120, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 120
+    assert "Exception: plugin crashed" in result.text
+    assert "deprecated dependency" not in result.text
+
+
+def test_node_recovery_notice_budget_preserves_python_exception_line() -> None:
+    raw = "\n".join(
+        [
+            "warning package.json: deprecated dependency",
+            *[f"build noise {index} " + ("x" * 20) for index in range(8)],
+            "Exception: plugin crashed",
+            *[f"tail noise {index} " + ("y" * 20) for index in range(8)],
+        ]
+    )
+
+    for max_chars in (120, 130, 140, 170, 200):
+        result = reduce_text(
+            raw,
+            command="npm test",
+            exit_code=1,
+            options=options(max_chars=max_chars, max_lines=80, head_lines=0, tail_lines=0),
+        )
+
+        if result.changed:
+            assert "Exception: plugin crashed" in result.text
+            assert "[noisegate: exit_code=1]" in result.text
+        else:
+            assert result.text == raw
+            assert result.metadata["reason"] == "no_gain"
+
+
+def test_node_char_budget_fails_open_instead_of_warning_when_error_cannot_fit() -> None:
+    raw = "\n".join(
+        [
+            "WARNING deprecated package",
+            *[f"build noise {index} " + ("x" * 20) for index in range(10)],
+            "Error: central failure detail " + ("z" * 40),
+            *[f"tail noise {index} " + ("y" * 20) for index in range(10)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="npm test",
+        exit_code=1,
+        options=options(max_chars=80, max_lines=80, head_lines=0, tail_lines=0),
     )
 
     assert result.changed is False

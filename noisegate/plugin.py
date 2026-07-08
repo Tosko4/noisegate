@@ -9,7 +9,7 @@ from typing import Any, Protocol, TypeAlias
 from ._version import __version__
 from .engine import (
     CRITICAL_PATTERNS,
-    NODE_PATTERNS,
+    NODE_PRESERVATION_PATTERNS,
     JsonValue,
     NoisegateOptions,
     _append_recovery_notices,
@@ -229,7 +229,7 @@ def _preserve_patterns_for(
     if command_class in {"pytest", "unittest"}:
         return CRITICAL_PATTERNS
     if command_class == "node":
-        return NODE_PATTERNS
+        return NODE_PRESERVATION_PATTERNS
     return None
 
 
