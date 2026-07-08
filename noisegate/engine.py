@@ -396,6 +396,7 @@ CRITICAL_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
         r"assertionerror|traceback|exceptiongroup|baseexception|\bexception\b\s*:",
+        r"\bunhandled\s+exception\b",
         r"\bexception\s+in\b",
         r"^\s*E\s+",
         r"\d+\s+failed",
@@ -600,6 +601,7 @@ def _is_diagnostic_detail_line(line: str) -> bool:
         re.search(
             r"\b(assertionerror|[a-z0-9_]*error|exceptiongroup|baseexception)\b(?::|$)"
             r"|\bexception\b\s*:"
+            r"|\bunhandled\s+exception\b"
             r"|\bexception\s+in\b",
             line,
             re.IGNORECASE,
@@ -719,6 +721,8 @@ def _char_head_tail_preserving_patterns(
 
 
 def _rank_for_span_match(match: _SpanMatch, layout: _LineLayout) -> int:
+    if match.detail_rank is not None:
+        return match.detail_rank
     for index, (start, end) in enumerate(layout.offsets):
         if start <= match.start() <= end:
             return _failure_detail_rank(layout.lines[index])
@@ -757,14 +761,21 @@ def _line_centered_excerpt(
     lines = layout.lines
     offsets = layout.offsets
 
-    match_line = next(
-        (
-            index
-            for index, (start, end) in enumerate(offsets)
-            if start <= match.start() <= end
-        ),
-        None,
-    )
+    match_line = match.line_index if isinstance(match, _SpanMatch) else None
+    if (
+        match_line is None
+        or match_line < 0
+        or match_line >= len(offsets)
+        or not offsets[match_line][0] <= match.start() <= offsets[match_line][1]
+    ):
+        match_line = next(
+            (
+                index
+                for index, (start, end) in enumerate(offsets)
+                if start <= match.start() <= end
+            ),
+            None,
+        )
     if match_line is None:
         return None
 
@@ -850,6 +861,8 @@ def _match_centered_slice(
 class _SpanMatch:
     start_index: int
     end_index: int
+    line_index: int | None = None
+    detail_rank: int | None = None
 
     def start(self) -> int:
         return self.start_index
@@ -976,7 +989,17 @@ def _ranked_pattern_line_matches(
                     offset + match.start(),
                     offset + match.end(),
                 )
-            candidates.append((rank, _SpanMatch(offset + match.start(), offset + match.end())))
+            candidates.append(
+                (
+                    rank,
+                    _SpanMatch(
+                        offset + match.start(),
+                        offset + match.end(),
+                        line_index=line_index,
+                        detail_rank=detail_rank,
+                    ),
+                )
+            )
         offset += len(line)
     return [match for _, match in sorted(candidates, key=lambda candidate: candidate[0])]
 

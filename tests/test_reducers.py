@@ -573,6 +573,40 @@ def test_line_budget_recognizes_exception_in_header_as_diagnostic_detail() -> No
     assert "1 failed in 0.12s" not in result.text
 
 
+def test_line_budget_preserves_unhandled_exception_shutdown_detail() -> None:
+    raw = "\n".join(
+        [
+            *[
+                f"tests/test_widget.py::test_exception_name_{index} PASSED"
+                for index in range(30)
+            ],
+            "Unhandled exception during asyncio.run() shutdown",
+            "RuntimeError: shutdown boom",
+            *[f"noise {index}" for index in range(30)],
+            "========================= 1 failed in 0.12s =========================",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            max_important_lines=10,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "Unhandled exception during asyncio.run() shutdown" in result.text
+    assert "1 failed in 0.12s" not in result.text
+    assert "test_exception_name_" not in result.text
+
+
 def test_line_budget_prefers_pytest_pass_summary_over_progress_line() -> None:
     raw = "\n".join(
         [
@@ -632,6 +666,20 @@ def test_important_line_reducer_handles_high_volume_repeated_failures() -> None:
     assert result.metadata["reducer"] == "pytest"
     assert "FAILED tests/test_load_" in result.text
     assert "[noisegate: omitted" in result.text
+
+
+def test_ranked_pattern_matches_carry_line_rank_metadata() -> None:
+    matches = engine._ranked_pattern_line_matches(
+        "E       AssertionError: dense failure\n",
+        engine.CRITICAL_PATTERNS,
+    )
+
+    assert matches
+    assert matches[0].line_index == 0
+    assert engine._rank_for_span_match(
+        matches[0],
+        engine._LineLayout(lines=[], offsets=[]),
+    ) == 0
 
 
 def test_terminal_file_read_commands_are_protected_by_default() -> None:
