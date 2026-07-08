@@ -63,6 +63,7 @@ And it refuses to touch things that should stay exact:
 - patches and diffs
 - skill documents
 - memory, LCM, Hindsight, MCP, search, and web extraction results
+- LCM/Hindsight/session retrieval CLI output such as `lcm expand`, `lcm grep`, `hindsight recall`, and `session_search`
 - unknown future tools unless explicitly allowed
 
 That last bit matters. A compactor that damages retrieved context is worse than no compactor.
@@ -240,12 +241,13 @@ Install and enable Noisegate for Hermes, then stop dumping terminal walls into c
 Operational rules:
 
 1. Use Noisegate for noisy terminal/tool output, not for exact source material.
-2. Do not compact file reads, patches, diffs, retrieved context, skill docs, memory results, MCP results, or web extraction output.
-3. Do not treat Noisegate as a raw-output archive. Raw artifacts are off by default.
-4. Keep Hermes-LCM optional. Noisegate must work without it.
-5. Do not write raw terminal output into Hindsight.
-6. If compaction fails, preserve the original output.
-7. Before committing, run the quality gate and scan the diff for secrets and personal/private data.
+2. Do not compact file reads, patches, diffs, retrieved context, skill docs, memory results, LCM/Hindsight retrieval results, MCP results, or web extraction output.
+3. It is fine to compact indexing/import/API retry spam from terminal commands, including LCM import/doctor logs. Retrieval evidence and expanded raw payloads stay raw.
+4. Do not treat Noisegate as a raw-output archive. Raw artifacts are off by default.
+5. Keep Hermes-LCM optional. Noisegate must work without it.
+6. Do not write raw terminal output into Hindsight.
+7. If compaction fails, preserve the original output.
+8. Before committing, run the quality gate and scan the diff for secrets and personal/private data.
 
 Safe smoke test for a lane or installation:
 
@@ -306,6 +308,8 @@ git diff / unified diffs
 unknown future tools
 ```
 
+Terminal output from retrieval commands such as `hermes lcm expand`, `hermes lcm grep`, `hindsight recall`, `hindsight reflect`, and `session_search` is also passed through unchanged. Terminal maintenance logs such as embedding batches, vector-index builds, API retry/rate-limit loops, and LCM import/doctor progress can still be compacted.
+
 Bypass controls:
 
 ```text
@@ -326,7 +330,7 @@ NOISEGATE_ARTIFACT_SIZE_CAP=1000000  # max stored raw-output bytes per artifact
 
 `noisegate doctor` reports ignored or fallback environment values, so typos like `NOISEGATE_ARTIFACTS=maybe` do not fail silently.
 
-Hermes calls `transform_terminal_output` before its built-in terminal redaction pass. Noisegate still compacts inline terminal output there, but it disables raw artifact storage on that early hook so pre-redaction output is not persisted.
+Hermes calls `transform_terminal_output` before its built-in terminal redaction pass. Noisegate still compacts inline terminal output there, but it disables raw artifact storage on that early hook so pre-redaction output is not persisted. Artifact planning also refuses obvious secret-bearing output, so accidental API-key/token/password material is not written into the artifact store.
 
 ## Artifacts
 

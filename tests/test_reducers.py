@@ -58,6 +58,106 @@ def test_named_non_noisy_tools_are_protected_by_default() -> None:
         assert result.metadata["reducer"] == "protected_tool"
 
 
+def test_memory_retrieval_tool_outputs_are_protected_by_default() -> None:
+    raw = numbered("retrieval evidence", 100)
+
+    for tool_name in (
+        "lcm_grep",
+        "lcm_load_session",
+        "lcm_describe",
+        "lcm_expand",
+        "lcm_expand_query",
+        "lcm_status",
+        "lcm_doctor",
+        "hindsight_recall",
+        "hindsight_reflect",
+        "hindsight_retain",
+        "memory",
+        "session_search",
+    ):
+        result = reduce_text(raw, tool_name=tool_name, options=options(max_chars=120))
+        assert result.changed is False
+        assert result.text == raw
+        assert result.metadata["reducer"] == "protected_tool"
+
+
+def test_memory_retrieval_cli_outputs_are_protected_by_default() -> None:
+    raw = "\n".join(
+        [
+            "LCM expanded payload store_id=123",
+            *numbered("raw memory evidence", 100).splitlines(),
+            "externalized_ref=payload_abc.json",
+        ]
+    )
+
+    for command in (
+        "hermes lcm grep retrieval",
+        "hermes lcm load-session abc123",
+        "hermes lcm describe 42",
+        "hermes lcm expand --store-id 123",
+        "hermes lcm expand-query retrieval",
+        "lcm_grep retrieval",
+        "lcm_load_session abc123",
+        "lcm_describe 42",
+        "lcm_expand 123",
+        "lcm_expand_query retrieval",
+        "hindsight recall retrieval",
+        "hindsight reflect retrieval",
+        "memory search retrieval",
+        "hermes memory search retrieval",
+        "session_search retrieval",
+    ):
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            options=options(max_chars=160),
+        )
+        assert result.changed is False
+        assert result.text == raw
+        assert result.metadata["reducer"] == "protected_memory_retrieval"
+
+
+def test_indexing_api_and_lcm_maintenance_logs_can_reduce_in_terminal() -> None:
+    cases = (
+        (
+            "python embed.py --batch-size 512",
+            "\n".join(f"embedding batch {index}/50000 ok" for index in range(1, 180)),
+        ),
+        (
+            "python build_vector_index.py",
+            "\n".join(f"vector DB indexing shard={index} committed" for index in range(1, 180)),
+        ),
+        (
+            "python build_hnsw.py",
+            "\n".join(f"HNSW/pgvector build layer {index} complete" for index in range(1, 180)),
+        ),
+        (
+            "python api_worker.py",
+            "\n".join(f"API retry rate-limit backoff attempt={index}" for index in range(1, 180)),
+        ),
+        (
+            "hermes lcm import archive.jsonl",
+            "\n".join(f"indexed {index}/50000 messages" for index in range(1, 180)),
+        ),
+        (
+            "hermes lcm doctor --reindex",
+            "\n".join(f"lcm doctor checked vector row {index}" for index in range(1, 180)),
+        ),
+    )
+
+    for command, raw in cases:
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            options=options(max_chars=220, head_lines=2, tail_lines=2),
+        )
+        assert result.changed is True
+        assert "[noisegate: omitted" in result.text
+        assert result.metadata["reducer"] == "generic_head_tail"
+
+
 def test_named_noisy_tools_can_still_reduce() -> None:
     raw = numbered("noisy output", 100)
 

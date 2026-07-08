@@ -43,6 +43,14 @@ PROTECTED_TOOL_NAMES = frozenset(
 )
 PROTECTED_TOOL_PREFIXES = ("hindsight_", "lcm_", "mcp_", "mcp__")
 COMPACTABLE_TOOL_NAMES = frozenset({"terminal", "process", "read_terminal", "browser_console"})
+SENSITIVE_ARTIFACT_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"(?<![A-Za-z0-9])[\w.-]*(api[_-]?key|secret|token|password|passwd)[\w.-]*\s*[:=]\s*['\"]?[^\s'\";]{6,}",
+        r"\bauthorization\b\s*[:=]\s*['\"]?bearer\s+[^\s'\";]{6,}",
+        r"\bsk-[A-Za-z0-9][A-Za-z0-9_-]{8,}",
+    )
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +228,13 @@ def _reduce_text(
         return _unchanged(text, "protected_tool", command_class, reason="protected_tool")
     if command_class == "git_diff" and options.preserve_diffs:
         return _unchanged(text, "protected_diff", command_class, reason="diff_passthrough")
+    if command_class == "memory_retrieval":
+        return _unchanged(
+            text,
+            "protected_memory_retrieval",
+            command_class,
+            reason="memory_retrieval_passthrough",
+        )
     if command_class == "file_read":
         return _unchanged(
             text,
@@ -360,6 +375,8 @@ def classify_command(command: str | None, text: str) -> str:
         or _looks_like_unified_diff(text)
     ):
         return "git_diff"
+    if _looks_like_memory_retrieval_command(command_l):
+        return "memory_retrieval"
     if _looks_like_file_read_command(command_l):
         return "file_read"
     if "git status" in command_l or ("on branch " in sample_l and "working tree" in sample_l):
@@ -976,6 +993,8 @@ def _unchanged(
 
 
 def _plan_artifact(text: str, options: NoisegateOptions) -> dict[str, JsonValue]:
+    if _contains_sensitive_artifact_material(text):
+        return {"stored": False, "reason": "sensitive_content"}
     data = text.encode("utf-8")
     if len(data) > options.artifact_size_cap:
         return {
@@ -1009,6 +1028,10 @@ def _drop_artifact_if_notice_cannot_fit(
             "reason": "recovery_notice_too_long",
             "size_bytes": artifact.get("size_bytes"),
         }
+
+
+def _contains_sensitive_artifact_material(text: str) -> bool:
+    return any(pattern.search(text) for pattern in SENSITIVE_ARTIFACT_PATTERNS)
 
 
 def _store_artifact(text: str, options: NoisegateOptions) -> dict[str, JsonValue]:
@@ -1209,6 +1232,41 @@ def _looks_like_unified_diff(text: str) -> bool:
         and re.search(r"(^|\n)\+\+\+\s+", text)
         and re.search(r"(^|\n)@@\s+-\d", text)
     )
+
+
+def _looks_like_memory_retrieval_command(command: str) -> bool:
+    if not command:
+        return False
+    direct_tool_names = (
+        "lcm_grep",
+        "lcm_load_session",
+        "lcm_describe",
+        "lcm_expand",
+        "lcm_expand_query",
+        "hindsight_recall",
+        "hindsight_reflect",
+        "session_search",
+    )
+    if any(
+        re.search(rf"(^|[\s;&|]){re.escape(name)}(\s|$)", command)
+        for name in direct_tool_names
+    ):
+        return True
+
+    normalized = command.replace("_", " ").replace("-", " ")
+    if re.search(
+        r"(^|[\s;&|])lcm\s+(grep|load\s+session|describe|expand(\s+query)?)(\s|$)",
+        normalized,
+    ):
+        return True
+    if re.search(r"(^|[\s;&|])hindsight\s+(recall|reflect)(\s|$)", normalized):
+        return True
+    if re.search(
+        r"(^|[\s;&|])memory\s+(search|recall|reflect|get|read|show|list)(\s|$)",
+        normalized,
+    ):
+        return True
+    return bool(re.search(r"(^|[\s;&|])session\s+search(\s|$)", normalized))
 
 
 def _looks_like_file_read_command(command: str) -> bool:

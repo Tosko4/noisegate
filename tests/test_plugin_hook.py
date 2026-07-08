@@ -151,6 +151,53 @@ def test_context_retrieval_tools_are_not_touched() -> None:
         assert transform_tool_result(raw, tool_name=tool_name, noisegate_max_chars=100) is None
 
 
+def test_memory_retrieval_tool_results_are_not_touched() -> None:
+    raw = json.dumps({"content": numbered("retrieval evidence", 120)})
+
+    for tool_name in (
+        "lcm_grep",
+        "lcm_load_session",
+        "lcm_describe",
+        "lcm_expand",
+        "lcm_expand_query",
+        "lcm_status",
+        "lcm_doctor",
+        "hindsight_recall",
+        "hindsight_reflect",
+        "hindsight_retain",
+        "memory",
+        "session_search",
+    ):
+        assert transform_tool_result(raw, tool_name=tool_name, noisegate_max_chars=100) is None
+
+
+def test_terminal_memory_retrieval_cli_output_is_not_touched() -> None:
+    raw = terminal_result(
+        numbered("expanded raw LCM payload", 120),
+        command="hermes lcm expand 123",
+    )
+
+    assert transform_tool_result(raw, tool_name="terminal", noisegate_max_chars=100) is None
+
+
+def test_terminal_indexing_and_retry_logs_are_compacted() -> None:
+    raw = terminal_result(
+        "\n".join(
+            f"indexed {index}/50000 embedding rows; retry backoff ok"
+            for index in range(120)
+        ),
+        command="hermes lcm import archive.jsonl",
+    )
+
+    transformed = transform_tool_result(raw, tool_name="terminal", noisegate_max_chars=220)
+
+    payload = parse_hook_result(transformed)
+    stdout = payload["stdout"]
+    assert isinstance(stdout, str)
+    assert "[noisegate: omitted" in stdout
+    assert payload["noisegate"]["fields"]["stdout"]["reducer"] == "generic_head_tail"
+
+
 def test_unknown_tool_result_is_not_touched() -> None:
     raw = json.dumps({"content": numbered("unknown but useful", 120)})
 
@@ -568,3 +615,32 @@ def test_transform_terminal_output_does_not_store_artifacts_before_redaction(
     assert isinstance(transformed, str)
     assert "[noisegate artifact:" not in transformed
     assert not (tmp_path / "artifacts").exists()
+
+
+def test_transform_tool_result_does_not_persist_sensitive_artifact(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    raw = terminal_result(
+        "\n".join(
+            [
+                *numbered("setup", 40).splitlines(),
+                "API_KEY=REDACTED_TEST_VALUE",
+                "GITHUB_TOKEN=REDACTED_TEST_VALUE",
+                "AWS_SECRET_ACCESS_KEY=REDACTED_TEST_VALUE",
+                *numbered("teardown", 40).splitlines(),
+            ]
+        ),
+        command="python api_worker.py",
+    )
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        noisegate_max_chars=800,
+        noisegate_artifacts=True,
+        noisegate_artifact_dir=str(artifact_dir),
+    )
+
+    payload = parse_hook_result(transformed)
+    metadata = payload["noisegate"]["fields"]["stdout"]
+    assert metadata["artifact"] == {"stored": False, "reason": "sensitive_content"}
+    assert not artifact_dir.exists() or list(artifact_dir.iterdir()) == []
