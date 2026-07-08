@@ -381,6 +381,94 @@ def test_char_budget_falls_back_to_lower_ranked_pytest_line_that_fits() -> None:
     assert "tests/test_widget.py::test_widget FAILED" in result.text
 
 
+def test_line_budget_falls_back_to_lower_ranked_pytest_line_that_fits() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(20)],
+            "E       AssertionError: " + ("x" * 200),
+            *[f"noise {index}" for index in range(20)],
+            "tests/test_widget.py::test_widget FAILED",
+            *[f"teardown {index}" for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=120,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 120
+    assert len(result.text.splitlines()) <= 3
+    assert "tests/test_widget.py::test_widget FAILED" in result.text
+
+
+def test_line_budget_prefers_traceback_over_failed_progress_line() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(20)],
+            "tests/test_widget.py::test_widget FAILED [100%]",
+            *[f"noise {index}" for index in range(20)],
+            "Traceback (most recent call last):",
+            *[f"teardown {index}" for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "Traceback (most recent call last):" in result.text
+    assert "tests/test_widget.py::test_widget FAILED" not in result.text
+
+
+def test_line_budget_recognizes_exception_group_as_diagnostic_detail() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(20)],
+            "ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)",
+            *[f"noise {index}" for index in range(20)],
+            "FAILED tests/test_widget.py::test_widget - ExceptionGroup",
+            *[f"teardown {index}" for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "ExceptionGroup: unhandled errors" in result.text
+    assert "FAILED tests/test_widget.py::test_widget" not in result.text
+
+
 def test_line_budget_prefers_pytest_pass_summary_over_progress_line() -> None:
     raw = "\n".join(
         [
@@ -1096,6 +1184,59 @@ def test_node_line_budget_prefers_error_detail_over_count_summary() -> None:
     assert result.changed is True
     assert "Cannot find module './missing'" in result.text
     assert "3 failed" not in result.text
+
+
+def test_node_char_budget_preserves_pattern_priority_when_ranks_tie() -> None:
+    raw = "\n".join(
+        [
+            "warning package.json: deprecated dependency",
+            *[f"build noise {index}" for index in range(20)],
+            "npm ERR! Cannot find module './missing'",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="npm test",
+        exit_code=1,
+        options=options(max_chars=120, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 120
+    assert "npm ERR! Cannot find module './missing'" in result.text
+    assert "deprecated dependency" not in result.text
+
+
+def test_preserving_pattern_char_path_reuses_line_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = "\n".join(
+        [
+            *("warning " + ("x" * 160) for _ in range(50)),
+            "npm ERR! Cannot find module './missing'",
+        ]
+    )
+    calls = 0
+    original = engine._line_layout
+
+    def counted_line_layout(text: str) -> engine._LineLayout:
+        nonlocal calls
+        calls += 1
+        return original(text)
+
+    monkeypatch.setattr(engine, "_line_layout", counted_line_layout)
+
+    result = reduce_text(
+        raw,
+        command="npm test",
+        exit_code=1,
+        options=options(max_chars=120, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert "npm ERR! Cannot find module './missing'" in result.text
+    assert calls == 1
 
 
 def test_direct_node_command_preserves_error_line() -> None:

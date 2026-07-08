@@ -484,7 +484,7 @@ def _important_lines(
 
     if len(keep) >= len(lines):
         if len(lines) > options.max_lines:
-            budgeted = _line_budgeted_important_excerpt(lines, important, options)
+            budgeted = _line_budgeted_important_excerpt(lines, important, options, patterns)
             if budgeted is not None:
                 return budgeted
             return _head_tail(text, options)
@@ -497,7 +497,7 @@ def _important_lines(
         return _char_head_tail(text, options)
     selected = _lines_with_markers(lines, sorted(keep))
     if _line_count(selected) > options.max_lines:
-        budgeted = _line_budgeted_important_excerpt(lines, important, options)
+        budgeted = _line_budgeted_important_excerpt(lines, important, options, patterns)
         if budgeted is None:
             return None
         selected = budgeted
@@ -521,6 +521,7 @@ def _line_budgeted_important_excerpt(
     lines: list[str],
     important: list[int],
     options: NoisegateOptions,
+    patterns: tuple[re.Pattern[str], ...],
 ) -> str | None:
     if not important:
         return None
@@ -540,7 +541,16 @@ def _line_budgeted_important_excerpt(
             end = min(len(lines), anchor + context + 1)
             candidate = _lines_with_surrounding_omission_markers(lines, start, end - 1)
             if _line_count(candidate) <= options.max_lines:
-                return candidate
+                if len(candidate) <= options.max_chars:
+                    return candidate
+                char_capped = _char_head_tail_preserving_patterns(
+                    candidate,
+                    options,
+                    _preservation_patterns(candidate, patterns),
+                )
+                if char_capped is not None and _fits_budget(char_capped, options):
+                    return char_capped
+                continue
     return None
 
 
@@ -548,12 +558,12 @@ def _failure_detail_rank(line: str) -> int:
     """Prefer diagnostic detail over progress/status lines when budgets are tight."""
     if _is_diagnostic_detail_line(line):
         return 0
+    if re.search(r"\btraceback\b", line, re.IGNORECASE):
+        return 0
     if re.search(r"\bFAILED\b.*tests?/.*::|tests?/.*::.*\bFAILED\b", line, re.IGNORECASE):
         return 1
     if re.search(r"^(failed|error)\s+", line, re.IGNORECASE):
         return 1
-    if re.search(r"\btraceback\b", line, re.IGNORECASE):
-        return 2
     if re.search(r"={2,}.*(failures|errors|short test summary)", line, re.IGNORECASE):
         return 2
     if re.search(r"\d+\s+failed", line, re.IGNORECASE):
@@ -572,7 +582,8 @@ def _is_diagnostic_detail_line(line: str) -> bool:
         return False
     return bool(
         re.search(
-            r"\b(assertionerror|[a-z0-9_]*error)\b(?::|\s|$)|\bexception\b\s*:",
+            r"\b(assertionerror|[a-z0-9_]*error|exceptiongroup|baseexception)\b(?::|\s|$)"
+            r"|\bexception\b\s*:",
             line,
             re.IGNORECASE,
         )
@@ -679,8 +690,9 @@ def _char_head_tail_preserving_patterns(
     matches = _ranked_pattern_line_matches(text, patterns)
     if not matches:
         return _char_head_tail(text, options)
+    layout = _line_layout(text)
     for match in matches:
-        line_excerpt = _line_centered_excerpt(text, options, match)
+        line_excerpt = _line_centered_excerpt(text, options, match, layout=layout)
         if line_excerpt is not None:
             return line_excerpt
     return None
@@ -705,17 +717,14 @@ def _line_centered_excerpt(
     text: str,
     options: NoisegateOptions,
     match: re.Match[str] | _SpanMatch,
+    *,
+    layout: _LineLayout | None = None,
 ) -> str | None:
     if "\n" not in text:
         return None
-    lines = text.splitlines()
-    offsets: list[tuple[int, int]] = []
-    cursor = 0
-    for line in lines:
-        start = cursor
-        end = start + len(line)
-        offsets.append((start, end))
-        cursor = end + 1
+    layout = layout or _line_layout(text)
+    lines = layout.lines
+    offsets = layout.offsets
 
     match_line = next(
         (
@@ -813,6 +822,26 @@ class _SpanMatch:
         return self.end_index
 
 
+@dataclass(frozen=True, slots=True)
+class _LineLayout:
+    lines: list[str]
+    offsets: list[tuple[int, int]]
+
+
+def _line_layout(text: str) -> _LineLayout:
+    lines: list[str] = []
+    offsets: list[tuple[int, int]] = []
+    cursor = 0
+    for raw_line in text.splitlines(keepends=True):
+        line = raw_line.rstrip("\r\n")
+        start = cursor
+        end = start + len(line)
+        lines.append(line)
+        offsets.append((start, end))
+        cursor += len(raw_line)
+    return _LineLayout(lines=lines, offsets=offsets)
+
+
 def _has_partial_noisegate_marker(text: str) -> bool:
     for line in text.splitlines():
         if "[noisegate:" in line and "]" not in line:
@@ -895,8 +924,8 @@ def _ranked_pattern_line_matches(
                 continue
             rank = (
                 _failure_detail_rank(stripped_line),
-                line_index,
                 pattern_index,
+                line_index,
                 offset + match.start(),
                 offset + match.end(),
             )
