@@ -626,6 +626,131 @@ def test_line_budget_preserves_unhandled_exception_shutdown_detail() -> None:
     assert "test_exception_name_" not in result.text
 
 
+def test_line_budget_preserves_task_exception_headers() -> None:
+    headers = (
+        "Task exception was never retrieved",
+        "Exception was never retrieved",
+        "During handling of the above exception, another exception occurred:",
+        "The above exception was the direct cause of the following exception:",
+    )
+
+    for header in headers:
+        raw = "\n".join(
+            [
+                *[f"setup {index}" for index in range(20)],
+                header,
+                *[f"noise {index}" for index in range(20)],
+                "========================= 1 failed in 0.12s =========================",
+            ]
+        )
+
+        result = reduce_text(
+            raw,
+            command="pytest -vv",
+            exit_code=1,
+            options=options(
+                max_chars=10_000,
+                max_lines=3,
+                head_lines=0,
+                tail_lines=0,
+                important_context_lines=0,
+            ),
+        )
+
+        assert result.changed is True
+        assert header in result.text
+        assert "1 failed in 0.12s" not in result.text
+
+
+def test_line_budget_prefers_chained_exception_header_over_adjacent_e_lines() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(20)],
+            "E       ValueError: first failure",
+            "During handling of the above exception, another exception occurred:",
+            "E       RuntimeError: second failure",
+            *[f"noise {index}" for index in range(20)],
+            "========================= 1 failed in 0.12s =========================",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "During handling of the above exception" in result.text
+    assert "1 failed in 0.12s" not in result.text
+
+
+def test_char_budget_prefers_chained_exception_header_over_adjacent_error_lines() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(20)],
+            "ValueError: first failure",
+            "During handling of the above exception, another exception occurred:",
+            "RuntimeError: second failure",
+            *[f"noise {index}" for index in range(20)],
+            "========================= 1 failed in 0.12s =========================",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=150,
+            max_lines=80,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "During handling of the above exception" in result.text
+    assert "ValueError: first failure" not in result.text
+
+
+def test_line_budget_ranks_base_exception_group_as_detail() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(20)],
+            "BaseExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)",
+            *[f"noise {index}" for index in range(20)],
+            "FAILED tests/test_widget.py::test_widget - BaseExceptionGroup",
+            *[f"teardown {index}" for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "BaseExceptionGroup: unhandled errors" in result.text
+    assert "FAILED tests/test_widget.py::test_widget" not in result.text
+
+
 def test_line_budget_prefers_pytest_pass_summary_over_progress_line() -> None:
     raw = "\n".join(
         [

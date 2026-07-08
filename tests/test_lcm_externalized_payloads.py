@@ -170,6 +170,60 @@ def test_tight_mixed_failure_budget_preserves_lcm_ref_or_fails_open() -> None:
     assert transformed is None or TOOL_PLACEHOLDER in transformed
 
 
+def test_node_char_budget_keeps_lcm_ref_ahead_of_diagnostics() -> None:
+    raw = "\n".join(
+        [
+            numbered("setup noise", 12),
+            TOOL_PLACEHOLDER,
+            numbered("middle noise", 12),
+            "npm ERR! Error: Cannot find module './missing'",
+            numbered("tail noise", 12),
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="npm test",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=360,
+        noisegate_max_lines=80,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_important_context_lines=3,
+    )
+
+    assert isinstance(transformed, str)
+    assert TOOL_PLACEHOLDER in transformed
+    assert "Cannot find module './missing'" in transformed
+
+
+def test_node_char_budget_keeps_lcm_ref_when_diagnostic_cannot_fit() -> None:
+    raw = "\n".join(
+        [
+            numbered("setup noise", 12),
+            TOOL_PLACEHOLDER,
+            numbered("middle noise", 12),
+            "npm ERR! Error: " + ("x" * 260),
+            numbered("tail noise", 12),
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="npm test",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=240,
+        noisegate_max_lines=80,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_important_context_lines=3,
+    )
+
+    assert isinstance(transformed, str)
+    assert TOOL_PLACEHOLDER in transformed
+    assert "npm ERR! Error" not in transformed
+
+
 def test_multiple_lcm_refs_are_all_preserved_or_compaction_fails_open() -> None:
     refs = [
         "[Externalized tool output: tool_call_id=call_"
