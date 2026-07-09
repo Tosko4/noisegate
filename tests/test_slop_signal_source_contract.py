@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from noisegate.engine import NoisegateOptions, reduce_text
+from noisegate.engine import NoisegateOptions, classify_command, reduce_text
 from noisegate.plugin import transform_tool_result
 
 
@@ -1162,6 +1162,41 @@ def test_source_search_feeding_xargs_uses_consumer_command_class() -> None:
     assert "FAILED tests/test_demo.py::test_signal" in swallowed_exit.text
 
 
+def test_python_module_pytest_flags_and_xargs_use_pytest_reducer() -> None:
+    successful_pytest_raw = "\n".join(
+        [
+            *[f"tests/test_{index}.py::test_ok PASSED" for index in range(120)],
+            "123 passed in 2.00s",
+        ]
+    )
+
+    for command in (
+        "rg target src && pytest -q",
+        "rg target src; pytest -q",
+        "python -I -m pytest -q",
+        "python -X dev -m pytest -q",
+        "python -W ignore -m pytest -q",
+        "python -Im pytest -q",
+        "python -uIm pytest -q",
+        "python -mpytest -q",
+        "python -u -m pytest",
+        "find tests -name '*.py' | xargs pytest -q",
+        'rg "$(cat pattern.txt)" src | xargs pytest -q',
+        "rg -f <(cat patterns.txt) src | xargs pytest -q",
+    ):
+        result = reduce_text(
+            successful_pytest_raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=opts(max_chars=180, max_lines=3, head_lines=1, tail_lines=1),
+        )
+
+        assert result.changed is True, command
+        assert result.metadata["command_class"] == "pytest", command
+        assert "123 passed in 2.00s" in result.text, command
+
+
 def test_later_chained_compactable_commands_override_exact_passthrough() -> None:
     pytest_raw = "\n".join(
         [
@@ -1177,6 +1212,262 @@ def test_later_chained_compactable_commands_override_exact_passthrough() -> None
             *[f"npm noise after {index}" for index in range(80)],
         ]
     )
+    docker_raw = "\n".join(
+        [
+            *[f"docker build progress before {index}" for index in range(80)],
+            "#1 [internal] load build definition from Dockerfile",
+            "#8 ERROR: failed to solve: process exited",
+            *[f"docker build progress after {index}" for index in range(80)],
+        ]
+    )
+    docker_after_source_hit_raw = "\n".join(
+        [
+            "src/Dockerfile:1:# Dockerfile literal",
+            *[f"docker build progress before {index}" for index in range(80)],
+            "#1 [internal] load build definition from Dockerfile",
+            "#8 ERROR: failed to solve: process exited",
+            *[f"docker build progress after {index}" for index in range(80)],
+        ]
+    )
+    pytest_pass_raw = "\n".join(
+        [
+            *[f"pytest progress before {index}" for index in range(80)],
+            "123 passed in 2.00s",
+            *[f"pytest progress after {index}" for index in range(80)],
+        ]
+    )
+    node_success_raw = "\n".join(
+        [
+            *[f"npm progress before {index}" for index in range(80)],
+            "added 451 packages in 12s",
+            "found 0 vulnerabilities",
+            *[f"npm progress after {index}" for index in range(80)],
+        ]
+    )
+    node_success_after_source_hit_raw = "\n".join(
+        [
+            "src/package.json:1:added 451 packages literal",
+            *[f"npm progress before {index}" for index in range(80)],
+            "added 451 packages in 12s",
+            "found 0 vulnerabilities",
+            *[f"npm progress after {index}" for index in range(80)],
+        ]
+    )
+    node_success_after_path_hits_raw = "\n".join(
+        [
+            *[f"src/file_{index}.py" for index in range(10)],
+            *[f"npm progress before {index}" for index in range(80)],
+            "added 451 packages in 12s",
+            "found 0 vulnerabilities",
+            *[f"npm progress after {index}" for index in range(80)],
+        ]
+    )
+    node_up_to_date_raw = "\n".join(
+        [
+            *[f"npm progress before {index}" for index in range(80)],
+            "up to date in 1s",
+            *[f"npm progress after {index}" for index in range(80)],
+        ]
+    )
+    node_test_raw = "\n".join(
+        [
+            *[f"npm test progress before {index}" for index in range(80)],
+            "1 failed, 123 passed",
+            *[f"npm test progress after {index}" for index in range(80)],
+        ]
+    )
+    node_error_after_path_hits_raw = "\n".join(
+        [
+            *[f"src/file_{index}.js" for index in range(5)],
+            *[f"npm test noise before {index}" for index in range(80)],
+            "Error: boom",
+            "    at Object.<anonymous> (src/app.test.js:3:9)",
+            *[f"npm test noise after {index}" for index in range(80)],
+        ]
+    )
+    node_pass_raw = "\n".join(
+        [
+            *[f"npm test progress before {index}" for index in range(80)],
+            "123 passed in 2.00s",
+            *[f"npm test progress after {index}" for index in range(80)],
+        ]
+    )
+    pip_success_raw = "\n".join(
+        [
+            *[f"pip progress before {index}" for index in range(80)],
+            "Installing collected packages: requests",
+            "Successfully installed requests-2.32.0",
+            *[f"pip progress after {index}" for index in range(80)],
+        ]
+    )
+    pip_error_after_path_hits_raw = "\n".join(
+        [
+            *[f"src/file_{index}.py" for index in range(5)],
+            *[f"pip chatter {index}" for index in range(80)],
+            "ERROR: No matching distribution found for missing-package",
+            *[f"pip after {index}" for index in range(80)],
+        ]
+    )
+    uv_error_after_path_hits_raw = "\n".join(
+        [
+            *[f"src/file_{index}.py" for index in range(5)],
+            *[f"uv chatter {index}" for index in range(80)],
+            "ResolutionImpossible: package versions conflict",
+            *[f"uv after {index}" for index in range(80)],
+        ]
+    )
+    pip_success_after_source_hit_raw = "\n".join(
+        [
+            "src/notes.py:1:Successfully installed literal",
+            *[f"pip progress before {index}" for index in range(80)],
+            "Installing collected packages: requests",
+            "Successfully installed requests-2.32.0",
+            *[f"pip progress after {index}" for index in range(80)],
+        ]
+    )
+    uv_success_raw = "\n".join(
+        [
+            *[f"uv progress before {index}" for index in range(80)],
+            "Resolved 192 packages in 1.2s",
+            *[f"uv progress after {index}" for index in range(80)],
+        ]
+    )
+    uv_success_after_source_hit_raw = "\n".join(
+        [
+            "src/lock.py:1:Resolved 192 packages literal",
+            *[f"uv progress before {index}" for index in range(80)],
+            "Resolved 192 packages in 1.2s",
+            *[f"uv progress after {index}" for index in range(80)],
+        ]
+    )
+    uv_audit_raw = "\n".join(
+        [
+            *[f"uv progress before {index}" for index in range(80)],
+            "Audited 157 packages in 0.13ms",
+            *[f"uv progress after {index}" for index in range(80)],
+        ]
+    )
+    uv_no_solution_after_path_hits_raw = "\n".join(
+        [
+            *[f"src/file_{index}.py" for index in range(5)],
+            *[f"uv progress before {index}" for index in range(80)],
+            "  × No solution found when resolving dependencies:",  # noqa: RUF001
+            "  ╰─▶ requirements are unsatisfiable.",
+            *[f"uv progress after {index}" for index in range(80)],
+        ]
+    )
+    apt_dpkg_error_after_path_hits_raw = "\n".join(
+        [
+            *[f"src/file_{index}.py" for index in range(5)],
+            *[f"apt progress before {index}" for index in range(80)],
+            "dpkg: error processing archive /var/cache/apt/archives/foo.deb (--unpack):",
+            " unable to create file: Permission denied",
+            "Errors were encountered while processing:",
+            " /var/cache/apt/archives/foo.deb",
+            *[f"apt progress after {index}" for index in range(80)],
+        ]
+    )
+    apt_success_after_path_hits_raw = "\n".join(
+        [
+            *[f"src/file_{index}.py" for index in range(5)],
+            *[f"apt progress before {index}" for index in range(80)],
+            "0 upgraded, 1 newly installed, 0 to remove and 0 not upgraded.",
+            "Setting up jq (1.6-2.1) ...",
+            *[f"apt progress after {index}" for index in range(80)],
+        ]
+    )
+    single_path_then_package_anchor_cases = [
+        (
+            "rg --files; npm test",
+            ["src/file.py", "Error: boom", *[f"plain npm line {index}" for index in range(60)]],
+            "node",
+            "Error: boom",
+            1,
+        ),
+        (
+            "rg --files src; npm install",
+            [
+                *[f"src/file_{index}.py" for index in range(20)],
+                *[f"plain npm progress {index}" for index in range(60)],
+                "added 451 packages in 12s",
+                "found 0 vulnerabilities",
+                *[f"plain npm after {index}" for index in range(60)],
+            ],
+            "node",
+            "added 451 packages",
+            0,
+        ),
+        (
+            "rg --files; uv sync",
+            [
+                "src/file.py",
+                "No solution found when resolving dependencies",
+                *[f"plain uv line {index}" for index in range(60)],
+            ],
+            "python_package",
+            "No solution found",
+            1,
+        ),
+        (
+            "rg --files; python -m pip install requests",
+            [
+                "src/file.py",
+                "Successfully installed requests-2.32.0",
+                *[f"plain pip line {index}" for index in range(60)],
+            ],
+            "python_package",
+            "Successfully installed",
+            0,
+        ),
+        (
+            "rg --files; apt install jq",
+            [
+                "src/file.py",
+                "Setting up jq (1.6-2.1) ...",
+                *[f"plain apt line {index}" for index in range(60)],
+            ],
+            "apt",
+            "Setting up jq",
+            0,
+        ),
+        (
+            "rg -l target src && apt-get update",
+            [
+                *[f"src/file_{index}.py" for index in range(5)],
+                "Get:1 http://deb.example stable/main amd64 Packages",
+                "Hit:2 http://deb.example stable InRelease",
+                "Fetched 12.3 MB in 2s (6,123 kB/s)",
+                "Reading package lists... Done",
+                *[f"plain apt update line {index}" for index in range(60)],
+            ],
+            "apt",
+            "Reading package lists",
+            0,
+        ),
+        (
+            "rg --files; apt-get update",
+            [
+                "src/file.py",
+                "Get:1 http://deb.example stable/main amd64 Packages",
+                "Reading package lists... Done",
+                *[f"plain apt update line {index}" for index in range(60)],
+            ],
+            "apt",
+            "Get:1",
+            0,
+        ),
+        (
+            "rg --files; docker build .",
+            [
+                "src/file.py",
+                "failed to solve: process exited",
+                *[f"plain docker line {index}" for index in range(60)],
+            ],
+            "docker_build",
+            "failed to solve",
+            1,
+        ),
+    ]
     realistic_pytest_with_frame = "\n".join(
         [
             "=================================== FAILURES ===================================",
@@ -1187,45 +1478,397 @@ def test_later_chained_compactable_commands_override_exact_passthrough() -> None
             "FAILED tests/test_artifacts.py::test_writes_config - AssertionError",
         ]
     )
+    traceback_only_pytest = "\n".join(
+        [
+            *[f"pytest collection noise before {index}" for index in range(70)],
+            "Traceback (most recent call last):",
+            "src/app.py:3: in <module>",
+            "    import missing_package",
+            "ModuleNotFoundError: No module named 'missing_package'",
+            *[f"pytest collection noise after {index}" for index in range(70)],
+        ]
+    )
+    short_frame_pytest = "\n".join(
+        [
+            *[f"pytest collection noise before {index}" for index in range(70)],
+            "src/app.py:3: in <module>",
+            "    import missing_package",
+            "ModuleNotFoundError: No module named 'missing_package'",
+            *[f"pytest collection noise after {index}" for index in range(70)],
+        ]
+    )
+    readme_prefix_then_npm_raw = "\n".join(
+        [
+            "# Notes",
+            *[f"npm before {index}" for index in range(80)],
+            "added 451 packages in 12s",
+            "found 0 vulnerabilities",
+            *[f"npm after {index}" for index in range(80)],
+        ]
+    )
+    source_prefix_then_pytest_raw = "\n".join(
+        [
+            "def fixture():",
+            "    return 1",
+            *[f"pytest before {index}" for index in range(80)],
+            "FAILED tests/test_demo.py::test_signal",
+            *[f"pytest after {index}" for index in range(80)],
+        ]
+    )
 
-    for command, raw, expected_class, signal in (
+    for command, raw, expected_class, signal, exit_code in (
+        (
+            "cat README && npm install",
+            readme_prefix_then_npm_raw,
+            "node",
+            "added 451 packages",
+            0,
+        ),
+        (
+            "cat file.py && pytest -q",
+            source_prefix_then_pytest_raw,
+            "pytest",
+            "FAILED tests/test_demo.py::test_signal",
+            1,
+        ),
         (
             "rg -l test tests && pytest -q",
             pytest_raw,
             "pytest",
             "FAILED tests/test_demo.py::test_signal",
+            1,
         ),
         (
             "rg -h target src && pytest -q",
             pytest_raw,
             "pytest",
             "FAILED tests/test_demo.py::test_signal",
+            1,
         ),
         (
             "grep -h target src && pytest -q",
             pytest_raw,
             "pytest",
             "FAILED tests/test_demo.py::test_signal",
+            1,
+        ),
+        (
+            "rg target src; python -Im pytest -q",
+            pytest_raw,
+            "pytest",
+            "FAILED tests/test_demo.py::test_signal",
+            1,
+        ),
+        (
+            "rg passed src && pytest -q",
+            pytest_pass_raw,
+            "pytest",
+            "123 passed in 2.00s",
+            0,
+        ),
+        (
+            "rg '123 passed' src; pytest -q",
+            pytest_pass_raw,
+            "pytest",
+            "123 passed in 2.00s",
+            0,
+        ),
+        (
+            "rg FAILED src && pytest -q",
+            pytest_raw,
+            "pytest",
+            "FAILED tests/test_demo.py::test_signal",
+            1,
+        ),
+        (
+            "rg -e NotPresent src || pytest -q",
+            pytest_pass_raw,
+            "pytest",
+            "123 passed in 2.00s",
+            0,
         ),
         (
             "rg target src && pytest -q",
             realistic_pytest_with_frame,
             "pytest",
             "FAILED tests/test_artifacts.py::test_writes_config",
+            1,
         ),
-        ("rg target src; npm install", node_raw, "node", "npm ERR! code ERESOLVE"),
+        (
+            "rg -e NotPresent src/app.py; pytest -q",
+            pytest_raw,
+            "pytest",
+            "FAILED tests/test_demo.py::test_signal",
+            1,
+        ),
+        (
+            "rg -h -e NotPresent src/app.py; pytest -q",
+            realistic_pytest_with_frame,
+            "pytest",
+            "FAILED tests/test_artifacts.py::test_writes_config",
+            1,
+        ),
+        (
+            "rg --no-filename -e NotPresent src/app.py; pytest -q",
+            realistic_pytest_with_frame,
+            "pytest",
+            "FAILED tests/test_artifacts.py::test_writes_config",
+            1,
+        ),
+        (
+            "rg -e NotPresent src/app.py && pytest -q",
+            traceback_only_pytest,
+            "pytest",
+            "ModuleNotFoundError: No module named 'missing_package'",
+            1,
+        ),
+        (
+            "rg -e src/app.py src && pytest -q",
+            traceback_only_pytest,
+            "pytest",
+            "ModuleNotFoundError: No module named 'missing_package'",
+            1,
+        ),
+        (
+            "rg --regexp NotPresent src/app.py; pytest -q",
+            traceback_only_pytest,
+            "pytest",
+            "ModuleNotFoundError: No module named 'missing_package'",
+            1,
+        ),
+        (
+            "rg -h -e NotPresent src/app.py && pytest -q",
+            traceback_only_pytest,
+            "pytest",
+            "ModuleNotFoundError: No module named 'missing_package'",
+            1,
+        ),
+        (
+            "rg --no-filename -e NotPresent src/app.py && pytest -q",
+            traceback_only_pytest,
+            "pytest",
+            "ModuleNotFoundError: No module named 'missing_package'",
+            1,
+        ),
+        (
+            "bash -lc 'rg -e NotPresent src/app.py && pytest -q'",
+            traceback_only_pytest,
+            "pytest",
+            "ModuleNotFoundError: No module named 'missing_package'",
+            1,
+        ),
+        (
+            "grep -e NotPresent src/app.py && pytest -q",
+            traceback_only_pytest,
+            "pytest",
+            "ModuleNotFoundError: No module named 'missing_package'",
+            1,
+        ),
+        (
+            "rg -e NotPresent src/app.py && pytest -q",
+            short_frame_pytest,
+            "pytest",
+            "ModuleNotFoundError: No module named 'missing_package'",
+            1,
+        ),
+        (
+            "rg -f patterns.txt src/app.py && pytest -q",
+            short_frame_pytest,
+            "pytest",
+            "ModuleNotFoundError: No module named 'missing_package'",
+            1,
+        ),
+        (
+            "rg --file=patterns.txt src/app.py && pytest -q",
+            short_frame_pytest,
+            "pytest",
+            "ModuleNotFoundError: No module named 'missing_package'",
+            1,
+        ),
+        ("rg failed src; docker build .", docker_raw, "docker_build", "failed to solve", 1),
+        (
+            "rg 'failed to solve' src; docker build .",
+            docker_raw,
+            "docker_build",
+            "failed to solve",
+            1,
+        ),
+        ("rg Dockerfile src; docker build .", docker_raw, "docker_build", "failed to solve", 1),
+        (
+            "rg Dockerfile src; docker build .",
+            docker_after_source_hit_raw,
+            "docker_build",
+            "failed to solve",
+            1,
+        ),
+        ("rg >(pytest -q) src", pytest_pass_raw, "pytest", "123 passed in 2.00s", 0),
+        ('rg "$(docker build .)" src', docker_raw, "docker_build", "failed to solve", 1),
+        ("rg target src; npm install", node_raw, "node", "npm ERR! code ERESOLVE", 1),
+        ("rg target src; npm install", node_success_raw, "node", "added 451 packages", 0),
+        (
+            "rg 'added 451 packages' src; npm install",
+            node_success_raw,
+            "node",
+            "added 451 packages",
+            0,
+        ),
+        (
+            "rg 'added 451 packages' src; npm install",
+            node_success_after_source_hit_raw,
+            "node",
+            "added 451 packages",
+            0,
+        ),
+        (
+            "rg -l target src; npm install",
+            node_success_after_path_hits_raw,
+            "node",
+            "added 451 packages",
+            0,
+        ),
+        (
+            "rg --files; npm install",
+            node_success_after_path_hits_raw,
+            "node",
+            "added 451 packages",
+            0,
+        ),
+        ("bash -lc 'rg \"$(npm install)\" src'", node_success_raw, "node", "added 451 packages", 0),
+        ('rg "$(npm install)" src', node_success_raw, "node", "added 451 packages", 0),
+        ("rg added src; npm install", node_success_raw, "node", "added 451 packages", 0),
+        ("rg target src; npm install --no-audit", node_up_to_date_raw, "node", "up to date", 0),
+        (
+            "rg 'up to date' src; npm install --no-audit",
+            node_up_to_date_raw,
+            "node",
+            "up to date",
+            0,
+        ),
+        ("rg target src; npm test", node_test_raw, "node", "1 failed, 123 passed", 1),
+        ("rg --files; npm test", node_error_after_path_hits_raw, "node", "Error: boom", 1),
+        ("rg -l target src; npm test", node_error_after_path_hits_raw, "node", "Error: boom", 1),
+        ("rg target src; npm test", node_pass_raw, "node", "123 passed in 2.00s", 0),
+        (
+            "rg target src; python -m pip install requests",
+            pip_success_raw,
+            "python_package",
+            "Successfully installed requests-2.32.0",
+            0,
+        ),
+        (
+            "rg --files; python -m pip install missing-package",
+            pip_error_after_path_hits_raw,
+            "python_package",
+            "No matching distribution found",
+            1,
+        ),
+        (
+            "rg 'Successfully installed' src; python -m pip install requests",
+            pip_success_after_source_hit_raw,
+            "python_package",
+            "Successfully installed requests-2.32.0",
+            0,
+        ),
+        (
+            'rg "$(python -m pip install requests)" src',
+            pip_success_raw,
+            "python_package",
+            "Successfully installed requests-2.32.0",
+            0,
+        ),
+        (
+            "bash -lc 'rg \"$(python -m pip install requests)\" src'",
+            pip_success_raw,
+            "python_package",
+            "Successfully installed requests-2.32.0",
+            0,
+        ),
+        (
+            "rg target src; python -Im pip install requests",
+            pip_success_raw,
+            "python_package",
+            "Successfully installed requests-2.32.0",
+            0,
+        ),
+        (
+            "rg target src; python -W ignore -m pip install requests",
+            pip_success_raw,
+            "python_package",
+            "Successfully installed requests-2.32.0",
+            0,
+        ),
+        (
+            "rg target src; python -X dev -m pip install requests",
+            pip_success_raw,
+            "python_package",
+            "Successfully installed requests-2.32.0",
+            0,
+        ),
+        (
+            "rg installed src; python -m pip install requests",
+            pip_success_raw,
+            "python_package",
+            "Successfully installed requests-2.32.0",
+            0,
+        ),
+        ("rg target src; uv sync", uv_success_raw, "python_package", "Resolved 192 packages", 0),
+        ("rg resolved src; uv sync", uv_success_raw, "python_package", "Resolved 192 packages", 0),
+        (
+            "rg resolved src; uv sync",
+            uv_success_after_source_hit_raw,
+            "python_package",
+            "Resolved 192 packages",
+            0,
+        ),
+        ("rg target src; uv sync", uv_audit_raw, "python_package", "Audited 157 packages", 0),
+        (
+            "rg --files; uv sync",
+            uv_error_after_path_hits_raw,
+            "python_package",
+            "ResolutionImpossible",
+            1,
+        ),
+        (
+            "rg --files; uv sync",
+            uv_no_solution_after_path_hits_raw,
+            "python_package",
+            "No solution found",
+            1,
+        ),
+        ("rg audited src; uv sync", uv_audit_raw, "python_package", "Audited 157 packages", 0),
+        (
+            "rg --files; apt install foo",
+            apt_dpkg_error_after_path_hits_raw,
+            "apt",
+            "dpkg: error",
+            1,
+        ),
+        (
+            "rg --files; apt install jq",
+            apt_success_after_path_hits_raw,
+            "apt",
+            "Setting up jq",
+            0,
+        ),
+        *(
+            (command, "\n".join(lines), expected_class, signal, exit_code)
+            for command, lines, expected_class, signal, exit_code in (
+                single_path_then_package_anchor_cases
+            )
+        ),
         (
             "bash -lc 'rg -l test tests && pytest -q'",
             pytest_raw,
             "pytest",
             "FAILED tests/test_demo.py::test_signal",
+            1,
         ),
     ):
         result = reduce_text(
             raw,
             command=command,
             tool_name="terminal",
-            exit_code=1,
+            exit_code=exit_code,
             options=opts(max_chars=500, max_lines=10),
         )
 
@@ -1256,6 +1899,34 @@ def test_short_circuit_semantics_do_not_override_exact_reads_blindly() -> None:
     assert successful_cat.text == raw_source
     assert successful_cat.metadata["command_class"] == "file_read"
 
+    successful_extensionless_cat = reduce_text(
+        "\n".join(
+            [
+                "Release notes",
+                "123 passed in 2.00s historical note",
+                *[f"plain prose line {index}" for index in range(100)],
+            ]
+        ),
+        command="cat README || pytest -q",
+        tool_name="terminal",
+        exit_code=0,
+        options=opts(max_chars=120, max_lines=5, head_lines=1, tail_lines=1),
+    )
+
+    assert successful_extensionless_cat.changed is False
+    assert successful_extensionless_cat.metadata["command_class"] == "file_read"
+
+    successful_extensionless_cat_then_pytest = reduce_text(
+        successful_extensionless_cat.text,
+        command="cat README && pytest -q",
+        tool_name="terminal",
+        exit_code=0,
+        options=opts(max_chars=120, max_lines=5, head_lines=1, tail_lines=1),
+    )
+
+    assert successful_extensionless_cat_then_pytest.changed is False
+    assert successful_extensionless_cat_then_pytest.metadata["command_class"] == "file_read"
+
     source_with_test_words = "\n".join(
         [
             "FAILED tests/test_demo.py::test_signal literal in source",
@@ -1269,13 +1940,6 @@ def test_short_circuit_semantics_do_not_override_exact_reads_blindly() -> None:
             "npm ERR! code ERESOLVE literal in fixture",
             "FAILED tests/test_demo.py::test_signal literal in fixture",
             *[f"literal fixture prose line {index:03d} ERROR failed" for index in range(80)],
-        ]
-    )
-    readme_package_literal = "\n".join(
-        [
-            "# Notes",
-            "ERROR: No matching distribution found for missing-package",
-            *[f"literal prose failed line {index}" for index in range(100)],
         ]
     )
     readme_pytest_literal = "\n".join(
@@ -1294,14 +1958,11 @@ def test_short_circuit_semantics_do_not_override_exact_reads_blindly() -> None:
         ("cat file.py && pytest -q", source_with_test_words, 0),
         ("cat file.py && pytest -q > pytest.log", source_with_test_words, 1),
         ("cat file.py; uv sync > uv.log", source_with_test_words, 1),
-        ("cat README.md && uv sync", readme_package_literal, 1),
+        ("cat README.md || pytest -q", readme_pytest_literal, 0),
         ("pytest -q && cat README.md", readme_pytest_literal, None),
         ("bash -lc 'cat file.py && pytest -q > pytest.log'", source_with_test_words, 1),
-        ("cat fixture.txt && pytest -q", plain_text_fixture_with_failure_words, 1),
         ("cat fixture.txt && pytest -q > pytest.log", plain_text_fixture_with_failure_words, 1),
-        ("cat fixture.txt; pytest -q", plain_text_fixture_with_failure_words, 1),
         ("pytest -q && cat fixture.txt", plain_text_fixture_with_failure_words, None),
-        ("bash -lc 'cat fixture.txt && pytest -q'", plain_text_fixture_with_failure_words, 1),
         ("pytest -q || cat fixture.txt", plain_text_fixture_with_failure_words, 0),
     ):
         literal_exact = reduce_text(
@@ -1315,6 +1976,130 @@ def test_short_circuit_semantics_do_not_override_exact_reads_blindly() -> None:
         assert literal_exact.changed is False, command
         assert literal_exact.text == raw, command
         assert literal_exact.metadata["command_class"] == "file_read", command
+
+    hidden_source_search_literal = "\n".join(
+        [
+            "123 passed in 2.00s literal historical note",
+            *[f"literal source prose line {index}" for index in range(100)],
+        ]
+    )
+    hidden_source_search_or_pytest = reduce_text(
+        hidden_source_search_literal,
+        command='rg -h "123 passed" notes.md || pytest -q',
+        tool_name="terminal",
+        exit_code=0,
+        options=opts(max_chars=400),
+    )
+
+    assert hidden_source_search_or_pytest.changed is True
+    assert hidden_source_search_or_pytest.metadata["command_class"] == "pytest"
+    assert "123 passed in 2.00s" in hidden_source_search_or_pytest.text
+
+    filename_source_search_or_pytest = reduce_text(
+        "\n".join(
+            f"src/file_{index}.py:{index}:123 passed in fixture docs"
+            for index in range(80)
+        ),
+        command="rg '123 passed' src || pytest -q",
+        tool_name="terminal",
+        exit_code=0,
+        options=opts(max_chars=400),
+    )
+
+    assert filename_source_search_or_pytest.changed is False
+    assert filename_source_search_or_pytest.metadata["command_class"] == "source_search"
+
+    failed_cat_then_npm = reduce_text(
+        "\n".join(
+            [
+                "cat: MISSING: No such file or directory",
+                *[f"npm progress before {index}" for index in range(80)],
+                "added 451 packages in 12s",
+                "found 0 vulnerabilities",
+                *[f"npm progress after {index}" for index in range(80)],
+            ]
+        ),
+        command="cat MISSING || npm install",
+        tool_name="terminal",
+        exit_code=0,
+        options=opts(max_chars=500, max_lines=10),
+    )
+
+    assert failed_cat_then_npm.changed is True
+    assert failed_cat_then_npm.metadata["command_class"] == "node"
+    assert "added 451 packages" in failed_cat_then_npm.text
+
+    failed_bat_then_npm = reduce_text(
+        "\n".join(
+            [
+                "bat: missing.txt: No such file or directory",
+                *[f"npm progress before {index}" for index in range(80)],
+                "added 451 packages in 12s",
+                "found 0 vulnerabilities",
+                *[f"npm progress after {index}" for index in range(80)],
+            ]
+        ),
+        command="bat missing.txt || npm install",
+        tool_name="terminal",
+        exit_code=0,
+        options=opts(max_chars=500, max_lines=10),
+    )
+
+    assert failed_bat_then_npm.changed is True
+    assert failed_bat_then_npm.metadata["command_class"] == "node"
+    assert "added 451 packages" in failed_bat_then_npm.text
+
+    failed_less_readme_then_npm = reduce_text(
+        "\n".join(
+            [
+                "README: No such file or directory",
+                *[f"npm progress before {index}" for index in range(80)],
+                "added 451 packages in 12s",
+                "found 0 vulnerabilities",
+                *[f"npm progress after {index}" for index in range(80)],
+            ]
+        ),
+        command="less README || npm install",
+        tool_name="terminal",
+        exit_code=0,
+        options=opts(max_chars=500, max_lines=10),
+    )
+
+    assert failed_less_readme_then_npm.changed is True
+    assert failed_less_readme_then_npm.metadata["command_class"] == "node"
+    assert "added 451 packages" in failed_less_readme_then_npm.text
+
+    for command, raw in (
+        ("cat missing.py || npm test", "cat: missing.py: No such file or directory"),
+        ("bat missing.txt || npm install", "bat: missing.txt: No such file or directory"),
+        ("less missing.txt || npm install", "missing.txt: No such file or directory"),
+        ("less README || npm install", "README: No such file or directory"),
+        (
+            "more missing.txt || npm install",
+            "more: cannot open missing.txt: No such file or directory",
+        ),
+    ):
+        assert classify_command(command, raw, exit_code=1) != "file_read", command
+
+    failed_cat_then_npm_test = reduce_text(
+        "\n".join(
+            [
+                "cat: missing.py: No such file or directory",
+                *[f"npm test noise before {index}" for index in range(80)],
+                "Error: boom",
+                "    at Object.<anonymous> (src/app.test.js:3:9)",
+                *[f"npm test noise after {index}" for index in range(80)],
+            ]
+        ),
+        command="cat missing.py || npm test",
+        tool_name="terminal",
+        exit_code=1,
+        options=opts(max_chars=500, max_lines=10),
+    )
+
+    assert failed_cat_then_npm_test.changed is True
+    assert failed_cat_then_npm_test.metadata["command_class"] == "node"
+    assert "Error: boom" in failed_cat_then_npm_test.text
 
     failed_pytest = reduce_text(
         pytest_raw,
@@ -1519,6 +2304,43 @@ def test_short_circuit_semantics_do_not_override_exact_reads_blindly() -> None:
     assert exact_search_then_package_command.text == structured_search_with_literal_error
     assert exact_search_then_package_command.metadata["command_class"] == "source_search"
 
+    hidden_heading_search_with_literal_error = "\n".join(
+        [
+            "src/app.py",
+            *[f"ERROR literal source line {index}" for index in range(80)],
+        ]
+    )
+    exact_hidden_heading_search = reduce_text(
+        hidden_heading_search_with_literal_error,
+        command="rg --heading --no-line-number ERROR src && uv sync",
+        tool_name="terminal",
+        exit_code=1,
+        options=opts(max_chars=400),
+    )
+
+    assert exact_hidden_heading_search.changed is False
+    assert exact_hidden_heading_search.text == hidden_heading_search_with_literal_error
+    assert exact_hidden_heading_search.metadata["command_class"] == "source_search"
+
+    hidden_context_search_with_literal_error = "\n".join(
+        [
+            "ERROR literal source line 1",
+            *[f"plain source context line {index}" for index in range(80)],
+            "ERROR literal source line 2",
+        ]
+    )
+    exact_hidden_context_search = reduce_text(
+        hidden_context_search_with_literal_error,
+        command="rg -h -C1 ERROR src && uv sync",
+        tool_name="terminal",
+        exit_code=1,
+        options=opts(max_chars=400),
+    )
+
+    assert exact_hidden_context_search.changed is False
+    assert exact_hidden_context_search.text == hidden_context_search_with_literal_error
+    assert exact_hidden_context_search.metadata["command_class"] == "source_search"
+
     single_file_search_without_filename = "\n".join(
         [
             "Traceback (most recent call last):",
@@ -1533,6 +2355,10 @@ def test_short_circuit_semantics_do_not_override_exact_reads_blindly() -> None:
         "rg -i Traceback src/app.py && pytest -q",
         "rg -e Traceback src/app.py && pytest -q",
         "rg --regexp Traceback src/app.py && pytest -q",
+        "rg -e NotPresent -e Traceback src/app.py && pytest -q",
+        "rg --sort-files Traceback src/app.py && pytest -q",
+        "rg --ignore-file .ignore Traceback src/app.py && pytest -q",
+        "rg --pre-glob '*.py' Traceback src/app.py && pytest -q",
         "grep -e Traceback src/app.py && pytest -q",
         "grep -eTraceback src/app.py && pytest -q",
         "rg --glob=*.py Traceback src/app.py && pytest -q",
@@ -1590,6 +2416,53 @@ def test_exact_pipeline_consumers_do_not_infer_node_from_literal_source_output()
         assert result.metadata["command_class"] == expected_class, command
 
 
+def test_unsafe_search_substitutions_and_null_input_generators_are_compacted() -> None:
+    pytest_raw = "\n".join(
+        [
+            *[f"pytest noise before {index}" for index in range(80)],
+            "FAILED tests/test_demo.py::test_signal",
+            *[f"pytest noise after {index}" for index in range(80)],
+        ]
+    )
+    generated_json = "\n".join(str(index) for index in range(1000))
+
+    for command in (
+        'rg "$(pytest -q)" src',
+        "rg $(pytest -q) src",
+        'rg "prefix$(pytest -q)" src',
+        "true & rg prefix$(pytest -q) src",
+        'true & rg "prefix$(pytest -q)" src',
+        'rg "prefix$(tail -f log & pytest -q)" src',
+        "bash -lc 'rg \"$(pytest -q)\" src'",
+        "rg `pytest -q` src",
+        'echo heading && cat "$(pytest -q)"',
+        'rg "$(echo $(pytest -q))" src',
+    ):
+        search_with_command_substitution = reduce_text(
+            pytest_raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=opts(max_chars=500, max_lines=10),
+        )
+
+        assert search_with_command_substitution.changed is True, command
+        assert search_with_command_substitution.metadata["command_class"] == "pytest", command
+        assert "FAILED tests/test_demo.py::test_signal" in search_with_command_substitution.text
+
+    null_input_jq = reduce_text(
+        generated_json,
+        command="jq -n 'range(0;1000)'",
+        tool_name="terminal",
+        exit_code=0,
+        options=opts(max_chars=120, max_lines=8, head_lines=1, tail_lines=1),
+    )
+
+    assert null_input_jq.changed is True
+    assert null_input_jq.metadata["command_class"] == "generic"
+    assert "[noisegate: omitted" in null_input_jq.text
+
+
 def test_source_and_exact_terminal_commands_stay_byte_for_byte_unchanged() -> None:
     raw_source = "\n".join(f"def function_{index}(): return {index}" for index in range(160))
     diff = "\n".join(
@@ -1606,6 +2479,15 @@ def test_source_and_exact_terminal_commands_stay_byte_for_byte_unchanged() -> No
     search_output = "\n".join(
         f"src/module_{index}.py:{index}:def target_{index}():" for index in range(180)
     )
+    literal_dollar_search_output = "\n".join(
+        f"src/module_{index}.py:{index}:literal $FOO target" for index in range(180)
+    )
+    literal_substitution_search_output = "\n".join(
+        f"src/module_{index}.py:{index}:literal $(fixture) target" for index in range(180)
+    )
+    literal_process_substitution_search_output = "\n".join(
+        f"src/module_{index}.py:{index}:literal <(pytest -q) target" for index in range(180)
+    )
 
     cases = {
         "cat file.py": raw_source,
@@ -1613,6 +2495,10 @@ def test_source_and_exact_terminal_commands_stay_byte_for_byte_unchanged() -> No
         "cat <file.py": raw_source,
         "cat file.py 2>/dev/null": raw_source,
         "cat file.py 2> /dev/null": raw_source,
+        "cat 'a>b.py' 2>/dev/null": raw_source,
+        "cat 'a<b.py' 2>/dev/null": raw_source,
+        "cat '<(fixture).py'": raw_source,
+        'cat "$(printf file.py)"': raw_source,
         "/bin/cat file.py": raw_source,
         "sed -n '1,200p' file.py": raw_source,
         "sed 's/foo/bar/' file.py": raw_source,
@@ -1656,6 +2542,17 @@ def test_source_and_exact_terminal_commands_stay_byte_for_byte_unchanged() -> No
         "git diff -- app.py & pytest -q": diff,
         "git diff -- app.py & npm install": diff,
         "rg target src": search_output,
+        "rg target src 2>/dev/null": search_output,
+        "rg target src 2> /dev/null": search_output,
+        "rg '$FOO' src 2>/dev/null": literal_dollar_search_output,
+        "rg '$FOO' src 2> /dev/null": literal_dollar_search_output,
+        "rg '$(fixture)' src 2>/dev/null": literal_substitution_search_output,
+        "rg '$(fixture)' src 2> /dev/null": literal_substitution_search_output,
+        'rg "<(pytest -q)" src': literal_process_substitution_search_output,
+        "rg '`fixture`' src 2>/dev/null": search_output,
+        "rg target '<(fixture)'": search_output,
+        'rg "$(cat pattern.txt)" src': search_output,
+        "rg -f <(cat patterns.txt) src": search_output,
         "/usr/local/bin/rg target src": search_output,
         "grep -R target src": search_output,
         "/opt/homebrew/bin/grep -R target src": search_output,
@@ -1868,3 +2765,691 @@ def test_non_build_docker_compose_commands_are_not_build_logs() -> None:
 
         assert result.metadata["command_class"] != "docker_build"
         assert result.metadata["command_class"] != "docker_logs"
+
+def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
+    compact_opts = opts(max_chars=220, max_lines=8, head_lines=1, tail_lines=1)
+
+    fixed_string_source = "\n".join(
+        [
+            "ERROR: literal source string, not uv output",
+            *[f"literal ERROR source line {index}" for index in range(80)],
+        ]
+    )
+    exact_fixed_string = reduce_text(
+        fixed_string_source,
+        command="rg -F -h ERROR src && uv sync",
+        tool_name="terminal",
+        exit_code=1,
+        options=compact_opts,
+    )
+    assert exact_fixed_string.changed is False
+    assert exact_fixed_string.metadata["command_class"] == "source_search"
+
+    fallback_read = "\n".join(
+        [
+            "cat: MISSING: No such file or directory",
+            "Release notes",
+            *[f"plain line {index}" for index in range(80)],
+        ]
+    )
+    exact_fallback_read = reduce_text(
+        fallback_read,
+        command="cat MISSING || cat README",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert exact_fallback_read.changed is False
+    assert exact_fallback_read.metadata["command_class"] == "file_read"
+
+    pytest_success_wall = "\n".join(
+        [
+            "# Project",
+            *[f"plain README line {index}" for index in range(30)],
+            *[f"tests/test_{index}.py::test_ok PASSED" for index in range(80)],
+            "123 passed in 2.00s",
+        ]
+    )
+    compacted_pytest_success = reduce_text(
+        pytest_success_wall,
+        command="cat README && pytest -q",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert compacted_pytest_success.changed is True
+    assert compacted_pytest_success.metadata["command_class"] == "pytest"
+    assert "123 passed" in compacted_pytest_success.text
+
+    docker_success_wall = "\n".join(
+        [
+            "# Project",
+            *[f"plain README line {index}" for index in range(30)],
+            "#1 [internal] load build definition from Dockerfile",
+            "#1 transferring dockerfile: 2B done",
+            "#2 DONE 0.1s",
+            *[f"#2 build line {index}" for index in range(50)],
+        ]
+    )
+    compacted_docker_success = reduce_text(
+        docker_success_wall,
+        command="cat README && docker build .",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert compacted_docker_success.changed is True
+    assert compacted_docker_success.metadata["command_class"] == "docker_build"
+    assert "DONE" in compacted_docker_success.text
+
+    heading_signal_pytest = "\n".join(
+        [
+            "src/test_notes.md",
+            *[f"123 passed literal source note {index}" for index in range(40)],
+            "123 passed in 2.00s",
+        ]
+    )
+    compacted_heading_signal = reduce_text(
+        heading_signal_pytest,
+        command="rg --heading --no-line-number '123 passed' src && pytest -q",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert compacted_heading_signal.changed is True
+    assert compacted_heading_signal.metadata["command_class"] == "pytest"
+
+    compound_failed_read_then_npm = reduce_text(
+        "\n".join(
+            [
+                "cat: MISSING: No such file or directory",
+                "# README",
+                "intro",
+                "added 451 packages in 12s",
+                *[f"npm after {index}" for index in range(30)],
+            ]
+        ),
+        command="cat MISSING || cat README && npm install",
+        tool_name="terminal",
+        exit_code=1,
+        options=compact_opts,
+    )
+    assert compound_failed_read_then_npm.changed is True
+    assert compound_failed_read_then_npm.metadata["command_class"] == "node"
+    assert "added 451 packages" in compound_failed_read_then_npm.text
+
+    apt_progress_prefixed_with_path = reduce_text(
+        "\n".join(
+            f"src/file.py | {index}% [Working] apt progress package lists"
+            for index in range(80)
+        ),
+        command="rg target src && apt-get update",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert apt_progress_prefixed_with_path.changed is True
+    assert apt_progress_prefixed_with_path.metadata["command_class"] == "apt"
+
+    docker_steps_prefixed_with_path = reduce_text(
+        "\n".join(
+            f"src/file.py | Step {index}/120 : RUN echo hi" for index in range(80)
+        ),
+        command="rg target src && docker build .",
+        tool_name="terminal",
+        exit_code=1,
+        options=compact_opts,
+    )
+    assert docker_steps_prefixed_with_path.changed is True
+    assert docker_steps_prefixed_with_path.metadata["command_class"] == "docker_build"
+
+    for command, raw in (
+        (
+            "cat README && docker build .",
+            "\n".join(
+                [
+                    "# Project",
+                    *[f"plain README line {index}" for index in range(30)],
+                    *[
+                        f"=> [internal] load build definition from Dockerfile {index}"
+                        for index in range(80)
+                    ],
+                ]
+            ),
+        ),
+        (
+            "rg target src && docker build .",
+            "\n".join(
+                f"src/file.py | => [internal] load build definition from Dockerfile {index}"
+                for index in range(80)
+            ),
+        ),
+    ):
+        compacted_buildkit_progress = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=compact_opts,
+        )
+        assert compacted_buildkit_progress.changed is True, command
+        assert compacted_buildkit_progress.metadata["command_class"] == "docker_build", command
+
+    yarn_cwd_source_search = "\n".join(
+        f"src/module_{index}.py:{index}:def target_{index}():" for index in range(80)
+    )
+    exact_yarn_cwd_search = reduce_text(
+        yarn_cwd_source_search,
+        command="yarn --cwd web exec rg target src",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert exact_yarn_cwd_search.changed is False
+    assert exact_yarn_cwd_search.metadata["command_class"] == "source_search"
+
+    for literal in (
+        "added 451 packages literal source line",
+        "added 451 packages in 12s",
+        "123 passed in 2.00s",
+    ):
+        exact_hidden_fixed_package_literal = reduce_text(
+            "\n".join(literal for _ in range(80)),
+            command=f"rg -F -h '{literal}' src || npm install",
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert exact_hidden_fixed_package_literal.changed is False, literal
+        assert (
+            exact_hidden_fixed_package_literal.metadata["command_class"] == "source_search"
+        ), literal
+
+    for literal, later_command in (
+        ("added 451 packages in 12s", "npm install"),
+        ("123 passed in 2.00s", "pytest -q"),
+    ):
+        for separator in ("&&", ";"):
+            exact_hidden_fixed_signal_literal = reduce_text(
+                "\n".join(literal for _ in range(80)),
+                command=f"rg -F -h '{literal}' src {separator} {later_command}",
+                tool_name="terminal",
+                exit_code=0,
+                options=compact_opts,
+            )
+            assert exact_hidden_fixed_signal_literal.changed is False, literal
+            assert (
+                exact_hidden_fixed_signal_literal.metadata["command_class"]
+                == "source_search"
+            ), literal
+
+    def plain_context(literal: str) -> str:
+        return "\n".join(
+            [
+                *[f"plain context before {index}" for index in range(40)],
+                literal,
+                *[f"plain context after {index}" for index in range(40)],
+            ]
+        )
+
+    for command, raw, expected_class in (
+        (
+            "rg -F -h -C40 'added 451 packages in 12s' src && npm install",
+            plain_context("added 451 packages in 12s"),
+            "source_search",
+        ),
+        (
+            "rg -F -h -C40 '123 passed in 2.00s' src && pytest -q",
+            plain_context("123 passed in 2.00s"),
+            "source_search",
+        ),
+        (
+            "rg -F -h -C40 'Reading package lists' src && apt-get update",
+            plain_context("Reading package lists... Done"),
+            "source_search",
+        ),
+        (
+            "rg -F -h -C40 'writing image' src && docker build .",
+            plain_context("#3 writing image sha256:abc"),
+            "source_search",
+        ),
+        (
+            "rg -h -C40 'added 451 packages in 12s' src && npm install",
+            plain_context("added 451 packages in 12s"),
+            "source_search",
+        ),
+        (
+            "rg -h -C40 'Reading package lists' src && apt-get update",
+            plain_context("Reading package lists... Done"),
+            "source_search",
+        ),
+        ("cat README && npm install", plain_context("added 451 packages in 12s"), "file_read"),
+        ("cat README && pytest -q", plain_context("123 passed in 2.00s"), "file_read"),
+        (
+            "cat README && apt-get update",
+            plain_context("Reading package lists... Done"),
+            "file_read",
+        ),
+        ("cat README && docker build .", plain_context("#3 writing image sha256:abc"), "file_read"),
+        (
+            "cat README && python -m pip install requests",
+            plain_context("Successfully installed requests-2.32.0"),
+            "file_read",
+        ),
+        ("cat README && uv sync", plain_context("Audited 157 packages in 0.13ms"), "file_read"),
+    ):
+        exact_context_with_compactable_literal = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert exact_context_with_compactable_literal.changed is False, command
+        assert exact_context_with_compactable_literal.text == raw, command
+        assert (
+            exact_context_with_compactable_literal.metadata["command_class"] == expected_class
+        ), command
+
+    late_failed_fallback_read_after_npm = reduce_text(
+        "\n".join(
+            [
+                "cat: MISSING: No such file or directory",
+                "npm ERR! code ERESOLVE",
+                *[f"npm noise {index}" for index in range(80)],
+                "cat: README: No such file or directory",
+            ]
+        ),
+        command="cat MISSING || npm install || cat README",
+        tool_name="terminal",
+        exit_code=1,
+        options=compact_opts,
+    )
+    assert late_failed_fallback_read_after_npm.changed is True
+    assert late_failed_fallback_read_after_npm.metadata["command_class"] == "node"
+    assert "npm ERR! code ERESOLVE" in late_failed_fallback_read_after_npm.text
+
+    skipped_read_fallback_after_npm_success = reduce_text(
+        "\n".join(
+            [
+                "cat: MISSING: No such file or directory",
+                "added 451 packages in 12s",
+                *[f"npm noise {index}" for index in range(80)],
+            ]
+        ),
+        command="cat MISSING || npm install || cat README",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert skipped_read_fallback_after_npm_success.changed is True
+    assert skipped_read_fallback_after_npm_success.metadata["command_class"] == "node"
+    assert "added 451 packages" in skipped_read_fallback_after_npm_success.text
+
+    executed_exact_fallback_after_npm_failure = reduce_text(
+        "\n".join(
+            [
+                "cat: MISSING: No such file or directory",
+                "npm ERR! code ERESOLVE",
+                "def fallback():",
+                *[f"    return {index}" for index in range(80)],
+            ]
+        ),
+        command="cat MISSING || npm install || cat file.py",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert executed_exact_fallback_after_npm_failure.changed is False
+    assert executed_exact_fallback_after_npm_failure.metadata["command_class"] == "file_read"
+
+    executed_exact_tail_after_successful_compactable_fallback = reduce_text(
+        "\n".join(
+            [
+                "cat: MISSING: No such file or directory",
+                "added 451 packages in 12s",
+                "found 0 vulnerabilities",
+                "def fallback():",
+                *[f"    return {index}" for index in range(80)],
+            ]
+        ),
+        command="cat MISSING || npm install; cat file.py",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert executed_exact_tail_after_successful_compactable_fallback.changed is False
+    assert (
+        executed_exact_tail_after_successful_compactable_fallback.metadata["command_class"]
+        == "file_read"
+    )
+
+    executed_exact_and_tail_after_successful_compactable_fallback = reduce_text(
+        "\n".join(
+            [
+                "cat: MISSING: No such file or directory",
+                "added 451 packages in 12s",
+                "found 0 vulnerabilities",
+                "def fallback():",
+                *[f"    return {index}" for index in range(80)],
+            ]
+        ),
+        command="cat MISSING || npm install && cat file.py",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert executed_exact_and_tail_after_successful_compactable_fallback.changed is False
+    assert (
+        executed_exact_and_tail_after_successful_compactable_fallback.metadata[
+            "command_class"
+        ]
+        == "file_read"
+    )
+
+    skipped_compactable_after_successful_read_fallback = reduce_text(
+        "\n".join(
+            [
+                "cat: MISSING: No such file or directory",
+                "# README",
+                *["added 451 packages in 12s" for _ in range(80)],
+            ]
+        ),
+        command="cat MISSING || cat README || npm install",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert skipped_compactable_after_successful_read_fallback.changed is False
+    assert (
+        skipped_compactable_after_successful_read_fallback.metadata["command_class"]
+        == "file_read"
+    )
+
+    skipped_compactable_after_successful_search_fallback = reduce_text(
+        "\n".join("added 451 packages in 12s" for _ in range(80)),
+        command="rg missing src || rg -F -h 'added 451 packages in 12s' docs || npm install",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert skipped_compactable_after_successful_search_fallback.changed is False
+    assert (
+        skipped_compactable_after_successful_search_fallback.metadata["command_class"]
+        == "source_search"
+    )
+
+    for raw in (
+        "\n".join(
+            f"src/file.py | {index}% [Connecting to deb.debian.org]" for index in range(80)
+        ),
+        "\n".join("src/file.py | Reading package lists... Done" for _ in range(80)),
+        "\n".join("src/file.py | Building dependency tree... Done" for _ in range(80)),
+        "\n".join("src/file.py | Reading state information... Done" for _ in range(80)),
+        "\n".join("src/file.py | Fetched 123 kB in 1s" for _ in range(80)),
+        "\n".join("src/file.py | Setting up pkg (1.0)" for _ in range(80)),
+    ):
+        connecting_apt_progress = reduce_text(
+            raw,
+            command="rg target src && apt-get update",
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert connecting_apt_progress.changed is True
+        assert connecting_apt_progress.metadata["command_class"] == "apt"
+
+        read_then_apt_progress = reduce_text(
+            raw,
+            command="cat README && apt-get update",
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert read_then_apt_progress.changed is True
+        assert read_then_apt_progress.metadata["command_class"] == "apt"
+
+    read_then_apt_install_state = reduce_text(
+        "\n".join(
+            [
+                "# README",
+                *[f"plain readme line {index}" for index in range(10)],
+                *[
+                    f"src/file.py | 0 upgraded, 1 newly installed, 0 to remove {index}"
+                    for index in range(80)
+                ],
+            ]
+        ),
+        command="cat README && apt-get install jq",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert read_then_apt_install_state.changed is True
+    assert read_then_apt_install_state.metadata["command_class"] == "apt"
+
+    for raw in (
+        "\n".join(f"src/file.py | #{index} DONE 0.{index}s" for index in range(80)),
+        "\n".join(f"src/file.py | #2 exporting layers {index}" for index in range(80)),
+        "\n".join(f"src/file.py | #3 writing image sha256:{index}" for index in range(80)),
+        "\n".join(f"src/file.py | #2 exporting layers 0.{index}s done" for index in range(80)),
+        "\n".join(f"src/file.py | => DONE 0.{index}s" for index in range(80)),
+        "\n".join(f"src/file.py | => load metadata for image {index}" for index in range(80)),
+        "\n".join(f"src/file.py | => load .dockerignore {index}" for index in range(80)),
+        "\n".join(f"src/file.py | => exporting layers 0.{index}s done" for index in range(80)),
+        "\n".join(
+            f"src/file.py | => CACHED [builder 2/5] {index}" for index in range(80)
+        ),
+    ):
+        compacted_buildkit_state = reduce_text(
+            raw,
+            command="rg target src && docker build .",
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert compacted_buildkit_state.changed is True
+        assert compacted_buildkit_state.metadata["command_class"] == "docker_build"
+
+        read_then_buildkit_state = reduce_text(
+            raw,
+            command="cat README && docker build .",
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert read_then_buildkit_state.changed is True
+        assert read_then_buildkit_state.metadata["command_class"] == "docker_build"
+
+    for command, raw, expected_class, expected_signal in (
+        (
+            "rg -F 'added 451 packages' src; npm install",
+            "\n".join(
+                ["added 451 packages in 12s", *[f"npm noise {index}" for index in range(80)]]
+            ),
+            "node",
+            "added 451 packages",
+        ),
+        (
+            "rg -F '123 passed' src; pytest -q",
+            "\n".join(
+                [
+                    *[f"tests/test_{index}.py::test_ok PASSED" for index in range(80)],
+                    "123 passed in 2.00s",
+                ]
+            ),
+            "pytest",
+            "123 passed",
+        ),
+        (
+            "rg -F 'failed to solve' src; docker build .",
+            "\n".join(["failed to solve: bad", *[f"#1 noise {index}" for index in range(80)]]),
+            "docker_build",
+            "failed to solve",
+        ),
+        (
+            "rg -F 'Resolved 192 packages' src; uv sync",
+            "\n".join(
+                ["Resolved 192 packages in 1ms", *[f"uv noise {index}" for index in range(80)]]
+            ),
+            "python_package",
+            "Resolved 192 packages",
+        ),
+        (
+            "rg -F 'Reading package lists' src; apt-get update",
+            "\n".join(
+                ["Reading package lists... Done", *[f"apt progress {index}" for index in range(80)]]
+            ),
+            "apt",
+            "Reading package lists",
+        ),
+        (
+            "rg -F 'load metadata' src; docker build .",
+            "\n".join(
+                [
+                    "#1 [internal] load metadata for image",
+                    *[f"#1 noise {index}" for index in range(80)],
+                ]
+            ),
+            "docker_build",
+            "load metadata",
+        ),
+        (
+            "rg -F 'load .dockerignore' src; docker build .",
+            "\n".join(
+                [
+                    "#1 [internal] load .dockerignore",
+                    *[f"#1 noise {index}" for index in range(80)],
+                ]
+            ),
+            "docker_build",
+            "load .dockerignore",
+        ),
+        (
+            "rg -F 'writing image' src; docker build .",
+            "\n".join(
+                ["#3 writing image sha256:abc", *[f"#3 noise {index}" for index in range(80)]]
+            ),
+            "docker_build",
+            "writing image",
+        ),
+        (
+            "rg -F -h 'npm ERR! code ERESOLVE' src && npm install",
+            "\n".join(
+                [
+                    *[f"npm progress before {index}" for index in range(80)],
+                    "npm ERR! code ERESOLVE",
+                    *[f"npm progress after {index}" for index in range(80)],
+                ]
+            ),
+            "node",
+            "npm ERR! code ERESOLVE",
+        ),
+        (
+            "rg -F -h 'ERROR: No matching distribution found' src && uv sync",
+            "\n".join(
+                [
+                    *[f"uv progress before {index}" for index in range(80)],
+                    "ERROR: No matching distribution found",
+                    *[f"uv progress after {index}" for index in range(80)],
+                ]
+            ),
+            "python_package",
+            "No matching distribution found",
+        ),
+        (
+            "rg -F -h '0 upgraded, 1 newly installed' src && apt install jq",
+            "\n".join(
+                [
+                    *[f"apt progress before {index}" for index in range(80)],
+                    "0 upgraded, 1 newly installed, 0 to remove and 0 not upgraded.",
+                    *[f"apt progress after {index}" for index in range(80)],
+                ]
+            ),
+            "apt",
+            "newly installed",
+        ),
+        (
+            "rg -F ERROR src && uv sync",
+            "\n".join(
+                [
+                    *[f"uv progress before {index}" for index in range(80)],
+                    "ERROR: No matching distribution found for missing-package",
+                    "ERROR: Could not build wheels for missing-package",
+                    *[f"uv progress after {index}" for index in range(80)],
+                ]
+            ),
+            "python_package",
+            "No matching distribution found",
+        ),
+    ):
+        compacted_later_output = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=compact_opts,
+        )
+        assert compacted_later_output.changed is True, command
+        assert compacted_later_output.metadata["command_class"] == expected_class, command
+        assert expected_signal in compacted_later_output.text, command
+
+    double_failed_read_then_npm = reduce_text(
+        "\n".join(
+            [
+                "cat: MISSING: No such file or directory",
+                "cat: README: No such file or directory",
+                "added 451 packages in 12s",
+                *[f"npm noise {index}" for index in range(80)],
+            ]
+        ),
+        command="cat MISSING || cat README || npm install",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert double_failed_read_then_npm.changed is True
+    assert double_failed_read_then_npm.metadata["command_class"] == "node"
+    assert "added 451 packages" in double_failed_read_then_npm.text
+
+    for raw in (
+        "\n".join(f"src/file.py | Get:{index} http://deb.example pkg" for index in range(80)),
+        "\n".join(f"src/file.py | {index}% [Working]" for index in range(80)),
+    ):
+        compacted_apt = reduce_text(
+            raw,
+            command="rg target src && apt-get update",
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert compacted_apt.changed is True
+        assert compacted_apt.metadata["command_class"] == "apt"
+
+    compacted_buildkit = reduce_text(
+        "\n".join(
+            f"src/file.py | #{index} [internal] load build definition from Dockerfile"
+            for index in range(80)
+        ),
+        command="rg target src && docker build .",
+        tool_name="terminal",
+        exit_code=1,
+        options=compact_opts,
+    )
+    assert compacted_buildkit.changed is True
+    assert compacted_buildkit.metadata["command_class"] == "docker_build"
+
+    for command in (
+        "pnpm -F app exec rg target src",
+        "pnpm exec -F app rg target src",
+        "yarn workspace web exec rg target src",
+    ):
+        exact_runner_search = reduce_text(
+            yarn_cwd_source_search,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert exact_runner_search.changed is False, command
+        assert exact_runner_search.metadata["command_class"] == "source_search", command

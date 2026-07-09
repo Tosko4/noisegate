@@ -57,6 +57,7 @@ SHELL_SEPARATORS = {"|", "||", "&&", ";", "&", "(", ")", "{", "}"}
 SOURCE_SEARCH_COMMANDS = {"rg", "grep", "ag", "ack"}
 OPTIONS_WITH_VALUES = {
     "-C",
+    "-F",
     "-H",
     "-I",
     "-h",
@@ -123,6 +124,7 @@ OPTIONS_WITH_VALUES = {
     "--with-requirements",
     "--workspace",
     "--filter",
+    "--cwd",
 }
 SOURCE_READ_COMMANDS = {
     "bat",
@@ -449,20 +451,21 @@ def _reduce_text(
     return ReducedOutput(compacted, True, metadata)
 
 def classify_command(command: str | None, text: str, *, exit_code: int | None = None) -> str:
-    command_l = (command or "").strip().lower()
+    command_s = (command or "").strip()
+    command_l = command_s.lower()
     sample_l = text[:4_000].lower()
     text_l = text.lower()
-
+    command_variants = _command_intent_variants(command_s)
 
     if _is_source_search_command(
-        command_l,
+        command_s,
         sample=sample_l,
         text=text_l,
         exit_code=exit_code,
     ):
         return "source_search"
     if _looks_like_file_read_command(
-        command_l,
+        command_s,
         sample=sample_l,
         text=text_l,
         exit_code=exit_code,
@@ -491,7 +494,14 @@ def classify_command(command: str | None, text: str, *, exit_code: int | None = 
         return "git_status"
     if "git log" in command_l:
         return "git_log"
-    command_variants = _command_intent_variants(command_l)
+    for substitution_command in (command_l, *command_variants):
+        substitution_class = _process_substitution_compactable_class(
+            substitution_command,
+            sample_l,
+            text_l,
+        )
+        if substitution_class is not None:
+            return substitution_class
     if any(_is_apt_command(variant) for variant in command_variants):
         return "apt"
     if any(_is_python_package_command(variant) for variant in command_variants):
@@ -625,7 +635,7 @@ TEST_PATTERNS = tuple(
         r"assertionerror|traceback|exception",
         r"\b[a-z_]+(?:error|exception)\b(?=:|$)",
         r"^\s*E\s+",
-        r"\d+\s+failed",
+        r"^\s*(?:=+\s*)?(?:\d+\s+(?:failed|passed|errors?)(?:,\s*)?)+\b",
         r"tests?/.*::",
     )
 )
@@ -655,11 +665,20 @@ PACKAGE_PATTERNS = tuple(
     for pattern in (
         r"^(e:|err:|error:)",
         r"unable to locate package|no matching distribution found|resolutionimpossible",
+        r"no solution found|unsatisfiable|could not build wheels|failed building wheel",
+        r"dpkg:\s+error|errors were encountered while processing",
         r"\b(error|failed|failure|fail|conflict|conflicts|conflicting|traceback|exception)\b",
         r"\b[a-z_]+(?:error|exception)\b(?=:|$)",
         r"hash sum mismatch|dependency problems|unmet dependencies|permission denied",
         r"npm err!|pnpm err!|yarn.*error|err_pnpm|elifecycle",
         r"^(warning:|warn:)",
+        r"successfully installed|installing collected packages|requirement already satisfied",
+        r"\b\d+\s+newly installed\b|^setting up\b",
+        r"^(installed|downloaded|resolved|prepared|audited)\s+\d+",
+        r"(?:^|\|)\s*\d+%\s+\[[^\]]+\]",
+        r"^(?:get|hit|ign):\d+\b|^fetched\s+\d+|^reading package lists\b",
+        r"^building dependency tree\b|^reading state information\b",
+        r"^up to date\b",
     )
 )
 
@@ -670,6 +689,10 @@ NODE_PATTERNS = tuple(
         r"\berror\b|\bfailed\b|\bfail\b",
         r"\bwarning\b|\bwarn\b",
         r"tests?.*(failed|passed)",
+        r"\d+\s+(passed|failed|errors?)\b",
+        r"^(added|removed|changed|audited)\s+\d+\s+packages?\b",
+        r"^\s*(found\s+0\s+vulnerabilities|\d+\s+vulnerabilities?)\b",
+        r"^up to date\b",
     )
 )
 
@@ -680,6 +703,12 @@ DOCKER_PATTERNS = tuple(
     for pattern in (
         r"\berror\b|\bfailed\b|\bfail\b",
         r"dockerfile|unable to|denied|not found",
+        r"(?:^|\|)\s*#\d+\s+.*"
+        r"(load build definition|load metadata|load \.dockerignore|"
+        r"transferring dockerfile|exporting|writing image|done|cached)",
+        r"(?:^|\|)\s*=>\s+.*"
+        r"(load build definition|load metadata|load \.dockerignore|"
+        r"transferring dockerfile|exporting|writing image|done|cached|dockerfile)",
         r"^#\d+|^=>",
     )
 )
@@ -2166,21 +2195,121 @@ def _is_pytest_command(command: str) -> bool:
         return True
     for tokens in _command_token_segments(command):
         stripped = _strip_command_wrappers(tokens)
-        if len(stripped) < 3:
-            continue
-        executable = Path(stripped[0]).name
-        module = stripped[2]
-        if (
-            re.fullmatch(r"python\d*(?:\.\d+)?", executable)
-            and stripped[1] == "-m"
-            and module in {"pytest", "py.test"}
-        ):
+        python_module = _python_module_invocation(stripped)
+        if python_module is not None and python_module[0] in {"pytest", "py.test"}:
             return True
     return False
 
 
+def _command_substitution_bodies(command: str) -> list[str]:
+    bodies: list[str] = []
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(command) - 1:
+        char = command[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if char == "\\":
+            escaped = True
+            index += 1
+            continue
+        if quote == '"':
+            if char == '"':
+                quote = None
+                index += 1
+                continue
+        elif char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if char == "`":
+            scan = index + 1
+            body_chars: list[str] = []
+            inner_escaped = False
+            while scan < len(command):
+                current = command[scan]
+                if inner_escaped:
+                    body_chars.append(current)
+                    inner_escaped = False
+                    scan += 1
+                    continue
+                if current == "\\":
+                    inner_escaped = True
+                    scan += 1
+                    continue
+                if current == "`":
+                    bodies.append("".join(body_chars))
+                    index = scan
+                    break
+                body_chars.append(current)
+                scan += 1
+        if (
+            char == "$" or (quote is None and char in {"<", ">"})
+        ) and command[index + 1] == "(":
+            depth = 1
+            body_start = index + 2
+            scan = body_start
+            inner_quote: str | None = None
+            inner_escaped = False
+            while scan < len(command):
+                current = command[scan]
+                if inner_escaped:
+                    inner_escaped = False
+                    scan += 1
+                    continue
+                if current == "\\":
+                    inner_escaped = True
+                    scan += 1
+                    continue
+                if inner_quote:
+                    if current == inner_quote:
+                        inner_quote = None
+                    scan += 1
+                    continue
+                if current in {"'", '"'}:
+                    inner_quote = current
+                    scan += 1
+                    continue
+                if current == "(":
+                    depth += 1
+                elif current == ")":
+                    depth -= 1
+                    if depth == 0:
+                        bodies.append(command[body_start:scan])
+                        index = scan
+                        break
+                scan += 1
+        index += 1
+    return bodies
+
+
+def _process_substitution_compactable_class(command: str, sample: str, text: str) -> str | None:
+    for body in _command_substitution_bodies(command):
+        nested_class = _process_substitution_compactable_class(body, sample, text)
+        if nested_class is not None:
+            return nested_class
+        token_groups = [_shell_tokens(body)]
+        token_groups.extend(_command_token_segments(body))
+        for tokens in token_groups:
+            command_class = _compactable_output_class_for_tokens(tokens, sample, text)
+            if command_class is not None:
+                return command_class
+            command_class = _compactable_class_for_tokens(tokens, sample, text)
+            if command_class is not None:
+                return command_class
+    return None
+
+
 def _contains_process_substitution_pytest(command: str) -> bool:
-    return bool(re.search(r"<\(\s*(?:[\w./-]+/)?(?:pytest|py\.test)(?:\s|\))", command))
+    return _process_substitution_compactable_class(command, "", "") == "pytest"
 
 
 def _is_unittest_command(command: str) -> bool:
@@ -2238,12 +2367,20 @@ def _looks_like_file_read_command(
     if not command or _has_suspicious_shell_quote_escape(command):
         return False
     segments = _background_segments(command)
+    for substitution_command in (command, *_command_intent_variants(command)):
+        if _process_substitution_compactable_class(substitution_command, sample, text) is not None:
+            return False
     if (
         _has_unsafe_shell_expansion(command)
         and not _has_only_safe_file_read_redirection(command)
         and len(segments) <= 1
     ):
-        return False
+        if not _has_unquoted_command_or_process_substitution(command):
+            return False
+        if not (
+            _contains_likely_file_read_output(text) or _starts_like_file_read_output(text)
+        ):
+            return False
     if _pipeline_compactable_class(command, sample, text) is not None:
         return False
     if _pipeline_xargs_compactable_class(command, sample, text) is not None:
@@ -2272,7 +2409,10 @@ def _looks_like_file_read_command(
                         prior_compactable_output,
                         prior_compactable_signal,
                         exit_code,
-                    ) and not _text_has_exact_owner_output_for_tokens(tokens, text):
+                    ) and not _text_has_exact_owner_output_against_later_compactable(
+                        tokens,
+                        text,
+                    ):
                         continue
                     if separator == "||" and prior_compactable:
                         if exit_code not in {None, 0}:
@@ -2285,12 +2425,30 @@ def _looks_like_file_read_command(
                         if segment and not _is_setup_segment(segment)
                     ]
                     if later_segments:
+                        if (
+                            exit_code == 0
+                            and any(
+                                later_separator == "||" for later_separator, _ in later_segments
+                            )
+                            and _or_fallback_exact_left_succeeded(tokens, text)
+                        ):
+                            return True
+                        if _or_later_exact_fallback_succeeded(
+                            later_segments,
+                            sample,
+                            text,
+                            exit_code,
+                        ):
+                            return True
                         if _later_compactable_output_dominates(
                             later_segments,
                             sample,
                             text,
                             exit_code,
-                        ) and not _text_has_exact_owner_output_for_tokens(tokens, text):
+                        ) and not _text_has_exact_owner_output_against_later_compactable(
+                            tokens,
+                            text,
+                        ):
                             return False
                         return not any(
                             (later_separator == "&" or prior_compactable)
@@ -2305,14 +2463,23 @@ def _looks_like_file_read_command(
                     if _compactable_output_dominates_for_tokens(tokens, sample, text):
                         prior_compactable_output = True
                 continue
-        if _tokens_have_unsafe_shell_expansion(tokens):
+        if _tokens_have_unsafe_shell_expansion(
+            tokens
+        ) and _has_unquoted_command_or_process_substitution(command):
             if _compactable_class_for_tokens(tokens, sample, text) is not None:
                 prior_compactable = True
                 if _compactable_output_class_for_tokens(tokens, sample, text) is not None:
                     prior_compactable_signal = True
                 if _compactable_output_dominates_for_tokens(tokens, sample, text):
                     prior_compactable_output = True
-            continue
+                continue
+            if not (
+                _contains_likely_file_read_output(text)
+                or _starts_like_file_read_output(text)
+                or _contains_likely_source_search_output(text)
+                or _contains_multiple_likely_source_search_lines(text)
+            ):
+                continue
         if not _tokens_start_file_read(tokens):
             if _compactable_class_for_tokens(tokens, sample, text) is not None:
                 prior_compactable = True
@@ -2334,14 +2501,74 @@ def _looks_like_file_read_command(
         if separator == "||" and prior_compactable:
             if exit_code not in {None, 0}:
                 continue
-            if prior_compactable_output:
+            if prior_compactable_output and not _text_has_exact_owner_output_for_tokens(
+                tokens,
+                text,
+            ):
                 continue
         later_segments = [
             (later_separator, segment)
             for later_separator, segment in segments[index + 1 :]
             if segment and not _is_setup_segment(segment)
         ]
+        if (
+            later_segments
+            and any(later_separator == "||" for later_separator, _ in later_segments)
+            and _contains_file_read_error(text)
+        ):
+            for fallback_index, (later_separator, segment) in enumerate(later_segments):
+                if not (
+                    later_separator == "||"
+                    and (_tokens_start_file_read(segment) or _tokens_pipe_to_file_read(segment))
+                    and not _contains_file_read_error_for_tokens(segment, text)
+                    and _contains_likely_file_read_output(text)
+                ):
+                    continue
+                if exit_code == 0 and all(
+                    following_separator == "||"
+                    for following_separator, _ in later_segments[fallback_index + 1 :]
+                ):
+                    return True
+                if _later_compactable_output_dominates(
+                    later_segments[fallback_index + 1 :],
+                    sample,
+                    text,
+                    exit_code,
+                ):
+                    continue
+                return True
+            for later_separator, segment in later_segments:
+                if later_separator not in {";", "&&"}:
+                    continue
+                if later_separator == "&&" and exit_code not in {None, 0}:
+                    continue
+                if not (_tokens_start_file_read(segment) or _tokens_pipe_to_file_read(segment)):
+                    continue
+                if _contains_file_read_error_for_tokens(segment, text):
+                    continue
+                if _contains_likely_file_read_output(text) or _starts_like_file_read_output(text):
+                    return True
+            if _later_compactable_output_dominates(
+                later_segments,
+                sample,
+                text,
+                exit_code,
+            ):
+                return False
+            return any(
+                later_separator == "||"
+                and _exact_fallback_segment_owns_output(segment, text)
+                for later_separator, segment in later_segments
+            )
         if later_segments:
+            if (
+                exit_code == 0
+                and any(
+                    later_separator == "||" for later_separator, _ in later_segments
+                )
+                and _or_fallback_exact_left_succeeded(tokens, text)
+            ):
+                return True
             if any(
                 _compactable_class_for_tokens(segment, sample, text) is not None
                 and _tokens_redirect_stdout(segment)
@@ -2353,7 +2580,11 @@ def _looks_like_file_read_command(
                 sample,
                 text,
                 exit_code,
-            ) and not _text_has_exact_owner_output_for_tokens(tokens, text):
+            ) and not _text_has_exact_owner_output_against_later_compactable(
+                tokens,
+                text,
+                exit_code=exit_code,
+            ):
                 return False
             return not any(
                 (later_separator == "&" or prior_compactable)
@@ -2396,16 +2627,45 @@ def _has_unsafe_shell_expansion(command: str) -> bool:
     return quote is not None
 
 
+def _has_unquoted_command_or_process_substitution(command: str) -> bool:
+    quote: str | None = None
+    escaped = False
+    for index, char in enumerate(command):
+        if escaped:
+            escaped = False
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = None
+            continue
+        if quote == '"':
+            if char == "\\":
+                escaped = True
+                continue
+            if char == '"':
+                quote = None
+                continue
+            if char == "`" or (char == "$" and command[index + 1 : index + 2] == "("):
+                return True
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            continue
+        if char == "`" or (char in {"$", "<", ">"} and command[index + 1 : index + 2] == "("):
+            return True
+    return quote is not None
+
+
 def _has_only_safe_file_read_redirection(command: str) -> bool:
     """Allow read-only/diagnostic redirections that preserve stdout payloads."""
 
     if (
-        "$" in command
-        or "`" in command
+        _has_unquoted_command_or_process_substitution(command)
         or "\n" in command
         or "\r" in command
-        or "<(" in command
-        or ">(" in command
     ):
         return False
     tokens = _shell_tokens(command)
@@ -2435,8 +2695,6 @@ def _has_only_safe_file_read_redirection(command: str) -> bool:
             saw_safe_redirection = True
             index += 1
             continue
-        if "<" in token or ">" in token:
-            return False
         index += 1
     return saw_safe_redirection
 
@@ -2605,6 +2863,15 @@ def _looks_like_docker_build_output(sample: str) -> bool:
         "failed to solve" in sample
         or "did not complete successfully" in sample
         or ("dockerfile" in sample and re.search(r"(?m)^(#\d+|=>)", sample))
+        or re.search(r"(?im)(?:^|\|)\s*#\d+\s+.*\bdockerfile\b", sample)
+        or re.search(r"(?im)(?:^|\|)\s*=>\s+.*\bdockerfile\b", sample)
+        or re.search(
+            r"(?im)(?:^|\|)\s*(?:#\d+|=>)\s+.*\b"
+            r"(?:load metadata|load \.dockerignore|exporting|writing image)\b",
+            sample,
+        )
+        or re.search(r"(?im)(?:^|\|)\s*(?:#\d+|=>)\s+(?:done|cached)\b", sample)
+        or re.search(r"(?im)(?:^|\|)\s*(?:#\d+|=>)\s+.*\b(?:done|cached)\b", sample)
     )
 
 
@@ -2627,17 +2894,40 @@ def _python_module_invocation(tokens: list[str]) -> tuple[str, list[str]] | None
     if not tokens or not re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", Path(tokens[0]).name):
         return None
     index = 1
-    value_options = {"-c", "-W", "-X"}
+    value_options = {"-c", "-w", "-x"}
     while index < len(tokens):
         token = tokens[index]
-        if token == "-m" and index + 1 < len(tokens):
-            return tokens[index + 1], tokens[index + 2 :]
+        token_l = token.lower()
+        if token_l == "-m" and index + 1 < len(tokens):
+            return tokens[index + 1].lower(), tokens[index + 2 :]
+        if token_l.startswith("-m") and len(token) > 2:
+            return token[2:].lower(), tokens[index + 1 :]
         if token in SHELL_SEPARATORS or not token.startswith("-"):
             return None
-        option_name = token.split("=", 1)[0]
-        index += 1
-        if option_name in value_options and "=" not in token and index < len(tokens):
+        option_name = token_l.split("=", 1)[0]
+        if option_name == "-c" or token_l.startswith("-c"):
+            return None
+        if (
+            option_name in value_options
+            or any(token_l.startswith(option) and token_l != option for option in value_options)
+        ):
             index += 1
+            if (
+                option_name in value_options
+                and "=" not in token
+                and token_l == option_name
+                and index < len(tokens)
+            ):
+                index += 1
+            continue
+        if token.startswith("-") and not token.startswith("--") and "m" in token_l[1:]:
+            module_suffix = token_l.split("m", 1)[1]
+            if module_suffix:
+                return module_suffix, tokens[index + 1 :]
+            if index + 1 < len(tokens):
+                return tokens[index + 1].lower(), tokens[index + 2 :]
+            return None
+        index += 1
     return None
 
 
@@ -2688,6 +2978,16 @@ def _is_source_search_command(
 ) -> bool:
     if not command:
         return False
+    if _has_unsafe_shell_expansion(command) and not _has_only_safe_file_read_redirection(command):
+        if not _has_unquoted_command_or_process_substitution(command):
+            return False
+        if _process_substitution_compactable_class(command, sample, text) is not None:
+            return False
+        if not (
+            _contains_likely_source_search_output(text)
+            or _contains_multiple_likely_source_search_lines(text)
+        ):
+            return False
     if _pipeline_compactable_class(command, sample, text) is not None:
         return False
     if _pipeline_xargs_compactable_class(command, sample, text) is not None:
@@ -2727,7 +3027,10 @@ def _is_source_search_command(
                         prior_compactable_output,
                         prior_compactable_signal,
                         exit_code,
-                    ) and not _text_has_exact_owner_output_for_tokens(tokens, text):
+                    ) and not _text_has_exact_owner_output_against_later_compactable(
+                        tokens,
+                        text,
+                    ):
                         continue
                     if separator == "||" and prior_compactable:
                         if exit_code not in {None, 0}:
@@ -2740,12 +3043,30 @@ def _is_source_search_command(
                         if segment and not _is_setup_segment(segment)
                     ]
                     if later_segments:
+                        if (
+                            exit_code == 0
+                            and any(
+                                later_separator == "||" for later_separator, _ in later_segments
+                            )
+                            and _or_fallback_exact_left_succeeded(tokens, text)
+                        ):
+                            return True
+                        if _or_later_exact_fallback_succeeded(
+                            later_segments,
+                            sample,
+                            text,
+                            exit_code,
+                        ):
+                            return True
                         if _later_compactable_output_dominates(
                             later_segments,
                             sample,
                             text,
                             exit_code,
-                        ) and not _text_has_exact_owner_output_for_tokens(tokens, text):
+                        ) and not _text_has_exact_owner_output_against_later_compactable(
+                            tokens,
+                            text,
+                        ):
                             return False
                         return not any(
                             (later_separator == "&" or prior_compactable)
@@ -2760,14 +3081,23 @@ def _is_source_search_command(
                     if _compactable_output_dominates_for_tokens(tokens, sample, text):
                         prior_compactable_output = True
                 continue
-        if _tokens_have_unsafe_shell_expansion(tokens):
+        if _tokens_have_unsafe_shell_expansion(
+            tokens
+        ) and _has_unquoted_command_or_process_substitution(command):
             if _compactable_class_for_tokens(tokens, sample, text) is not None:
                 prior_compactable = True
                 if _compactable_output_class_for_tokens(tokens, sample, text) is not None:
                     prior_compactable_signal = True
                 if _compactable_output_dominates_for_tokens(tokens, sample, text):
                     prior_compactable_output = True
-            continue
+                continue
+            if not (
+                _contains_likely_file_read_output(text)
+                or _starts_like_file_read_output(text)
+                or _contains_likely_source_search_output(text)
+                or _contains_multiple_likely_source_search_lines(text)
+            ):
+                continue
         if _tokens_start_source_search(tokens) or _tokens_pipe_to_source_search(tokens):
             if (
                 separator == "&&"
@@ -2802,12 +3132,30 @@ def _is_source_search_command(
                 if segment and not _is_setup_segment(segment)
             ]
             if later_segments:
+                if (
+                    exit_code == 0
+                    and any(
+                        later_separator == "||" for later_separator, _ in later_segments
+                    )
+                    and _or_fallback_exact_left_succeeded(tokens, text)
+                ):
+                    return True
+                if _or_later_exact_fallback_succeeded(
+                    later_segments,
+                    sample,
+                    text,
+                    exit_code,
+                ):
+                    return True
                 if _later_compactable_output_dominates(
                     later_segments,
                     sample,
                     text,
                     exit_code,
-                ) and not _text_has_exact_owner_output_for_tokens(tokens, text):
+                ) and not _text_has_exact_owner_output_against_later_compactable(
+                    tokens,
+                    text,
+                ):
                     return False
                 return not any(
                     (later_separator == "&" or prior_compactable)
@@ -2831,6 +3179,9 @@ def _source_consumer_command_class(
     *,
     exit_code: int | None = None,
 ) -> str | None:
+    substitution_class = _process_substitution_compactable_class(command, sample, text)
+    if substitution_class is not None:
+        return substitution_class
     for variant in _command_intent_variants(command):
         command_class = _background_tail_command_class(
             variant,
@@ -2955,11 +3306,44 @@ def _later_compactable_output_dominates(
             continue
         if separator == "&":
             continue
-        if separator == "||" and exit_code == 0:
-            continue
         if _exact_class_for_tokens(tokens) is not None:
             continue
         if _compactable_output_dominates_for_tokens(tokens, sample, text):
+            return True
+    return False
+
+
+def _or_later_exact_fallback_succeeded(
+    segments: list[tuple[str | None, list[str]]],
+    sample: str,
+    text: str,
+    exit_code: int | None,
+) -> bool:
+    for fallback_index, (separator, tokens) in enumerate(segments):
+        if separator != "||" or not tokens or _is_setup_segment(tokens):
+            continue
+        exact_class = _exact_class_for_tokens(tokens)
+        if exact_class is None:
+            continue
+        if exact_class == "file_read":
+            owns_output = (
+                not _contains_file_read_error_for_tokens(tokens, text)
+                and (_contains_likely_file_read_output(text) or _starts_like_file_read_output(text))
+            )
+        else:
+            owns_output = _text_has_exact_owner_output_against_later_compactable(
+                tokens,
+                text,
+                exit_code=exit_code,
+            )
+        if not owns_output:
+            continue
+        following = segments[fallback_index + 1 :]
+        if exit_code == 0 and all(
+            following_separator == "||" for following_separator, _ in following
+        ):
+            return True
+        if not _later_compactable_output_dominates(following, sample, text, exit_code):
             return True
     return False
 
@@ -3020,6 +3404,8 @@ def _tokens_redirect_stdout(tokens: list[str]) -> bool:
 def _tokens_have_unsafe_shell_expansion(tokens: list[str]) -> bool:
     for index, token in enumerate(tokens):
         if token == "<" and index + 1 < len(tokens) and tokens[index + 1] == "(":
+            return True
+        if token == "$" and index + 1 < len(tokens) and tokens[index + 1] == "(":
             return True
         if (
             "`" in token
@@ -3098,6 +3484,14 @@ def _compactable_class_for_tokens(
         return None
     command = shlex.join(tokens)
     command_variants = _command_intent_variants(command)
+    for substitution_command in (command, *command_variants):
+        substitution_class = _process_substitution_compactable_class(
+            substitution_command,
+            sample,
+            text,
+        )
+        if substitution_class is not None:
+            return substitution_class
     if any(_is_apt_command(variant) for variant in command_variants):
         return "apt"
     if any(_is_python_package_command(variant) for variant in command_variants):
@@ -3184,8 +3578,23 @@ def _compactable_output_dominates_for_tokens(
     if command_class in {"pytest", "unittest"}:
         has_pytest_summary = bool(
             re.search(r"(?im)^={2,}.*(?:failures|errors|short test summary)", output)
-            or re.search(r"(?im)^tests?/.*::.*\b(?:failed|error)\b", output)
+            or re.search(r"(?im)^tests?/.*::.*\b(?:passed|failed|error)\b", output)
+            or re.search(
+                r"(?im)^\s*(?:=+\s*)?(?:\d+\s+(?:passed|failed|errors?)(?:,\s*)?)+\b",
+                output,
+            )
             or len(re.findall(r"(?im)^pytest\b", output)) >= 3
+        )
+        has_short_traceback_detail = bool(
+            re.search(r"(?im)^[\w./-]+\.py:\d+:\s+in\s+(?:\w+|<[^>]+>)", output)
+            and (
+                re.search(r"(?im)^\s*e\s+", output)
+                or re.search(
+                    r"(?i)\b(?:assertionerror|modulenotfounderror|importerror|typeerror|"
+                    r"referenceerror|runtimeerror):",
+                    output,
+                )
+            )
         )
         has_traceback_detail = bool(
             re.search(r"(?im)^traceback \(most recent call last\):", output)
@@ -3198,24 +3607,71 @@ def _compactable_output_dominates_for_tokens(
                 )
             )
         )
-        return has_pytest_summary or has_traceback_detail
+        return has_pytest_summary or has_traceback_detail or has_short_traceback_detail
     if command_class in {"apt", "python_package"}:
         return bool(
-            re.search(r"(?im)^(?:e:|err:|error:)", output)
+            _first_pattern_match(output, PACKAGE_PATTERNS)
+            or _first_pattern_match(output, CRITICAL_PATTERNS)
+            or re.search(r"(?im)^(?:e:|err:|error:)", output)
             or re.search(
                 r"(?i)resolutionimpossible|no matching distribution found|unable to locate package",
                 output,
             )
+            or re.search(r"(?im)^(?:installed|downloaded|resolved|prepared|audited)\s+\d+", output)
+            or re.search(r"(?im)(?:^|\|)\s*\d+%\s+\[[^\]]+\].*\bapt\b", output)
+            or re.search(r"(?im)(?:^|\|)\s*(?:get|hit|ign):\d+\b", output)
+            or re.search(r"(?im)(?:^|\|)\s*\d+%\s+\[[^\]]+\]", output)
+            or re.search(r"(?im)(?:^|\|)\s*reading package lists\b", output)
+            or re.search(r"(?im)(?:^|\|)\s*building dependency tree\b", output)
+            or re.search(r"(?im)(?:^|\|)\s*reading state information\b", output)
+            or re.search(r"(?im)(?:^|\|)\s*fetched\s+\d+", output)
+            or re.search(r"(?im)(?:^|\|)\s*setting up\b", output)
+            or re.search(
+                r"(?im)^(?:get|hit|ign):\d+\b|^\s*fetched\s+\d+|"
+                r"^\s*reading package lists\b|^\s*building dependency tree\b|"
+                r"^\s*reading state information\b",
+                output,
+            )
+            or re.search(
+                r"(?i)successfully installed|installing collected packages|"
+                r"requirement already satisfied",
+                output,
+            )
+            or re.search(r"(?im)^\s*(?:up to date|setting up)\b", output)
+            or re.search(r"(?im)\b\d+\s+newly installed\b", output)
+            or re.search(r"(?im)^\s*[+~\-]\s+\w", output)
         )
     if command_class == "node":
         return bool(
             len(re.findall(r"(?im)^(?:npm err!|pnpm err!|yarn.*error|err_pnpm)", output)) >= 2
             or re.search(r"(?i)\b(?:typeerror|referenceerror|syntaxerror|rangeerror):", output)
+            or re.search(r"(?im)^\s*error:\s+\S", output)
+            or re.search(r"(?im)^\s+at\s+.+\(.+\)", output)
             or re.search(r"(?im)^\s*error:\s+cannot find module\b", output)
+            or re.search(
+                r"(?im)^\s*(?:=+\s*)?(?:\d+\s+(?:passed|failed|errors?)(?:,\s*)?)+\b",
+                output,
+            )
+            or re.search(r"(?im)^tests?/.*::.*\b(?:passed|failed|error)\b", output)
+            or re.search(r"(?im)^(?:added|removed|changed|audited)\s+\d+\s+packages?\b", output)
+            or re.search(
+                r"(?im)^\s*(?:found\s+0\s+vulnerabilities|\d+\s+vulnerabilities?)\b",
+                output,
+            )
+            or re.search(r"(?im)^up to date\b", output)
         )
     if command_class == "docker_build":
         return bool(
             re.search(r"(?im)^(?:#\d+\s+error\b|failed to solve\b|error: failed\b)", output)
+            or re.search(r"(?im)(?:^|\|)\s*step\s+\d+/\d+\s*:", output)
+            or re.search(r"(?im)(?:^|\|)\s*=>\s+.*\bdockerfile\b", output)
+            or re.search(
+                r"(?im)(?:^|\|)\s*(?:#\d+|=>)\s+.*\b"
+                r"(?:load metadata|load \.dockerignore|exporting|writing image)\b",
+                output,
+            )
+            or re.search(r"(?im)(?:^|\|)\s*(?:#\d+|=>)\s+(?:done|cached)\b", output)
+            or re.search(r"(?im)(?:^|\|)\s*(?:#\d+|=>)\s+.*\b(?:done|cached)\b", output)
             or _looks_like_docker_build_output(output)
         )
     return _compactable_output_class_for_tokens(tokens, sample, text) is not None
@@ -3234,21 +3690,31 @@ def _text_has_exact_output_for_tokens(tokens: list[str], text: str) -> bool:
             or _source_search_pattern_appears_in_text(tokens, text)
         )
     if _tokens_start_file_read(tokens):
-        return _contains_likely_file_read_output(text)
+        if _contains_file_read_error(text):
+            return False
+        return _contains_likely_file_read_output(text) or _tokens_read_plain_text_file(tokens)
     return False
 
 
 def _text_has_exact_owner_output_for_tokens(tokens: list[str], text: str) -> bool:
     if _tokens_start_source_search(tokens) or _tokens_pipe_to_source_search(tokens):
-        if _looks_like_test_failure_output(text) and not _source_search_pattern_appears_in_text(
-            tokens,
-            text,
+        pattern_owns_text = _source_search_pattern_owns_text(tokens, text)
+        fixed_pattern_owns_text = (
+            _tokens_source_search_uses_fixed_strings(tokens)
+            and _source_search_pattern_appears_in_text(tokens, text)
+        )
+        if _looks_like_test_failure_output(text) and not (
+            pattern_owns_text or fixed_pattern_owns_text
         ):
             return False
-        return _contains_likely_source_search_output(
-            text,
-        ) or _source_search_pattern_appears_in_text(tokens, text)
+        return (
+            _contains_likely_source_search_output(text)
+            or pattern_owns_text
+            or fixed_pattern_owns_text
+        )
     if _tokens_start_file_read(tokens):
+        if _contains_file_read_error(text):
+            return False
         return (
             _contains_likely_dominant_file_read_output(text)
             or _starts_like_file_read_output(text)
@@ -3257,11 +3723,396 @@ def _text_has_exact_owner_output_for_tokens(tokens: list[str], text: str) -> boo
     return False
 
 
+def _text_has_exact_owner_output_against_later_compactable(
+    tokens: list[str],
+    text: str,
+    *,
+    exit_code: int | None = None,
+) -> bool:
+    if _tokens_start_source_search(tokens) or _tokens_pipe_to_source_search(tokens):
+        patterns = _source_search_patterns(tokens)
+        pattern_owns_text = _source_search_pattern_owns_text(tokens, text)
+        if patterns and all(
+            _source_search_pattern_is_compactable_signal(pattern) for pattern in patterns
+        ):
+            if _tokens_source_search_uses_fixed_strings(
+                tokens
+            ) and (
+                _source_search_fixed_pattern_dominates_text(tokens, text)
+                or _source_search_fixed_pattern_context_owns_text(tokens, text)
+                or _source_search_pattern_owns_repeated_non_source_lines(
+                    tokens,
+                    text,
+                    allow_compactable_signals=True,
+                )
+            ):
+                return True
+            if _source_search_pattern_context_owns_text(tokens, text):
+                return True
+            if _source_search_heading_block_owns_text(tokens, text) and any(
+                pattern.lower() in {"error", "failed", "traceback"}
+                for pattern in patterns
+            ):
+                return True
+            return (
+                _contains_multiple_likely_source_search_lines(text)
+                and not _contains_compactable_anchor_outside_source_search_lines(text)
+            ) or pattern_owns_text
+        if _contains_compactable_anchor_outside_source_search_lines(
+            text
+        ) and not _source_search_pattern_owns_non_source_line(tokens, text):
+            return False
+        if _source_search_heading_block_owns_text(
+            tokens,
+            text,
+        ):
+            return True
+        if pattern_owns_text:
+            return True
+    if _tokens_start_file_read(tokens) or _tokens_pipe_to_file_read(tokens):
+        return _file_read_output_owns_against_later_compactable(
+            tokens,
+            text,
+            exit_code=exit_code,
+        )
+    return _text_has_exact_owner_output_for_tokens(tokens, text)
+
+
+def _exact_fallback_segment_owns_output(tokens: list[str], text: str) -> bool:
+    if _tokens_start_source_search(tokens) or _tokens_pipe_to_source_search(tokens):
+        return _contains_likely_source_search_output(text) or _source_search_pattern_owns_text(
+            tokens,
+            text,
+        )
+    if _tokens_start_file_read(tokens) or _tokens_pipe_to_file_read(tokens):
+        if _contains_file_read_error_for_tokens(tokens, text):
+            return False
+        return (
+            _contains_likely_dominant_file_read_output(text)
+            or _starts_like_file_read_output(text)
+            or _tokens_read_plain_text_file(tokens)
+        )
+    return False
+
+
+def _file_read_output_owns_against_later_compactable(
+    tokens: list[str],
+    text: str,
+    *,
+    exit_code: int | None = None,
+) -> bool:
+    if _contains_file_read_error(text):
+        return False
+    if _contains_later_command_output_anchor(text, exit_code=exit_code):
+        return _file_read_plain_context_owns_compactable_literal(text)
+    return (
+        _contains_likely_dominant_file_read_output(text)
+        or _starts_like_file_read_output(text)
+        or _tokens_read_plain_text_file(tokens)
+    )
+
+
+def _contains_later_command_output_anchor(
+    text: str,
+    *,
+    exit_code: int | None = None,
+) -> bool:
+    failure_exit = exit_code not in {None, 0}
+    return bool(
+        re.search(
+            r"(?im)^(?:npm|pnpm|yarn|pip|uv|apt(?:-get)?|docker|pytest)\b.*"
+            r"(?:noise|progress|err|error|failed|passed|install|sync|build|after|before)",
+            text,
+        )
+        or re.search(r"(?im)^(?:added|removed|changed|audited)\s+\d+\s+packages?\b", text)
+        or re.search(r"(?im)^\s*found\s+0\s+vulnerabilities\b", text)
+        or re.search(r"(?im)^\s*(?:setting up|successfully installed)\b", text)
+        or re.search(r"(?im)\b\d+\s+upgraded,\s+\d+\s+newly installed\b", text)
+        or re.search(r"(?im)^\s*(?:resolved|audited)\s+\d+\b", text)
+        or re.search(
+            r"(?im)^(?:get|hit|ign):\d+\b|^\s*fetched\s+\d+|"
+            r"^\s*reading package lists\b|^\s*building dependency tree\b|"
+            r"^\s*reading state information\b",
+            text,
+        )
+        or re.search(
+            r"(?im)(?:^|\|)\s*(?:fetched\s+\d+|reading package lists\b|"
+            r"building dependency tree\b|reading state information\b|setting up\b)",
+            text,
+        )
+        or re.search(r"(?im)(?:^|\|)\s*\d+%\s+\[[^\]]+\]", text)
+        or re.search(r"(?im)(?:^|\|)\s*(?:get|hit|ign):\d+\b", text)
+        or re.search(
+            r"(?im)^#\d+\s+.*\b"
+            r"(?:done|cached|load build definition|load metadata|load \.dockerignore|"
+            r"transferring dockerfile|exporting|writing image|error|"
+            r"failed to solve)\b",
+            text,
+        )
+        or re.search(
+            r"(?im)(?:^|\|)\s*#\d+\s+.*\b"
+            r"(?:done|cached|load build definition|load metadata|load \.dockerignore|"
+            r"transferring dockerfile|exporting|writing image|dockerfile|error)\b",
+            text,
+        )
+        or re.search(
+            r"(?im)(?:^|\|)\s*=>\s+.*\b"
+            r"(?:done|cached|load build definition|load metadata|load \.dockerignore|"
+            r"transferring dockerfile|exporting|writing image|dockerfile|error)\b",
+            text,
+        )
+        or re.search(r"(?im)^\s*\d+\s+passed(?:\s+in\s+[\d.]+s)?\s*$", text)
+        or re.search(r"(?im)^tests?/.*::.*\bPASSED\b", text)
+        or (
+            failure_exit
+            and bool(
+                re.search(r"(?im)^={2,}.*(?:failures|errors|short test summary)", text)
+                or re.search(r"(?im)^failed\s+tests?/.*::", text)
+                or re.search(
+                    r"(?i)\b(?:no matching distribution found|resolutionimpossible|"
+                    r"unable to locate package|could not build wheels|failed building wheel)\b",
+                    text,
+                )
+                or re.search(r"(?im)^(?:e:|err:|error:)\s+\S", text)
+                or re.search(r"(?i)\b(?:typeerror|referenceerror|syntaxerror|rangeerror):", text)
+                or re.search(r"(?im)^\s+at\s+.+\(.+\)", text)
+            )
+        )
+    )
+
+
+def _or_fallback_exact_left_succeeded(tokens: list[str], text: str) -> bool:
+    if _contains_file_read_error(text):
+        return False
+    if _tokens_start_file_read(tokens) or _tokens_pipe_to_file_read(tokens):
+        return True
+    return _text_has_exact_owner_output_for_tokens(tokens, text)
+
+
+def _contains_file_read_error(text: str) -> bool:
+    reader_names = "|".join(sorted(SOURCE_READ_COMMANDS))
+    prefixed_error = re.compile(
+        rf"(?i)\b(?:{reader_names}):\s+.*"
+        r"(?:no such file|cannot open|can't read|not a directory|permission denied|"
+        r"cannot access)",
+    )
+    generic_reader_error = re.compile(
+        r"(?i)(?:no such file or directory|cannot open .+ for reading|"
+        r"can't read|permission denied|cannot access)",
+    )
+    unprefixed_reader_error = re.compile(
+        r"(?i)^\s*[\w./~-]+:\s+.*(?:no such file or directory|cannot open|"
+        r"can't read|permission denied|cannot access)"
+    )
+    path_like = re.compile(
+        r"(?i)(?:[\w./~-]+\.(?:py|pyi|js|jsx|ts|tsx|md|txt|toml|ya?ml|json|"
+        r"sh|css|html|go|rs|java|c|cc|cpp|cxx|h|hpp|rb|php|sql)|[\w./~-]+/)",
+    )
+    for line in text.splitlines()[:12]:
+        if prefixed_error.search(line) or unprefixed_reader_error.search(line):
+            return True
+        if generic_reader_error.search(line) and path_like.search(line):
+            return True
+    return False
+
+
+def _contains_file_read_error_for_tokens(tokens: list[str], text: str) -> bool:
+    tokens = _strip_command_wrappers(tokens)
+    runner_tokens = _command_runner_payload(tokens)
+    if runner_tokens is not None:
+        tokens = runner_tokens
+    if not tokens:
+        return False
+    command_name = Path(tokens[0]).name.lower()
+    candidate_paths: set[str] = set()
+    skip_next = False
+    for token in tokens[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in SHELL_SEPARATORS or token in {"<", ">", ">>", "2>", "2>>"}:
+            continue
+        if token.startswith("-"):
+            option_name = token.split("=", 1)[0]
+            if option_name in OPTIONS_WITH_VALUES and "=" not in token:
+                skip_next = True
+            continue
+        candidate_paths.add(Path(token).name.lower())
+        candidate_paths.add(token.lower())
+    if not candidate_paths:
+        return False
+    error_re = re.compile(
+        r"(?i)(?:no such file or directory|cannot open|can't read|permission denied|cannot access)"
+    )
+    for line in text.splitlines():
+        if not error_re.search(line):
+            continue
+        line_l = line.lower()
+        if f"{command_name}:" in line_l and any(path in line_l for path in candidate_paths):
+            return True
+        if any(path in line_l for path in candidate_paths):
+            return True
+    return False
+
+
+def _is_likely_source_search_line(line: str) -> bool:
+    return bool(
+        re.match(r"^[\w./-]+(?::\d+){1,2}:", line)
+        or re.match(
+            r"^(?:[\w./-]+/)?[\w.-]+(?:\.[\w.-]+|file|makefile|dockerfile)$",
+            line,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _contains_multiple_likely_source_search_lines(text: str) -> bool:
+    count = 0
+    for line in text.splitlines():
+        if _is_likely_source_search_line(line):
+            count += 1
+            if count >= 3:
+                return True
+    return False
+
+
+def _source_search_heading_block_owns_text(tokens: list[str], text: str) -> bool:
+    patterns = [
+        pattern.strip().strip("'\"").lower()
+        for pattern in _source_search_patterns(tokens)
+        if len(pattern.strip().strip("'\"")) >= 3
+    ]
+    if not patterns:
+        return False
+    owned_lines = 0
+    pattern_lines = 0
+    context_lines = 0
+    allow_hidden_context = _tokens_source_search_hides_filenames(tokens)
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _is_likely_source_search_line(stripped):
+            owned_lines += 1
+            continue
+        line_l = stripped.lower()
+        if any(pattern in line_l for pattern in patterns):
+            owned_lines += 1
+            pattern_lines += 1
+            continue
+        if allow_hidden_context and pattern_lines > 0:
+            context_lines += 1
+            continue
+        return False
+    if pattern_lines >= 1 and owned_lines >= 3 and context_lines == 0:
+        return True
+    return allow_hidden_context and pattern_lines >= 2 and owned_lines + context_lines >= 3
+
+
+def _contains_compactable_anchor_outside_source_search_lines(text: str) -> bool:
+    remainder_lines: list[str] = []
+    for line in text.splitlines():
+        if _is_likely_source_search_line(line):
+            continue
+        remainder_lines.append(line)
+    remainder = "\n".join(remainder_lines)
+    return bool(
+        _first_pattern_match(remainder, PACKAGE_PATTERNS)
+        or _first_pattern_match(remainder, NODE_PATTERNS)
+        or _first_pattern_match(remainder, DOCKER_BUILD_PRESERVATION_PATTERNS)
+        or re.search(
+            r"(?im)^(?:npm|pip|uv|docker|node|pytest|pnpm|yarn)\b.*(?:progress|err|error|failed|passed)",
+            remainder,
+        )
+        or re.search(r"(?im)^(?:added|removed|changed|audited)\s+\d+\s+packages?\b", remainder)
+        or re.search(
+            r"(?im)^\s*(?:found\s+0\s+vulnerabilities|\d+\s+vulnerabilities?)\b",
+            remainder,
+        )
+        or re.search(r"(?im)^(?:e:|err:|error:)\s+\S", remainder)
+        or re.search(r"(?im)(?:^|\|)\s*\d+%\s+\[[^\]]+\].*\bapt\b", remainder)
+        or re.search(r"(?im)(?:^|\|)\s*(?:get|hit|ign):\d+\b", remainder)
+        or re.search(r"(?im)(?:^|\|)\s*\d+%\s+\[[^\]]+\]", remainder)
+        or re.search(r"(?im)(?:^|\|)\s*reading package lists\b", remainder)
+        or re.search(r"(?im)(?:^|\|)\s*building dependency tree\b", remainder)
+        or re.search(r"(?im)(?:^|\|)\s*reading state information\b", remainder)
+        or re.search(r"(?im)(?:^|\|)\s*fetched\s+\d+", remainder)
+        or re.search(r"(?im)(?:^|\|)\s*setting up\b", remainder)
+        or re.search(r"(?im)(?:^|\|)\s*step\s+\d+/\d+\s*:", remainder)
+        or re.search(
+            r"(?im)(?:^|\|)\s*#\d+\s+.*\b"
+            r"(?:done|cached|load build definition|load metadata|load \.dockerignore|"
+            r"transferring dockerfile|exporting|writing image|dockerfile|error)\b",
+            remainder,
+        )
+        or re.search(
+            r"(?im)(?:^|\|)\s*=>\s+.*\b"
+            r"(?:done|cached|load build definition|load metadata|load \.dockerignore|"
+            r"transferring dockerfile|exporting|writing image|dockerfile|error)\b",
+            remainder,
+        )
+        or re.search(
+            r"(?i)\b(?:no matching distribution found|resolutionimpossible|"
+            r"unable to locate package|could not build wheels)\b",
+            remainder,
+        )
+        or re.search(r"(?im)^\s+at\s+.+\(.+\)", remainder)
+        or re.search(r"(?im)^\s*(?:up to date|setting up)\b", remainder)
+        or re.search(r"(?im)\b\d+\s+newly installed\b", remainder)
+        or re.search(r"(?im)\b\d+\s+upgraded,\s+\d+\s+newly installed\b", remainder)
+        or re.search(
+            r"(?im)^(?:installing collected packages|successfully installed|"
+            r"resolved\s+\d+|audited\s+\d+)\b",
+            remainder,
+        )
+        or re.search(
+            r"(?im)^#\d+\s+.*\b(?:load build definition|error|failed to solve)\b",
+            remainder,
+        )
+        or re.search(r"(?im)failed to solve", remainder)
+        or re.search(
+            r"(?im)^\s*(?:=+\s*)?(?:\d+\s+(?:passed|failed|errors?)(?:,\s*)?)+\b",
+            remainder,
+        )
+    )
+
+
 def _looks_like_test_failure_output(text: str) -> bool:
     lowered = text.lower()
+    has_short_traceback_detail = bool(
+        re.search(r"(?im)^[\w./-]+\.py:\d+:\s+in\s+(?:\w+|<[^>]+>)", text)
+        and (
+            re.search(r"(?im)^\s*e\s+", text)
+            or re.search(
+                r"(?i)\b(?:assertionerror|modulenotfounderror|importerror|typeerror|"
+                r"referenceerror|runtimeerror):",
+                text,
+            )
+        )
+    )
+    has_traceback_detail = bool(
+        re.search(r"(?im)^traceback \(most recent call last\):", text)
+        and (
+            re.search(r"(?im)^\s*file \".+\", line \d+", text)
+            or has_short_traceback_detail
+            or re.search(r"(?im)^\s*e\s+", text)
+            or re.search(
+                r"(?i)\b(?:assertionerror|modulenotfounderror|importerror|typeerror|"
+                r"referenceerror|runtimeerror):",
+                text,
+            )
+        )
+    )
     return (
         "=== failures ===" in lowered
         or "failed tests/" in lowered
+        or has_traceback_detail
+        or has_short_traceback_detail
+        or re.search(r"(?im)^tests?/.*::.*\b(?:passed|failed|error)\b", text) is not None
+        or re.search(
+            r"(?im)^\s*(?:=+\s*)?(?:\d+\s+(?:passed|failed|errors?)(?:,\s*)?)+\b",
+            text,
+        ) is not None
         or re.search(r"^tests/.+:\d+:\s*(?:assertionerror|error|failed)", text, re.MULTILINE)
         is not None
     )
@@ -3272,11 +4123,26 @@ def _tokens_read_plain_text_file(tokens: list[str]) -> bool:
     runner_tokens = _command_runner_payload(tokens)
     if runner_tokens is not None:
         tokens = runner_tokens
-    return any(
-        Path(token).suffix.lower() in {".txt", ".log"}
-        for token in tokens[1:]
-        if token and not token.startswith("-")
-    )
+    plain_extensionless_names = {
+        "authors",
+        "changelog",
+        "codeowners",
+        "contributing",
+        "copying",
+        "license",
+        "notice",
+        "readme",
+    }
+    for token in tokens[1:]:
+        if not token or token.startswith("-"):
+            continue
+        path = Path(token)
+        suffix = path.suffix.lower()
+        if suffix in {".md", ".rst", ".txt"}:
+            return True
+        if not suffix and path.name.lower() in plain_extensionless_names:
+            return True
+    return False
 
 
 def _text_has_dominant_exact_output_for_tokens(tokens: list[str], text: str) -> bool:
@@ -3312,27 +4178,305 @@ def _tokens_source_search_hides_filenames(tokens: list[str]) -> bool:
     )
 
 
-def _source_search_pattern_appears_in_text(tokens: list[str], text: str) -> bool:
+def _source_search_pattern_is_compactable_signal(pattern: str) -> bool:
+    normalized = pattern.strip().strip("'\"").lower()
+    if normalized in {
+        "added",
+        "audited",
+        "dockerfile",
+        "downloaded",
+        "error",
+        "errors",
+        "exporting",
+        "fail",
+        "failed",
+        "failure",
+        "found 0 vulnerabilities",
+        "installed",
+        "load .dockerignore",
+        "load metadata",
+        "newly installed",
+        "no matching distribution found",
+        "passed",
+        "prepared",
+        "reading package lists",
+        "reading state information",
+        "resolved",
+        "solve",
+        "successfully installed",
+        "building dependency tree",
+        "up to date",
+        "writing image",
+    }:
+        return True
+    return bool(
+        re.search(r"\b\d+\s+(passed|failed|errors?)\b", normalized)
+        or re.search(r"\b(passed|failed)\s+in\b", normalized)
+        or re.search(r"\b(added|removed|changed|audited)\s+\d+\s+packages?\b", normalized)
+        or re.search(r"\bfound\s+0\s+vulnerabilities\b", normalized)
+        or re.search(r"\b(successfully\s+installed|installed\s+\S+)", normalized)
+        or re.search(r"\b(resolved|downloaded|prepared)\s+\d+\s+packages?\b", normalized)
+        or re.search(r"\b(up\s+to\s+date|failed\s+to\s+solve)\b", normalized)
+        or re.search(r"\bnpm\s+err!", normalized)
+        or re.search(
+            r"\b(?:no matching distribution found|resolutionimpossible|"
+            r"unable to locate package|could not build wheels|eresolve)\b",
+            normalized,
+        )
+        or re.search(r"\b\d+\s+upgraded,\s+\d+\s+newly installed\b", normalized)
+        or re.search(
+            r"\b(load\s+build\s+definition\s+from\s+dockerfile|load\s+metadata|"
+            r"load\s+\.dockerignore|exporting|writing\s+image|dockerfile.*error)\b",
+            normalized,
+        )
+        or re.search(
+            r"\b(reading\s+package\s+lists|building\s+dependency\s+tree|"
+            r"reading\s+state\s+information|setting\s+up)\b",
+            normalized,
+        )
+        or re.search(r"\bnpm\s+err!\b", normalized)
+    )
+
+
+def _source_search_pattern_is_traceback_path(pattern: str) -> bool:
+    normalized = pattern.strip().strip("'\"").lower()
+    return bool(
+        re.fullmatch(r"[\w./-]*[\w-]+\.py(?::\d+)?", normalized)
+        or re.fullmatch(r"[\w./-]*[\w-]+\.py:\d+:.*", normalized)
+    )
+
+
+def _source_search_pattern_owns_text(tokens: list[str], text: str) -> bool:
+    patterns = _source_search_patterns(tokens)
+    if not patterns:
+        return False
+    text_l = text.lower()
+    looks_like_test_failure = _looks_like_test_failure_output(text)
+    return any(
+        len(pattern) >= 3
+        and pattern.lower() in text_l
+        and not _source_search_pattern_is_compactable_signal(pattern)
+        and not (looks_like_test_failure and _source_search_pattern_is_traceback_path(pattern))
+        for pattern in patterns
+    )
+
+
+def _tokens_source_search_uses_fixed_strings(tokens: list[str]) -> bool:
+    tokens = _strip_command_wrappers(tokens)
+    runner_tokens = _command_runner_payload(tokens)
+    if runner_tokens is not None:
+        return _tokens_source_search_uses_fixed_strings(runner_tokens)
+    return any(
+        token in {"-F", "--fixed-strings"}
+        or (
+            token.startswith("-")
+            and not token.startswith("--")
+            and "F" in token[1:]
+        )
+        for token in tokens[1:]
+    )
+
+
+def _source_search_pattern_owns_non_source_line(
+    tokens: list[str],
+    text: str,
+    *,
+    allow_compactable_signals: bool = False,
+) -> bool:
+    patterns = [
+        pattern.lower()
+        for pattern in _source_search_patterns(tokens)
+        if len(pattern) >= 3
+        and (allow_compactable_signals or not _source_search_pattern_is_compactable_signal(pattern))
+    ]
+    if not patterns:
+        return False
+    looks_like_test_failure = _looks_like_test_failure_output(text)
+    for line in text.splitlines():
+        if _is_likely_source_search_line(line.strip()):
+            continue
+        line_l = line.lower()
+        for pattern in patterns:
+            if pattern in line_l and not (
+                looks_like_test_failure and _source_search_pattern_is_traceback_path(pattern)
+            ):
+                return True
+    return False
+
+
+def _source_search_pattern_owns_repeated_non_source_lines(
+    tokens: list[str],
+    text: str,
+    *,
+    allow_compactable_signals: bool = False,
+) -> bool:
+    patterns = [
+        pattern.lower()
+        for pattern in _source_search_patterns(tokens)
+        if len(pattern) >= 3
+        and (allow_compactable_signals or not _source_search_pattern_is_compactable_signal(pattern))
+    ]
+    if not patterns:
+        return False
+    looks_like_test_failure = _looks_like_test_failure_output(text)
+    counts = {pattern: 0 for pattern in patterns}
+    for line in text.splitlines():
+        if _is_likely_source_search_line(line.strip()):
+            continue
+        if allow_compactable_signals and _line_looks_like_compactable_output(line):
+            continue
+        line_l = line.lower()
+        for pattern in patterns:
+            if pattern in line_l and not (
+                looks_like_test_failure and _source_search_pattern_is_traceback_path(pattern)
+            ):
+                counts[pattern] += 1
+                if counts[pattern] >= 2:
+                    return True
+    return False
+
+
+def _source_search_fixed_pattern_dominates_text(tokens: list[str], text: str) -> bool:
+    patterns = [pattern.lower() for pattern in _source_search_patterns(tokens) if len(pattern) >= 3]
+    if not patterns:
+        return False
+    checked_lines = [line.strip().lower() for line in text.splitlines() if line.strip()]
+    if not checked_lines:
+        return False
+    for pattern in patterns:
+        hits = sum(1 for line in checked_lines if pattern in line)
+        if hits >= 2 and hits / len(checked_lines) >= 0.8:
+            return True
+    return False
+
+
+def _source_search_fixed_pattern_context_owns_text(tokens: list[str], text: str) -> bool:
+    if not _tokens_source_search_uses_fixed_strings(tokens):
+        return False
+    return _source_search_pattern_context_owns_text(
+        tokens,
+        text,
+        allow_test_summary=True,
+    )
+
+
+def _source_search_pattern_context_owns_text(
+    tokens: list[str],
+    text: str,
+    *,
+    allow_test_summary: bool = False,
+) -> bool:
+    patterns = [pattern.lower() for pattern in _source_search_patterns(tokens) if len(pattern) >= 3]
+    if not patterns:
+        return False
+    if not allow_test_summary and any(
+        re.search(r"\b\d+\s+(?:passed|failed|errors?)\b", pattern)
+        or re.search(r"\b(?:passed|failed)\s+in\b", pattern)
+        for pattern in patterns
+    ):
+        return False
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) < 3:
+        return False
+    pattern_lines = 0
+    compactable_other_lines = 0
+    plain_context_lines = 0
+    for line in lines:
+        line_l = line.lower()
+        if any(pattern in line_l for pattern in patterns):
+            pattern_lines += 1
+            continue
+        if _line_looks_like_compactable_context(line):
+            compactable_other_lines += 1
+            continue
+        plain_context_lines += 1
+    return pattern_lines >= 1 and compactable_other_lines == 0 and plain_context_lines >= 2
+
+
+def _file_read_plain_context_owns_compactable_literal(text: str) -> bool:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) < 3:
+        return False
+    compactable_lines = sum(1 for line in lines if _line_looks_like_compactable_context(line))
+    return compactable_lines == 1 and len(lines) - compactable_lines >= 2
+
+
+def _line_looks_like_compactable_context(line: str) -> bool:
+    stripped = line.strip()
+    return bool(
+        _line_looks_like_compactable_output(stripped)
+        or re.search(r"(?i)^#\d+\b", stripped)
+        or re.search(r"(?i)^=>\b", stripped)
+        or re.search(r"(?i)^tests?/.*::.*\b(?:passed|failed|error)\b", stripped)
+        or re.search(r"(?i)(?:^|\|)\s*#\d+\b", stripped)
+        or re.search(r"(?i)(?:^|\|)\s*=>\b", stripped)
+        or re.search(r"(?i)(?:^|\|)\s*\d+%\s+\[[^\]]+\]", stripped)
+        or re.search(r"(?i)(?:^|\|)\s*(?:get|hit|ign):\d+\b", stripped)
+        or re.search(
+            r"(?i)(?:^|\|)\s*(?:reading package lists|building dependency tree|"
+            r"reading state information|fetched\s+\d+|setting up|"
+            r"successfully installed|audited\s+\d+)\b",
+            stripped,
+        )
+        or re.search(r"(?i)\b\d+\s+upgraded,\s+\d+\s+newly installed\b", stripped)
+    )
+
+
+def _line_looks_like_compactable_output(line: str) -> bool:
+    stripped = line.strip()
+    return bool(
+        re.search(r"(?i)^(?:npm|pnpm|yarn|pip|uv|apt(?:-get)?|docker|pytest)\b", stripped)
+        or re.search(r"(?i)^(?:npm err!|pnpm err!|yarn.*error|err_pnpm)\b", stripped)
+        or re.search(
+            r"(?i)^(?:e:|err:|error:)\s+(?:no matching distribution found|"
+            r"could not build wheels|unable to locate package|failed|error|"
+            r"cannot find module)\b",
+            stripped,
+        )
+        or re.search(
+            r"(?i)^(?:added|removed|changed|audited)\s+\d+\s+packages?"
+            r"(?:\s+in\s+[\d.]+s)?$",
+            stripped,
+        )
+        or re.search(r"(?i)^found\s+0\s+vulnerabilities$", stripped)
+        or re.search(r"(?i)^up\s+to\s+date$", stripped)
+        or re.search(r"(?i)^\d+\s+(?:passed|failed|errors?)(?:\s+in\s+[\d.]+s)?$", stripped)
+        or re.search(r"(?i)^failed\s+to\s+solve\b", stripped)
+        or re.search(
+            r"(?i)^(?:resolved|downloaded|prepared)\s+\d+\s+packages?"
+            r"(?:\s+in\s+[\d.]+\w+)?$",
+            stripped,
+        )
+    )
+
+
+def _source_search_patterns(tokens: list[str]) -> list[str]:
     tokens = _strip_command_wrappers(tokens)
     if tokens and Path(tokens[0]).name in {"bash", "sh", "zsh"}:
         shell_command = _shell_c_argument(tokens[1:])
         if shell_command is None:
-            return False
-        return any(
-            _source_search_pattern_appears_in_text(segment, text)
-            for segment in _command_token_segments(shell_command)
-            if segment
-        )
+            return []
+        patterns: list[str] = []
+        for segment in _command_token_segments(shell_command):
+            patterns.extend(_source_search_patterns(segment))
+        return patterns
     runner_tokens = _command_runner_payload(tokens)
     if runner_tokens is not None:
-        return _source_search_pattern_appears_in_text(runner_tokens, text)
+        return _source_search_patterns(runner_tokens)
     if not tokens or Path(tokens[0]).name not in SOURCE_SEARCH_COMMANDS | {"git"}:
-        return False
+        return []
     if Path(tokens[0]).name == "git":
         for index, token in enumerate(tokens[1:], start=1):
             if token == "grep":
-                return _source_search_pattern_appears_in_text(tokens[index:], text)
-        return False
+                return _source_search_patterns(tokens[index:])
+        return []
+
+    if any(
+        token in {"--files", "--type-list"}
+        or (token.startswith("-") and not token.startswith("--") and "f" in token[1:])
+        for token in tokens[1:]
+    ):
+        return []
 
     if any(
         (
@@ -3342,18 +4486,33 @@ def _source_search_pattern_appears_in_text(tokens: list[str], text: str) -> bool
         )
         for token in tokens[1:]
     ):
-        return False
+        return []
 
+    explicit_patterns: list[str] = []
+    has_pattern_file = False
     for index, token in enumerate(tokens[1:], start=1):
+        if token in {"-f", "--file"} and index + 1 < len(tokens):
+            has_pattern_file = True
+            continue
+        if token.startswith("-f") and not token.startswith("--") and len(token) > 2:
+            has_pattern_file = True
+            continue
+        if token.startswith("--file="):
+            has_pattern_file = True
+            continue
         if token in {"-e", "--regexp"} and index + 1 < len(tokens):
-            pattern = tokens[index + 1].strip()
-            return len(pattern) >= 3 and pattern.lower() in text.lower()
+            explicit_patterns.append(tokens[index + 1].strip())
+            continue
         if token.startswith("-e") and not token.startswith("--") and len(token) > 2:
-            pattern = token[2:].strip()
-            return len(pattern) >= 3 and pattern.lower() in text.lower()
+            explicit_patterns.append(token[2:].strip())
+            continue
         if token.startswith("--regexp="):
-            pattern = token.split("=", 1)[1].strip()
-            return len(pattern) >= 3 and pattern.lower() in text.lower()
+            explicit_patterns.append(token.split("=", 1)[1].strip())
+            continue
+    if explicit_patterns:
+        return explicit_patterns
+    if has_pattern_file:
+        return []
 
     source_options_with_values = {
         "-A",
@@ -3372,6 +4531,7 @@ def _source_search_pattern_appears_in_text(tokens: list[str], text: str) -> bool
         "--field-match-separator",
         "--glob",
         "--iglob",
+        "--ignore-file",
         "--include",
         "--exclude",
         "--exclude-dir",
@@ -3379,9 +4539,9 @@ def _source_search_pattern_appears_in_text(tokens: list[str], text: str) -> bool
         "--label",
         "--max-count",
         "--path-separator",
+        "--pre-glob",
         "--replace",
         "--sort",
-        "--sort-files",
         "--type",
         "--type-add",
     }
@@ -3405,8 +4565,16 @@ def _source_search_pattern_appears_in_text(tokens: list[str], text: str) -> bool
         pattern = token.strip()
         if len(pattern) < 3 or pattern in {".", "*"}:
             continue
-        return pattern.lower() in text.lower()
-    return False
+        return [pattern]
+    return []
+
+
+def _source_search_pattern_appears_in_text(tokens: list[str], text: str) -> bool:
+    text_l = text.lower()
+    return any(
+        len(pattern) >= 3 and pattern.lower() in text_l
+        for pattern in _source_search_patterns(tokens)
+    )
 
 
 def _contains_likely_source_search_output(text: str) -> bool:
@@ -3556,7 +4724,24 @@ def _tokens_start_file_read(tokens: list[str]) -> bool:
         return _looks_like_git_show_file_read_tokens(tokens)
     if token_name == "sed":
         return _looks_like_sed_file_read_tokens(tokens)
+    if token_name in {"jq", "yq"}:
+        return _looks_like_jq_file_read_tokens(tokens)
     return token_name in SOURCE_READ_COMMANDS
+
+
+def _looks_like_jq_file_read_tokens(tokens: list[str]) -> bool:
+    if not tokens or Path(tokens[0]).name not in {"jq", "yq"}:
+        return False
+    for token in tokens[1:]:
+        if token == "--":
+            break
+        if token in {"-n", "--null-input", "--help", "--version"}:
+            return False
+        if token.startswith("--null-input="):
+            return False
+        if token.startswith("-") and not token.startswith("--") and "n" in token[1:]:
+            return False
+    return True
 
 
 def _tokens_start_compactable_command(tokens: list[str]) -> bool:
@@ -3572,7 +4757,7 @@ def _tokens_start_compactable_command(tokens: list[str]) -> bool:
     if token_name in {"uv", "pip", "pip3", "pytest", "py.test", "node"}:
         return True
     python_module = _python_module_invocation(tokens)
-    return bool(python_module is not None and python_module[0] == "pip")
+    return bool(python_module is not None and python_module[0] in {"pip", "pytest", "py.test"})
 
 
 def _tokens_start_find_path_list(tokens: list[str]) -> bool:
@@ -3645,6 +4830,8 @@ def _command_runner_payload(tokens: list[str]) -> list[str] | None:
         return _xargs_payload_tokens(tokens)
     if command in {"npm", "pnpm", "yarn"}:
         rest = _skip_option_tokens(tokens[1:])
+        if command == "yarn" and len(rest) >= 3 and rest[0] == "workspace":
+            rest = rest[2:]
         if rest and rest[0] in {"dlx", "exec"}:
             shell_command = _runner_shell_call_argument(rest[1:])
             if shell_command is not None:
@@ -3837,7 +5024,7 @@ def _shell_c_argument(tokens: list[str]) -> str | None:
 
 def _strip_assignment_tokens(tokens: list[str]) -> list[str]:
     index = 0
-    while index < len(tokens) and re.fullmatch(r"[a-z_][a-z0-9_]*=.*", tokens[index]):
+    while index < len(tokens) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[index]):
         index += 1
     return tokens[index:]
 
