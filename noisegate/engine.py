@@ -6,6 +6,7 @@ import re
 import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from itertools import pairwise
 from pathlib import Path
 
 from ._version import __version__
@@ -53,7 +54,7 @@ LCM_EXTERNALIZED_PATTERNS = tuple(
         r"\bexternalized_ref\b\s*[:=]\s*[^,\s}\]]+",
     )
 )
-SHELL_SEPARATORS = {"|", "||", "&&", ";", "&", "(", ")", "{", "}"}
+SHELL_SEPARATORS = {"|", "|&", "||", "&&", ";", "&", "(", ")", "{", "}"}
 SOURCE_SEARCH_COMMANDS = {"rg", "grep", "ag", "ack"}
 OPTIONS_WITH_VALUES = {
     "-C",
@@ -1084,17 +1085,26 @@ def _line_budgeted_important_excerpt(
             for index in concrete_tight_priority
         )
         if has_concrete_exception and (has_failed_test_id or len(best_ranked_priority) == 1):
-            tight_indices = concrete_tight_priority if has_failed_test_id else best_ranked_priority
-            tight_anchor_candidate = "\n".join(
-                lines[index] for index in sorted(tight_indices)
+            tight_indices = sorted(
+                concrete_tight_priority if has_failed_test_id else best_ranked_priority
             )
+            tight_anchor_candidate = _marked_excerpt_for_line_indices(lines, tight_indices)
             exit_notice_reserve = len("\n[noisegate: exit_code=1]")
             if (
-                _fits_budget(tight_anchor_candidate, options)
+                tight_anchor_candidate is not None
+                and _fits_budget(tight_anchor_candidate, options)
                 and len(tight_anchor_candidate) + exit_notice_reserve <= options.max_chars
                 and _line_count(tight_anchor_candidate) + 1 <= options.max_lines
             ):
                 return tight_anchor_candidate
+            if all(b == a + 1 for a, b in pairwise(tight_indices)):
+                contiguous_candidate = "\n".join(lines[index] for index in tight_indices)
+                if (
+                    _fits_budget(contiguous_candidate, options)
+                    and len(contiguous_candidate) + exit_notice_reserve <= options.max_chars
+                    and _line_count(contiguous_candidate) + 1 <= options.max_lines
+                ):
+                    return contiguous_candidate
     if len(multi_anchor_priority) > 1:
         for context in range(max_context, -1, -1):
             keep: set[int] = set()
@@ -1916,9 +1926,14 @@ def _concrete_failure_excerpt_for_notices(
         if any(pattern.search(line) for pattern in LCM_EXTERNALIZED_PATTERNS):
             rich_keep.add(index)
     if len(rich_keep) > 1:
-        rich_candidate = "\n".join(lines[index] for index in sorted(rich_keep))
-        if _fits_budget(rich_candidate, options):
-            return rich_candidate
+        rich_indices = sorted(rich_keep)
+        marked_rich_candidate = _marked_excerpt_for_line_indices(lines, rich_indices)
+        if marked_rich_candidate is not None and _fits_budget(marked_rich_candidate, options):
+            return marked_rich_candidate
+        if all(b == a + 1 for a, b in pairwise(rich_indices)):
+            rich_candidate = "\n".join(lines[index] for index in rich_indices)
+            if _fits_budget(rich_candidate, options):
+                return rich_candidate
 
     keep = [concrete_indices[0]]
     if failed_indices:
@@ -1942,9 +1957,40 @@ def _concrete_failure_excerpt_for_notices(
         if _fits_budget(marked_candidate, options):
             return marked_candidate
     candidate = "\n".join(lines[index] for index in keep)
-    if _fits_budget(candidate, options):
+    if len(keep) == 1 and _fits_budget(candidate, options):
         return candidate
+    if len(keep) > 1:
+        marked_candidate = _marked_excerpt_for_line_indices(lines, keep)
+        if marked_candidate is not None and _fits_budget(marked_candidate, options):
+            return marked_candidate
+        if all(b == a + 1 for a, b in pairwise(keep)) and _fits_budget(candidate, options):
+            return candidate
     return None
+
+
+def _marked_excerpt_for_line_indices(lines: list[str], indices: list[int]) -> str | None:
+    if not lines or not indices:
+        return None
+    sorted_indices = sorted(set(index for index in indices if 0 <= index < len(lines)))
+    if not sorted_indices:
+        return None
+
+    parts: list[str] = []
+    first_index = sorted_indices[0]
+    if first_index:
+        parts.append(f"[noisegate: omitted {first_index} lines]")
+
+    previous_index: int | None = None
+    for index in sorted_indices:
+        if previous_index is not None and index > previous_index + 1:
+            parts.append(f"[noisegate: omitted {index - previous_index - 1} lines]")
+        parts.append(lines[index])
+        previous_index = index
+
+    last_index = sorted_indices[-1]
+    if last_index < len(lines) - 1:
+        parts.append(f"[noisegate: omitted {len(lines) - last_index - 1} lines]")
+    return "\n".join(parts)
 
 
 def _append_recovery_notices(
@@ -2357,6 +2403,71 @@ def _looks_like_v4a_patch(text: str) -> bool:
     return len(lines) >= 2 and lines[0] == "*** Begin Patch" and lines[-1] == "*** End Patch"
 
 
+def _leading_exact_output_owns_before_only_or_fallbacks(
+    segments: list[tuple[str | None, list[str]]],
+    text: str,
+    *,
+    exit_code: int | None,
+    expected_class: str,
+) -> bool:
+    if exit_code != 0:
+        return False
+    meaningful_indices = [
+        index
+        for index, (_separator, tokens) in enumerate(segments)
+        if tokens and not _is_setup_segment(tokens)
+    ]
+    if len(meaningful_indices) < 2:
+        return False
+    first_index = meaningful_indices[0]
+    first_tokens = segments[first_index][1]
+    if _exact_class_for_tokens(first_tokens) != expected_class:
+        return False
+
+    group_depth = first_tokens.count("{") + first_tokens.count("(")
+    group_depth = max(0, group_depth - first_tokens.count("}") - first_tokens.count(")"))
+    for separator, tokens in segments[first_index + 1 :]:
+        if group_depth == 0 and separator != "||":
+            return False
+        group_depth += tokens.count("{") + tokens.count("(")
+        group_depth = max(0, group_depth - tokens.count("}") - tokens.count(")"))
+    if group_depth != 0:
+        return False
+    return _text_has_exact_owner_output_against_later_compactable(
+        first_tokens,
+        text,
+        exit_code=exit_code,
+    )
+
+
+def _earlier_compactable_output_blocks_first_file_read(
+    segments: list[tuple[str | None, list[str]]],
+    sample: str,
+    text: str,
+    *,
+    exit_code: int | None,
+) -> bool:
+    earlier_compactable_output = False
+    for index, (_separator, tokens) in enumerate(segments):
+        if not tokens or _is_setup_segment(tokens):
+            continue
+        if _tokens_start_file_read(tokens) or _tokens_pipe_to_file_read(tokens):
+            return earlier_compactable_output and not (
+                _text_has_exact_owner_output_against_later_compactable(
+                    tokens,
+                    text,
+                    exit_code=exit_code,
+                )
+            )
+        effective_tokens = _segment_tokens_with_enclosing_group_redirects(segments, index)
+        if (
+            _compactable_output_dominates_for_tokens(tokens, sample, text)
+            and _compactable_segment_can_contribute_output(effective_tokens, text)
+        ):
+            earlier_compactable_output = True
+    return False
+
+
 def _looks_like_file_read_command(
     command: str,
     *,
@@ -2367,6 +2478,20 @@ def _looks_like_file_read_command(
     if not command or _has_suspicious_shell_quote_escape(command):
         return False
     segments = _background_segments(command)
+    if _leading_exact_output_owns_before_only_or_fallbacks(
+        segments,
+        text,
+        exit_code=exit_code,
+        expected_class="file_read",
+    ):
+        return True
+    if _earlier_compactable_output_blocks_first_file_read(
+        segments,
+        sample,
+        text,
+        exit_code=exit_code,
+    ):
+        return False
     for substitution_command in (command, *_command_intent_variants(command)):
         if _process_substitution_compactable_class(substitution_command, sample, text) is not None:
             return False
@@ -2427,10 +2552,16 @@ def _looks_like_file_read_command(
                     if later_segments:
                         if (
                             exit_code == 0
-                            and any(
-                                later_separator == "||" for later_separator, _ in later_segments
+                            and later_segments[0][0] == "||"
+                            and (
+                                _or_fallback_exact_left_succeeded(tokens, text)
+                                or _or_fallback_branch_terminates_current_shell(later_segments)
                             )
-                            and _or_fallback_exact_left_succeeded(tokens, text)
+                            and not _or_tail_has_unconditional_compactable_after_fallback(
+                                later_segments,
+                                sample,
+                                text,
+                            )
                         ):
                             return True
                         if _or_later_exact_fallback_succeeded(
@@ -2489,6 +2620,8 @@ def _looks_like_file_read_command(
                     prior_compactable_output = True
             continue
         if separator == "&&" and prior_compactable and exit_code not in {None, 0}:
+            continue
+        if separator == "&" and prior_compactable_signal:
             continue
         if _prior_compactable_output_blocks_exact_tail(
             separator,
@@ -2563,16 +2696,23 @@ def _looks_like_file_read_command(
         if later_segments:
             if (
                 exit_code == 0
-                and any(
-                    later_separator == "||" for later_separator, _ in later_segments
+                and later_segments[0][0] == "||"
+                and (
+                    _or_fallback_exact_left_succeeded(tokens, text)
+                    or _or_fallback_branch_terminates_current_shell(later_segments)
                 )
-                and _or_fallback_exact_left_succeeded(tokens, text)
+                and not _or_tail_has_unconditional_compactable_after_fallback(
+                    later_segments,
+                    sample,
+                    text,
+                )
             ):
                 return True
-            if any(
-                _compactable_class_for_tokens(segment, sample, text) is not None
-                and _tokens_redirect_stdout(segment)
-                for _, segment in later_segments
+            if _hidden_compactable_tail_preserves_exact_output(
+                tokens,
+                later_segments,
+                sample,
+                text,
             ):
                 return True
             if _later_compactable_output_dominates(
@@ -2673,7 +2813,15 @@ def _has_only_safe_file_read_redirection(command: str) -> bool:
     saw_safe_redirection = False
     while index < len(tokens):
         token = tokens[index]
+        if re.fullmatch(r"[12]?>&[12]", token):
+            saw_safe_redirection = True
+            index += 1
+            continue
         if token in {">", "1>", ">>", "1>>"} or re.match(r"^(?:[01]?>|[01]>>|>>|>)", token):
+            if _redirected_stream_visibility(tokens)[0]:
+                saw_safe_redirection = True
+                index += 1
+                continue
             return False
         if token in {"<", "0<"}:
             if index + 1 >= len(tokens) or tokens[index + 1].startswith("-"):
@@ -2978,21 +3126,29 @@ def _is_source_search_command(
 ) -> bool:
     if not command:
         return False
+    segments = _background_segments(command)
+    if _leading_exact_output_owns_before_only_or_fallbacks(
+        segments,
+        text,
+        exit_code=exit_code,
+        expected_class="source_search",
+    ):
+        return True
     if _has_unsafe_shell_expansion(command) and not _has_only_safe_file_read_redirection(command):
-        if not _has_unquoted_command_or_process_substitution(command):
-            return False
         if _process_substitution_compactable_class(command, sample, text) is not None:
             return False
-        if not (
-            _contains_likely_source_search_output(text)
-            or _contains_multiple_likely_source_search_lines(text)
-        ):
-            return False
+        if len(segments) <= 1:
+            if not _has_unquoted_command_or_process_substitution(command):
+                return False
+            if not (
+                _contains_likely_source_search_output(text)
+                or _contains_multiple_likely_source_search_lines(text)
+            ):
+                return False
     if _pipeline_compactable_class(command, sample, text) is not None:
         return False
     if _pipeline_xargs_compactable_class(command, sample, text) is not None:
         return False
-    segments = _background_segments(command)
     prior_compactable = False
     prior_compactable_output = False
     prior_compactable_signal = False
@@ -3045,10 +3201,16 @@ def _is_source_search_command(
                     if later_segments:
                         if (
                             exit_code == 0
-                            and any(
-                                later_separator == "||" for later_separator, _ in later_segments
+                            and later_segments[0][0] == "||"
+                            and (
+                                _or_fallback_exact_left_succeeded(tokens, text)
+                                or _or_fallback_branch_terminates_current_shell(later_segments)
                             )
-                            and _or_fallback_exact_left_succeeded(tokens, text)
+                            and not _or_tail_has_unconditional_compactable_after_fallback(
+                                later_segments,
+                                sample,
+                                text,
+                            )
                         ):
                             return True
                         if _or_later_exact_fallback_succeeded(
@@ -3081,8 +3243,12 @@ def _is_source_search_command(
                     if _compactable_output_dominates_for_tokens(tokens, sample, text):
                         prior_compactable_output = True
                 continue
-        if _tokens_have_unsafe_shell_expansion(
-            tokens
+        if (
+            _tokens_have_unsafe_shell_expansion(tokens)
+            or (
+                _has_unsafe_shell_expansion(command)
+                and any("$(" in token or "`" in token for token in tokens)
+            )
         ) and _has_unquoted_command_or_process_substitution(command):
             if _compactable_class_for_tokens(tokens, sample, text) is not None:
                 prior_compactable = True
@@ -3098,6 +3264,11 @@ def _is_source_search_command(
                 or _contains_multiple_likely_source_search_lines(text)
             ):
                 continue
+            if (
+                _process_substitution_compactable_class(shlex.join(tokens), sample, text)
+                is not None
+            ):
+                continue
         if _tokens_start_source_search(tokens) or _tokens_pipe_to_source_search(tokens):
             if (
                 separator == "&&"
@@ -3110,6 +3281,12 @@ def _is_source_search_command(
             ):
                 continue
             if separator == "&&" and prior_compactable and exit_code not in {None, 0}:
+                continue
+            if (
+                separator == "&"
+                and prior_compactable_signal
+                and not _text_has_exact_owner_output_for_tokens(tokens, text)
+            ):
                 continue
             if _prior_compactable_output_blocks_exact_tail(
                 separator,
@@ -3126,25 +3303,80 @@ def _is_source_search_command(
                     continue
                 if not _text_has_exact_output_for_tokens(tokens, text):
                     continue
-            later_segments = [
+            semantic_later_segments = [
                 (later_separator, segment)
                 for later_separator, segment in segments[index + 1 :]
-                if segment and not _is_setup_segment(segment)
+                if segment
             ]
-            if later_segments:
+            later_segments = [
+                (later_separator, segment)
+                for later_separator, segment in semantic_later_segments
+                if not _is_setup_segment(segment)
+            ]
+            if semantic_later_segments:
                 if (
                     exit_code == 0
-                    and any(
-                        later_separator == "||" for later_separator, _ in later_segments
+                    and semantic_later_segments[0][0] == "||"
+                    and not _or_tail_has_unconditional_compactable_after_fallback(
+                        semantic_later_segments,
+                        sample,
+                        text,
                     )
-                    and _or_fallback_exact_left_succeeded(tokens, text)
+                    and (
+                        (
+                            not _or_tail_has_any_compactable_fallback(
+                                semantic_later_segments,
+                                sample,
+                                text,
+                            )
+                            and _or_fallback_exact_left_succeeded(tokens, text)
+                        )
+                        or (
+                            _or_fallback_tail_forces_zero(semantic_later_segments)
+                            and not _or_tail_has_any_compactable_fallback(
+                                semantic_later_segments,
+                                sample,
+                                text,
+                            )
+                            and _text_has_exact_output_for_tokens(tokens, text)
+                        )
+                        or (
+                            _or_fallback_tail_forces_nonzero(semantic_later_segments)
+                            and not _or_tail_has_following_compactable_fallback(
+                                semantic_later_segments,
+                                sample,
+                                text,
+                            )
+                            and _text_has_exact_output_for_tokens(tokens, text)
+                        )
+                    )
                 ):
                     return True
+                if (
+                    semantic_later_segments[0][0] == "||"
+                    and _or_tail_has_reachable_compactable_output(
+                        semantic_later_segments,
+                        sample,
+                        text,
+                    )
+                    and not _text_has_exact_owner_output_against_later_compactable(
+                        tokens,
+                        text,
+                    )
+                ):
+                    return False
                 if _or_later_exact_fallback_succeeded(
                     later_segments,
                     sample,
                     text,
                     exit_code,
+                ):
+                    return True
+                if _hidden_compactable_tail_preserves_exact_output(
+                    tokens,
+                    later_segments,
+                    sample,
+                    text,
                 ):
                     return True
                 if _later_compactable_output_dominates(
@@ -3181,6 +3413,74 @@ def _source_consumer_command_class(
 ) -> str | None:
     substitution_class = _process_substitution_compactable_class(command, sample, text)
     if substitution_class is not None:
+        segments = _background_segments(command)
+        substitution_index = next(
+            (
+                index
+                for index, (_separator, tokens) in enumerate(segments)
+                if any("$(" in token or "`" in token for token in tokens)
+            ),
+            -1,
+        )
+        if substitution_index > 0:
+            substitution_tokens = _segment_tokens_with_enclosing_group_redirects(
+                segments,
+                substitution_index,
+            )
+            substitution_stdout_hidden = _tokens_hide_stdout_from_capture(
+                substitution_tokens
+            )
+            substitution_stderr_hidden = _tokens_hide_stderr_from_capture(
+                substitution_tokens
+            )
+            if (
+                substitution_stdout_hidden
+                and (
+                    substitution_stderr_hidden
+                    or not _contains_redirected_compactable_stderr(text)
+                )
+                and segments[substitution_index][0] in {"&&", "||", ";", "&"}
+            ):
+                previous_exact_class = (
+                    _previous_exact_output_class_when_later_output_is_hidden(
+                        segments[:substitution_index],
+                        text,
+                    )
+                )
+                if previous_exact_class is not None:
+                    return previous_exact_class
+        if substitution_index > 0 and segments[substitution_index][0] in {"&&", ";", "&"}:
+            previous_exact_class = _previous_exact_output_class(
+                segments[:substitution_index],
+                text,
+                exit_code=exit_code,
+            )
+            if previous_exact_class is not None:
+                return previous_exact_class
+        later_segments = segments[substitution_index + 1 :]
+        if exit_code == 0 and (
+            _or_fallback_branch_terminates_current_shell(later_segments)
+            or (
+                _or_fallback_tail_forces_zero(later_segments)
+                and not _or_tail_has_any_compactable_fallback(
+                    later_segments,
+                    sample,
+                    text,
+                )
+            )
+        ):
+            return substitution_class
+        for _separator, tokens in reversed(later_segments):
+            exact_class = _exact_class_for_tokens(tokens)
+            if exact_class is not None and _text_has_exact_owner_output_against_later_compactable(
+                tokens,
+                text,
+                exit_code=exit_code,
+            ):
+                return exact_class
+            later_output_class = _compactable_output_class_for_tokens(tokens, sample, text)
+            if later_output_class is not None:
+                return later_output_class
         return substitution_class
     for variant in _command_intent_variants(command):
         command_class = _background_tail_command_class(
@@ -3202,6 +3502,167 @@ def _source_consumer_command_class(
     return None
 
 
+def _previous_exact_output_class(
+    segments: list[tuple[str | None, list[str]]],
+    text: str,
+    *,
+    exit_code: int | None = None,
+) -> str | None:
+    for _separator, tokens in reversed(segments):
+        if not tokens or _is_setup_segment(tokens):
+            continue
+        exact_class = _exact_class_for_tokens(tokens)
+        if exact_class is not None:
+            return (
+                exact_class
+                if _text_has_exact_owner_output_against_later_compactable(
+                    tokens,
+                    text,
+                    exit_code=exit_code,
+                )
+                else None
+            )
+        if _compactable_output_class_for_tokens(tokens, text[:2_000], text) is not None:
+            return None
+    return None
+
+
+def _previous_exact_output_class_when_later_output_is_hidden(
+    segments: list[tuple[str | None, list[str]]],
+    text: str,
+) -> str | None:
+    for _separator, tokens in reversed(segments):
+        if not tokens or _is_setup_segment(tokens):
+            continue
+        exact_class = _exact_class_for_tokens(tokens)
+        if exact_class == "file_read":
+            return None if _contains_file_read_error_for_tokens(tokens, text) else exact_class
+        if exact_class == "source_search":
+            return exact_class if _text_has_exact_output_for_tokens(tokens, text) else None
+        return None
+    return None
+
+
+def _segments_before_unconditional_current_shell_exit(
+    segments: list[tuple[str | None, list[str]]],
+) -> tuple[list[tuple[str | None, list[str]]], bool]:
+    reachable: list[tuple[str | None, list[str]]] = []
+    paren_depth = 0
+    first_meaningful = True
+    previous_forces_zero = False
+    previous_forces_nonzero = False
+    for separator, tokens in segments:
+        reachable.append((separator, tokens))
+        command_paren_depth = paren_depth + tokens.count("(")
+        normalized = _strip_grouping_tokens(tokens)
+        if (
+            normalized
+            and Path(normalized[0]).name.lower() == "exit"
+            and command_paren_depth == 0
+            and (
+                first_meaningful
+                or separator == ";"
+                or (separator == "&&" and previous_forces_zero)
+                or (separator == "||" and previous_forces_nonzero)
+            )
+        ):
+            return reachable, True
+        paren_depth = max(
+            0,
+            command_paren_depth - tokens.count(")"),
+        )
+        if normalized:
+            command_name = Path(normalized[0]).name.lower()
+            previous_forces_zero = command_name in {":", "echo", "printf", "true"}
+            previous_forces_nonzero = command_name == "false"
+            first_meaningful = False
+    return reachable, False
+
+
+def _segment_tokens_with_enclosing_group_redirects(
+    segments: list[tuple[str | None, list[str]]],
+    index: int,
+) -> list[str]:
+    """Include redirects applied to any shell group enclosing one segment."""
+    effective_tokens = list(segments[index][1])
+    group_depth = 0
+    for _separator, tokens in segments[: index + 1]:
+        group_depth += tokens.count("{") + tokens.count("(")
+        group_depth = max(0, group_depth - tokens.count("}") - tokens.count(")"))
+    if group_depth == 0:
+        return effective_tokens
+
+    enclosing_depth = group_depth
+    for _separator, tokens in segments[index + 1 :]:
+        next_depth = group_depth + tokens.count("{") + tokens.count("(")
+        next_depth = max(0, next_depth - tokens.count("}") - tokens.count(")"))
+        if next_depth < enclosing_depth:
+            effective_tokens.extend(tokens)
+            enclosing_depth = next_depth
+        group_depth = next_depth
+        if enclosing_depth == 0:
+            break
+    return effective_tokens
+
+
+def _compactable_segment_can_contribute_output(tokens: list[str], text: str) -> bool:
+    stdout_visible, stderr_visible = _redirected_stream_visibility(tokens)
+    return stdout_visible or (
+        stderr_visible and _contains_redirected_compactable_stderr(text)
+    )
+
+
+def _contains_redirected_compactable_stderr(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(?im)^[^\S\r\n]*(?:npm|pnpm)\s+"
+            r"(?:err!|error|warn(?:ing)?)(?:\s|$)|"
+            r"^[^\S\r\n]*err_pnpm(?:_|\b)|^[^\S\r\n]*warn\s+|"
+            r"^[^\S\r\n]*yarn\b.*\berror\b|"
+            r"^[^\S\r\n]*traceback\b|"
+            r"^[^\S\r\n]*[a-z_][a-z0-9_]*(?:error|exception):|"
+            r"^[^\S\r\n]*(?:e:|err:|error:)\s+\S|"
+            r"\bfailed to (?:solve|build|install)\b",
+            text,
+        )
+    )
+
+
+def _hidden_compactable_tail_preserves_exact_output(
+    exact_tokens: list[str],
+    later_segments: list[tuple[str | None, list[str]]],
+    sample: str,
+    text: str,
+) -> bool:
+    if not _text_has_exact_output_for_tokens(exact_tokens, text):
+        return False
+    later_segments, _terminated = _segments_before_unconditional_current_shell_exit(
+        later_segments
+    )
+    saw_hidden_stdout = False
+    for index, (_separator, segment) in enumerate(later_segments):
+        if _compactable_class_for_tokens(segment, sample, text) is None:
+            continue
+        effective_tokens = _segment_tokens_with_enclosing_group_redirects(
+            later_segments,
+            index,
+        )
+        stdout_hidden = _tokens_hide_stdout_from_capture(effective_tokens)
+        stderr_hidden = _tokens_hide_stderr_from_capture(effective_tokens)
+        if not stdout_hidden:
+            if _separator != "||":
+                return False
+            if saw_hidden_stdout and _contains_redirected_compactable_stderr(text):
+                return False
+            continue
+        saw_hidden_stdout = True
+        if stderr_hidden:
+            continue
+        if _contains_redirected_compactable_stderr(text):
+            return False
+    return saw_hidden_stdout
+
+
 def _background_tail_command_class(
     command: str,
     sample: str,
@@ -3215,10 +3676,75 @@ def _background_tail_command_class(
             continue
         exact_class = _exact_class_for_tokens(tokens)
         if exact_class is not None:
-            later_compactable_class = _later_compactable_class(segments[index + 1 :], sample, text)
+            for _previous_separator, previous_tokens in reversed(segments[:index]):
+                if not previous_tokens or _is_setup_segment(previous_tokens):
+                    continue
+                previous_output_class = _compactable_output_class_for_tokens(
+                    previous_tokens,
+                    sample,
+                    text,
+                )
+                if previous_output_class is not None and (
+                    exact_class == "file_read"
+                    or not _text_has_exact_owner_output_for_tokens(tokens, text)
+                ):
+                    return previous_output_class
+                break
+            later_compactable_class = _later_compactable_class(
+                [
+                    (later_separator, segment)
+                    for later_separator, segment in segments[index + 1 :]
+                    if not _tokens_hide_stdout_from_capture(segment)
+                    or (
+                        exit_code not in {None, 0}
+                        and _compactable_output_class_for_tokens(segment, sample, text) is not None
+                        and not _text_has_exact_output_for_tokens(tokens, text)
+                    )
+                ],
+                sample,
+                text,
+            )
             return later_compactable_class or exact_class
         compactable_class = _compactable_class_for_tokens(tokens, sample, text)
         if compactable_class is not None:
+            if (
+                index > 0
+                and _compactable_output_class_for_tokens(tokens, sample, text) is None
+            ):
+                previous_exact_class = _previous_exact_output_class(
+                    segments[:index],
+                    text,
+                    exit_code=exit_code,
+                )
+                if previous_exact_class is not None:
+                    return previous_exact_class
+            if _tokens_hide_stdout_from_capture(tokens) and index > 0:
+                previous_exact_class = _previous_exact_output_class(
+                    segments[:index],
+                    text,
+                    exit_code=exit_code,
+                )
+                if previous_exact_class is not None:
+                    return previous_exact_class
+                if not _contains_redirected_compactable_stderr(text):
+                    for _previous_separator, previous_tokens in reversed(segments[:index]):
+                        if _is_setup_segment(previous_tokens):
+                            continue
+                        previous_exact_class = _exact_class_for_tokens(previous_tokens)
+                        if previous_exact_class == "file_read" or (
+                            previous_exact_class == "source_search"
+                            and _text_has_exact_output_for_tokens(previous_tokens, text)
+                        ):
+                            return previous_exact_class
+                        break
+            if (
+                _tokens_hide_stdout_from_capture(tokens)
+                and index > 0
+                and _compactable_output_class_for_tokens(tokens, sample, text) is None
+            ):
+                previous_exact_class = _exact_class_for_tokens(segments[index - 1][1])
+                if previous_exact_class is not None:
+                    return previous_exact_class
             later_exact_class = _later_exact_tail_class(
                 segments[index + 1 :],
                 sample,
@@ -3267,11 +3793,16 @@ def _later_compactable_class(
     sample: str,
     text: str,
 ) -> str | None:
-    for _separator, tokens in segments:
+    segments, _terminated = _segments_before_unconditional_current_shell_exit(segments)
+    for index, (_separator, tokens) in enumerate(segments):
         if not tokens or _is_setup_segment(tokens):
             continue
+        effective_tokens = _segment_tokens_with_enclosing_group_redirects(segments, index)
         command_class = _compactable_class_for_tokens(tokens, sample, text)
-        if command_class is not None:
+        if command_class is not None and _compactable_segment_can_contribute_output(
+            effective_tokens,
+            text,
+        ):
             return command_class
     return None
 
@@ -3282,15 +3813,20 @@ def _later_compactable_output_ran(
     text: str,
     exit_code: int | None,
 ) -> bool:
-    for separator, tokens in segments:
+    segments, _terminated = _segments_before_unconditional_current_shell_exit(segments)
+    for index, (separator, tokens) in enumerate(segments):
         if not tokens or _is_setup_segment(tokens):
             continue
         if separator == "&":
             continue
         if separator == "||" and exit_code == 0:
             continue
+        effective_tokens = _segment_tokens_with_enclosing_group_redirects(segments, index)
         command_class = _compactable_output_class_for_tokens(tokens, sample, text)
-        if command_class is not None:
+        if command_class is not None and _compactable_segment_can_contribute_output(
+            effective_tokens,
+            text,
+        ):
             return True
     return False
 
@@ -3301,13 +3837,27 @@ def _later_compactable_output_dominates(
     text: str,
     exit_code: int | None,
 ) -> bool:
-    for separator, tokens in segments:
+    segments, _terminated = _segments_before_unconditional_current_shell_exit(segments)
+    for index, (separator, tokens) in enumerate(segments):
         if not tokens or _is_setup_segment(tokens):
             continue
         if separator == "&":
             continue
         if _exact_class_for_tokens(tokens) is not None:
             continue
+        effective_tokens = _segment_tokens_with_enclosing_group_redirects(segments, index)
+        if (
+            _tokens_hide_stdout_from_capture(effective_tokens)
+            and _tokens_hide_stderr_from_capture(effective_tokens)
+        ):
+            continue
+        if (
+            _tokens_hide_stdout_from_capture(effective_tokens)
+            and not _tokens_hide_stderr_from_capture(effective_tokens)
+            and _contains_redirected_compactable_stderr(text)
+            and _compactable_class_for_tokens(tokens, sample, text) is not None
+        ):
+            return True
         if _compactable_output_dominates_for_tokens(tokens, sample, text):
             return True
     return False
@@ -3346,6 +3896,273 @@ def _or_later_exact_fallback_succeeded(
         if not _later_compactable_output_dominates(following, sample, text, exit_code):
             return True
     return False
+
+
+def _top_level_or_fallback_branches(
+    segments: list[tuple[str | None, list[str]]],
+) -> list[list[tuple[str | None, list[str]]]]:
+    branches: list[list[tuple[str | None, list[str]]]] = []
+    current: list[tuple[str | None, list[str]]] = []
+    started = False
+    group_depth = 0
+    for separator, tokens in segments:
+        if not started:
+            if separator != "||":
+                continue
+            started = True
+        elif group_depth == 0 and separator == "||":
+            if current:
+                branches.append(current)
+            current = []
+        current.append((separator, tokens))
+        group_depth += tokens.count("{") + tokens.count("(")
+        group_depth = max(0, group_depth - tokens.count("}") - tokens.count(")"))
+    if current:
+        branches.append(current)
+    return branches
+
+
+def _or_tail_has_any_compactable_fallback(
+    segments: list[tuple[str | None, list[str]]],
+    sample: str,
+    text: str,
+) -> bool:
+    for branch in _top_level_or_fallback_branches(segments):
+        reachable_branch, terminated = _segments_before_unconditional_current_shell_exit(branch)
+        if any(
+            _compactable_class_for_tokens(tokens, sample, text)
+            and _compactable_segment_can_contribute_output(
+                _segment_tokens_with_enclosing_group_redirects(reachable_branch, index),
+                text,
+            )
+            for index, (_separator, tokens) in enumerate(reachable_branch)
+        ):
+            return True
+        if terminated:
+            return False
+        if _or_fallback_branch_terminates_current_shell(branch):
+            return False
+        if _or_fallback_tail_forces_zero(branch):
+            return False
+    return False
+
+
+def _or_tail_has_reachable_compactable_output(
+    segments: list[tuple[str | None, list[str]]],
+    sample: str,
+    text: str,
+) -> bool:
+    if not _or_tail_has_any_compactable_fallback(segments, sample, text):
+        return False
+    return any(
+        _compactable_output_class_for_tokens(tokens, sample, text) is not None
+        and _compactable_segment_can_contribute_output(
+            _segment_tokens_with_enclosing_group_redirects(segments, index),
+            text,
+        )
+        for index, (_separator, tokens) in enumerate(segments)
+    )
+
+
+def _or_fallback_branch_terminates_current_shell(
+    segments: list[tuple[str | None, list[str]]],
+) -> bool:
+    saw_fallback = False
+    brace_depth = 0
+    paren_depth = 0
+    previous_forces_zero = False
+    previous_forces_nonzero = False
+    for separator, tokens in segments:
+        first_fallback_segment = not saw_fallback
+        if not saw_fallback:
+            if separator != "||":
+                continue
+            saw_fallback = True
+        elif brace_depth == 0 and paren_depth == 0:
+            break
+
+        brace_depth += tokens.count("{")
+        paren_depth += tokens.count("(")
+        normalized = _strip_grouping_tokens(tokens)
+        is_numeric_exit = bool(
+            normalized
+            and Path(normalized[0]).name.lower() == "exit"
+            and len(normalized) >= 2
+            and re.fullmatch(r"[+-]?\d+", normalized[1])
+        )
+        if is_numeric_exit and (
+            (
+                first_fallback_segment
+                and brace_depth == 0
+                and paren_depth == 0
+            )
+            or (
+                int(normalized[1]) % 256 != 0
+                and (
+                    first_fallback_segment
+                    or separator == ";"
+                    or (separator == "&&" and previous_forces_zero)
+                    or (separator == "||" and previous_forces_nonzero)
+                )
+                and brace_depth > 0
+                and paren_depth == 0
+            )
+        ):
+            return True
+        if normalized:
+            command_name = Path(normalized[0]).name.lower()
+            previous_forces_zero = command_name in {":", "echo", "printf", "true"}
+            previous_forces_nonzero = command_name == "false"
+        brace_depth = max(0, brace_depth - tokens.count("}"))
+        paren_depth = max(0, paren_depth - tokens.count(")"))
+        if saw_fallback and brace_depth == 0 and paren_depth == 0:
+            break
+    return False
+
+
+def _or_tail_has_following_compactable_fallback(
+    segments: list[tuple[str | None, list[str]]],
+    sample: str,
+    text: str,
+) -> bool:
+    if _or_fallback_branch_terminates_current_shell(segments):
+        return False
+    saw_fallback = False
+    group_depth = 0
+    branch_done = False
+    for index, (separator, tokens) in enumerate(segments):
+        if not saw_fallback:
+            if separator != "||":
+                continue
+            saw_fallback = True
+        elif not branch_done:
+            if group_depth == 0:
+                branch_done = True
+            else:
+                group_depth += tokens.count("{") + tokens.count("(")
+                group_depth = max(0, group_depth - tokens.count("}") - tokens.count(")"))
+                if group_depth == 0:
+                    branch_done = True
+                continue
+
+        if not branch_done:
+            group_depth += tokens.count("{") + tokens.count("(")
+            group_depth = max(0, group_depth - tokens.count("}") - tokens.count(")"))
+            if group_depth == 0:
+                branch_done = True
+            continue
+        if (
+            separator == "||"
+            and _compactable_class_for_tokens(tokens, sample, text)
+            and _compactable_segment_can_contribute_output(
+                _segment_tokens_with_enclosing_group_redirects(segments, index),
+                text,
+            )
+        ):
+            return True
+    return False
+
+
+def _or_tail_has_unconditional_compactable_after_fallback(
+    segments: list[tuple[str | None, list[str]]],
+    sample: str,
+    text: str,
+) -> bool:
+    saw_fallback = False
+    group_depth = 0
+    for index, (separator, tokens) in enumerate(segments):
+        if separator == "||" and not saw_fallback:
+            saw_fallback = True
+            group_depth += tokens.count("{") + tokens.count("(")
+            group_depth = max(0, group_depth - tokens.count("}") - tokens.count(")"))
+            continue
+        if not saw_fallback:
+            continue
+        if (
+            group_depth == 0
+            and separator in {";", "&&", "&"}
+            and _compactable_class_for_tokens(tokens, sample, text)
+            and _compactable_segment_can_contribute_output(
+                _segment_tokens_with_enclosing_group_redirects(segments, index),
+                text,
+            )
+        ):
+            return True
+        group_depth += tokens.count("{") + tokens.count("(")
+        group_depth = max(0, group_depth - tokens.count("}") - tokens.count(")"))
+    return False
+
+
+def _or_fallback_tail_forces_zero(
+    segments: list[tuple[str | None, list[str]]],
+) -> bool:
+    branch_tokens: list[list[str]] = []
+    saw_fallback = False
+    group_depth = 0
+    for separator, tokens in segments:
+        if not saw_fallback:
+            if separator != "||":
+                continue
+            saw_fallback = True
+        elif group_depth == 0:
+            break
+
+        normalized = _strip_grouping_tokens(tokens)
+        if normalized:
+            branch_tokens.append(normalized)
+        group_depth += tokens.count("{") + tokens.count("(")
+        group_depth = max(0, group_depth - tokens.count("}") - tokens.count(")"))
+        if saw_fallback and group_depth == 0:
+            break
+
+    if not branch_tokens:
+        return False
+    last_command = Path(branch_tokens[-1][0]).name.lower()
+    if last_command in {"true", ":", "echo", "printf"}:
+        return True
+    if last_command != "exit" or len(branch_tokens[-1]) == 1:
+        return False
+    try:
+        return int(branch_tokens[-1][1]) % 256 == 0
+    except ValueError:
+        return False
+
+
+def _or_fallback_tail_forces_nonzero(
+    segments: list[tuple[str | None, list[str]]],
+) -> bool:
+    """Return True when the immediate || fallback branch cannot explain exit_code=0."""
+
+    branch_tokens: list[list[str]] = []
+    saw_fallback = False
+    group_depth = 0
+    for separator, tokens in segments:
+        if not saw_fallback:
+            if separator != "||":
+                continue
+            saw_fallback = True
+        elif group_depth == 0:
+            break
+
+        normalized = _strip_grouping_tokens(tokens)
+        if normalized:
+            branch_tokens.append(normalized)
+        group_depth += tokens.count("{") + tokens.count("(")
+        group_depth = max(0, group_depth - tokens.count("}") - tokens.count(")"))
+        if saw_fallback and group_depth == 0:
+            break
+
+    if not branch_tokens:
+        return False
+    last_command = Path(branch_tokens[-1][0]).name.lower()
+    if last_command == "false":
+        return True
+    if last_command != "exit" or len(branch_tokens[-1]) == 1:
+        return False
+    try:
+        return int(branch_tokens[-1][1]) != 0
+    except ValueError:
+        return False
 
 
 def _later_exact_tail_class(
@@ -3401,11 +4218,89 @@ def _tokens_redirect_stdout(tokens: list[str]) -> bool:
     return False
 
 
+def _redirected_stream_visibility(tokens: list[str]) -> tuple[bool, bool]:
+    stdout_visible = True
+    stderr_visible = True
+
+    def target_visibility(target: str) -> bool:
+        if target in {"&1", "/dev/stdout", "/dev/fd/1", "/proc/self/fd/1"}:
+            return stdout_visible
+        if target in {"&2", "/dev/stderr", "/dev/fd/2", "/proc/self/fd/2"}:
+            return stderr_visible
+        return False
+
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"&>", "&>>"} or token.startswith(("&>", "&>>")):
+            target = token[2:]
+            if token.startswith("&>>"):
+                target = token[3:]
+            if not target and index + 1 < len(tokens):
+                target = tokens[index + 1]
+                index += 1
+            visibility = target_visibility(target)
+            stdout_visible = visibility
+            stderr_visible = visibility
+            index += 1
+            continue
+
+        fd_prefix = ""
+        redirect_token = token
+        if token in {"1", "2"} and index + 1 < len(tokens):
+            next_token = tokens[index + 1]
+            if next_token in {">", ">>", ">|"}:
+                fd_prefix = token
+                redirect_token = next_token
+                index += 1
+
+        match = re.fullmatch(r"([12]?)(>>?|>\|)(.*)", redirect_token)
+        if match is None:
+            index += 1
+            continue
+        fd = fd_prefix or match.group(1) or "1"
+        target = match.group(3)
+        if not target and index + 1 < len(tokens):
+            target = tokens[index + 1]
+            index += 1
+        visibility = target_visibility(target)
+        if fd == "2":
+            stderr_visible = visibility
+        else:
+            stdout_visible = visibility
+        index += 1
+
+    return stdout_visible, stderr_visible
+
+
+def _tokens_hide_stdout_from_capture(tokens: list[str]) -> bool:
+    stdout_visible, _stderr_visible = _redirected_stream_visibility(tokens)
+    return not stdout_visible
+
+
+def _tokens_hide_stderr_from_capture(tokens: list[str]) -> bool:
+    _stdout_visible, stderr_visible = _redirected_stream_visibility(tokens)
+    return not stderr_visible
+
+
+def _tokens_redirect_stderr(tokens: list[str]) -> bool:
+    for index, token in enumerate(tokens):
+        if token in {"2>", "2>>", "&>"}:
+            return True
+        if token.startswith(("2>", "&>")):
+            return True
+        if token == "2" and index + 1 < len(tokens) and tokens[index + 1] in {">", ">>"}:
+            return True
+    return False
+
+
 def _tokens_have_unsafe_shell_expansion(tokens: list[str]) -> bool:
     for index, token in enumerate(tokens):
         if token == "<" and index + 1 < len(tokens) and tokens[index + 1] == "(":
             return True
         if token == "$" and index + 1 < len(tokens) and tokens[index + 1] == "(":
+            return True
+        if token.endswith("$") and index + 1 < len(tokens) and tokens[index + 1] == "(":
             return True
         if (
             "`" in token
@@ -3439,7 +4334,7 @@ def _pipeline_compactable_class(command: str, sample: str, text: str) -> str | N
     token_variants.extend(_command_token_segments(command))
     for tokens in token_variants:
         for index, token in enumerate(tokens[:-1]):
-            if token != "|":
+            if token not in {"|", "|&"}:
                 continue
             upstream = tokens[:index]
             if not _tokens_start_exact_output_producer(upstream):
@@ -3458,7 +4353,7 @@ def _pipeline_xargs_compactable_class(command: str, sample: str, text: str) -> s
     token_variants.extend(_command_token_segments(command))
     for tokens in token_variants:
         for index, token in enumerate(tokens[:-1]):
-            if token != "|":
+            if token not in {"|", "|&"}:
                 continue
             upstream = tokens[:index]
             if not _tokens_start_exact_output_producer(upstream):
@@ -3643,7 +4538,14 @@ def _compactable_output_dominates_for_tokens(
         )
     if command_class == "node":
         return bool(
-            len(re.findall(r"(?im)^(?:npm err!|pnpm err!|yarn.*error|err_pnpm)", output)) >= 2
+            len(
+                re.findall(
+                    r"(?im)^\s*(?:(?:npm|pnpm)\s+(?:err!|error|warn(?:ing)?)|"
+                    r"yarn.*error|err_pnpm|warn\s+)",
+                    output,
+                )
+            )
+            >= 2
             or re.search(r"(?i)\b(?:typeerror|referenceerror|syntaxerror|rangeerror):", output)
             or re.search(r"(?im)^\s*error:\s+\S", output)
             or re.search(r"(?im)^\s+at\s+.+\(.+\)", output)
@@ -3737,15 +4639,7 @@ def _text_has_exact_owner_output_against_later_compactable(
         ):
             if _tokens_source_search_uses_fixed_strings(
                 tokens
-            ) and (
-                _source_search_fixed_pattern_dominates_text(tokens, text)
-                or _source_search_fixed_pattern_context_owns_text(tokens, text)
-                or _source_search_pattern_owns_repeated_non_source_lines(
-                    tokens,
-                    text,
-                    allow_compactable_signals=True,
-                )
-            ):
+            ) and _source_search_fixed_pattern_context_owns_text(tokens, text):
                 return True
             if _source_search_pattern_context_owns_text(tokens, text):
                 return True
@@ -3820,10 +4714,11 @@ def _contains_later_command_output_anchor(
     failure_exit = exit_code not in {None, 0}
     return bool(
         re.search(
-            r"(?im)^(?:npm|pnpm|yarn|pip|uv|apt(?:-get)?|docker|pytest)\b.*"
-            r"(?:noise|progress|err|error|failed|passed|install|sync|build|after|before)",
+            r"(?im)^[^\S\r\n]*(?:npm|pnpm|yarn|pip|uv|apt(?:-get)?|docker|pytest)\b.*"
+            r"(?:noise|progress|err|error|warn|failed|passed|install|sync|build|after|before)",
             text,
         )
+        or re.search(r"(?im)^\s*err_pnpm(?:_|\b)|^\s*warn\s+", text)
         or re.search(r"(?im)^(?:added|removed|changed|audited)\s+\d+\s+packages?\b", text)
         or re.search(r"(?im)^\s*found\s+0\s+vulnerabilities\b", text)
         or re.search(r"(?im)^\s*(?:setting up|successfully installed)\b", text)
@@ -3885,7 +4780,17 @@ def _or_fallback_exact_left_succeeded(tokens: list[str], text: str) -> bool:
     if _contains_file_read_error(text):
         return False
     if _tokens_start_file_read(tokens) or _tokens_pipe_to_file_read(tokens):
+        if _tokens_hide_stderr_from_capture(tokens):
+            return _contains_likely_file_read_output(text) or _starts_like_file_read_output(text)
         return True
+    if _tokens_start_source_search(tokens) or _tokens_pipe_to_source_search(tokens):
+        return _contains_likely_source_search_output(text) or (
+            _tokens_source_search_uses_fixed_strings(tokens)
+            and (
+                _source_search_fixed_pattern_dominates_text(tokens, text)
+                or _source_search_heading_block_owns_text(tokens, text)
+            )
+        )
     return _text_has_exact_owner_output_for_tokens(tokens, text)
 
 
@@ -4398,7 +5303,8 @@ def _file_read_plain_context_owns_compactable_literal(text: str) -> bool:
     if len(lines) < 3:
         return False
     compactable_lines = sum(1 for line in lines if _line_looks_like_compactable_context(line))
-    return compactable_lines == 1 and len(lines) - compactable_lines >= 2
+    plain_lines = len(lines) - compactable_lines
+    return compactable_lines <= max(2, len(lines) // 10) and plain_lines >= 2
 
 
 def _line_looks_like_compactable_context(line: str) -> bool:
@@ -4406,10 +5312,10 @@ def _line_looks_like_compactable_context(line: str) -> bool:
     return bool(
         _line_looks_like_compactable_output(stripped)
         or re.search(r"(?i)^#\d+\b", stripped)
-        or re.search(r"(?i)^=>\b", stripped)
+        or re.search(r"(?i)^=>\s", stripped)
         or re.search(r"(?i)^tests?/.*::.*\b(?:passed|failed|error)\b", stripped)
         or re.search(r"(?i)(?:^|\|)\s*#\d+\b", stripped)
-        or re.search(r"(?i)(?:^|\|)\s*=>\b", stripped)
+        or re.search(r"(?i)(?:^|\|)\s*=>\s", stripped)
         or re.search(r"(?i)(?:^|\|)\s*\d+%\s+\[[^\]]+\]", stripped)
         or re.search(r"(?i)(?:^|\|)\s*(?:get|hit|ign):\d+\b", stripped)
         or re.search(
@@ -4427,6 +5333,7 @@ def _line_looks_like_compactable_output(line: str) -> bool:
     return bool(
         re.search(r"(?i)^(?:npm|pnpm|yarn|pip|uv|apt(?:-get)?|docker|pytest)\b", stripped)
         or re.search(r"(?i)^(?:npm err!|pnpm err!|yarn.*error|err_pnpm)\b", stripped)
+        or re.search(r"(?i)^warn\s+", stripped)
         or re.search(
             r"(?i)^(?:e:|err:|error:)\s+(?:no matching distribution found|"
             r"could not build wheels|unable to locate package|failed|error|"
@@ -4770,7 +5677,7 @@ def _tokens_start_find_path_list(tokens: list[str]) -> bool:
 def _tokens_pipe_to_file_read(tokens: list[str]) -> bool:
     tokens = _strip_command_wrappers(tokens)
     for index, token in enumerate(tokens[:-1]):
-        if token == "|":
+        if token in {"|", "|&"}:
             downstream = _strip_command_wrappers(tokens[index + 1 :])
             upstream = tokens[:index]
             if _tokens_start_compactable_command(upstream):
@@ -4796,7 +5703,7 @@ def _tokens_pipe_to_file_read(tokens: list[str]) -> bool:
 def _tokens_pipe_to_source_search(tokens: list[str]) -> bool:
     tokens = _strip_command_wrappers(tokens)
     for index, token in enumerate(tokens[:-1]):
-        if token == "|":
+        if token in {"|", "|&"}:
             downstream = tokens[index + 1 :]
             if _tokens_start_source_search(downstream):
                 upstream = tokens[:index]
@@ -5098,11 +6005,70 @@ def _skip_option_tokens(tokens: list[str]) -> list[str]:
     return tokens[index:]
 
 
+def _split_shell_punctuation_token(token: str) -> list[str]:
+    if token == "{}":
+        return [token]
+    separators: list[str] = []
+    index = 0
+    while index < len(token):
+        pair = token[index : index + 2]
+        if pair in {"||", "&&", "|&"}:
+            separators.append(pair)
+            index += 2
+            continue
+        separators.append(token[index])
+        index += 1
+    return separators
+
+
+def _merge_shell_redirection_tokens(tokens: list[str]) -> list[str]:
+    merged: list[str] = []
+    index = 0
+    while index < len(tokens):
+        if (
+            index + 2 < len(tokens)
+            and tokens[index] in {">", ">>"}
+            and tokens[index + 1] == "&"
+            and tokens[index + 2] not in SHELL_SEPARATORS
+            and not re.fullmatch(r"(?:\d+|-)", tokens[index + 2])
+        ):
+            combined_redirect = "&>" if tokens[index] == ">" else "&>>"
+            merged.append(combined_redirect + tokens[index + 2])
+            index += 3
+            continue
+        if (
+            index + 2 < len(tokens)
+            and tokens[index].endswith((">", "<"))
+            and tokens[index + 1] == "&"
+            and re.fullmatch(r"(?:\d+|-)", tokens[index + 2])
+        ):
+            merged.append(tokens[index] + "&" + tokens[index + 2])
+            index += 3
+            continue
+        if (
+            tokens[index] == "&"
+            and index + 1 < len(tokens)
+            and (tokens[index + 1] == ">" or tokens[index + 1].startswith(">"))
+        ):
+            merged.append("&" + tokens[index + 1])
+            index += 2
+            continue
+        merged.append(tokens[index])
+        index += 1
+    return merged
+
+
 def _shell_tokens(command: str) -> list[str]:
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars="();&|{}")
         lexer.whitespace_split = True
-        return list(lexer)
+        tokens: list[str] = []
+        for token in lexer:
+            if token and all(char in "();&|{}" for char in token):
+                tokens.extend(_split_shell_punctuation_token(token))
+            else:
+                tokens.append(token)
+        return _merge_shell_redirection_tokens(tokens)
     except ValueError:
         return command.split()
 

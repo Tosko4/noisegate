@@ -930,6 +930,42 @@ def test_artifact_notice_path_keeps_package_failure_line(tmp_path: Path) -> None
     assert "E: Unable to locate package imaginary-package" in stdout
 
 
+def test_artifact_notice_path_marks_gaps_between_stitched_failure_lines(tmp_path: Path) -> None:
+    raw_stdout = "\n".join(
+        [
+            *[f"pytest setup noise {index}" for index in range(30)],
+            "Traceback (most recent call last):",
+            "ModuleNotFoundError: No module named missing_pkg",
+            *[f"pytest more noise {index}" for index in range(16)],
+            "FAILED tests/test_demo.py::test_signal",
+            *[f"pytest tail noise {index}" for index in range(30)],
+        ]
+    )
+
+    result = reduce_text(
+        raw_stdout,
+        command="pytest -q",
+        tool_name="terminal",
+        exit_code=1,
+        options=opts(
+            max_chars=900,
+            max_lines=12,
+            head_lines=1,
+            tail_lines=1,
+            artifact_enabled=True,
+            artifact_dir=tmp_path / "artifacts",
+        ),
+    )
+
+    assert result.changed is True
+    assert "Traceback (most recent call last):" in result.text
+    assert "ModuleNotFoundError: No module named missing_pkg" in result.text
+    assert "FAILED tests/test_demo.py::test_signal" in result.text
+    assert "[noisegate: omitted" in result.text
+    assert result.text.index("Traceback") < result.text.index("ModuleNotFoundError")
+    assert result.text.index("ModuleNotFoundError") < result.text.index("FAILED")
+
+
 def test_log_filter_pipelines_still_use_the_original_slop_classifier() -> None:
     raw = "\n".join(
         [
@@ -941,6 +977,7 @@ def test_log_filter_pipelines_still_use_the_original_slop_classifier() -> None:
 
     for command in (
         "apt install imaginary-package | grep ERROR",
+        "apt install imaginary-package |& grep ERROR",
         "apt install imaginary-package | head -100",
     ):
         result = reduce_text(
@@ -2948,39 +2985,43 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
     assert exact_yarn_cwd_search.changed is False
     assert exact_yarn_cwd_search.metadata["command_class"] == "source_search"
 
-    for literal in (
-        "added 451 packages literal source line",
-        "added 451 packages in 12s",
-        "123 passed in 2.00s",
-    ):
-        exact_hidden_fixed_package_literal = reduce_text(
-            "\n".join(literal for _ in range(80)),
-            command=f"rg -F -h '{literal}' src || npm install",
-            tool_name="terminal",
-            exit_code=0,
-            options=compact_opts,
-        )
-        assert exact_hidden_fixed_package_literal.changed is False, literal
-        assert (
-            exact_hidden_fixed_package_literal.metadata["command_class"] == "source_search"
-        ), literal
+    literal = "literal source line with target token"
+    exact_hidden_fixed_package_literal = reduce_text(
+        "\n".join(literal for _ in range(80)),
+        command=f"rg -F -h '{literal}' src || npm install",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert exact_hidden_fixed_package_literal.changed is False
+    assert exact_hidden_fixed_package_literal.metadata["command_class"] == "source_search"
 
-    for literal, later_command in (
-        ("added 451 packages in 12s", "npm install"),
-        ("123 passed in 2.00s", "pytest -q"),
+    ambiguous_hidden_fixed_package_output = reduce_text(
+        "\n".join("added 451 packages in 12s" for _ in range(80)),
+        command="rg -F -h 'added 451 packages in 12s' src || npm install",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert ambiguous_hidden_fixed_package_output.changed is True
+    assert ambiguous_hidden_fixed_package_output.metadata["command_class"] == "node"
+
+    for literal, later_command, expected_class in (
+        ("added 451 packages in 12s", "npm install", "node"),
+        ("123 passed in 2.00s", "pytest -q", "pytest"),
     ):
         for separator in ("&&", ";"):
-            exact_hidden_fixed_signal_literal = reduce_text(
+            compacted_hidden_fixed_signal_literal = reduce_text(
                 "\n".join(literal for _ in range(80)),
                 command=f"rg -F -h '{literal}' src {separator} {later_command}",
                 tool_name="terminal",
                 exit_code=0,
                 options=compact_opts,
             )
-            assert exact_hidden_fixed_signal_literal.changed is False, literal
+            assert compacted_hidden_fixed_signal_literal.changed is True, literal
             assert (
-                exact_hidden_fixed_signal_literal.metadata["command_class"]
-                == "source_search"
+                compacted_hidden_fixed_signal_literal.metadata["command_class"]
+                == expected_class
             ), literal
 
     def plain_context(literal: str) -> str:
@@ -3166,16 +3207,745 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
         == "file_read"
     )
 
-    skipped_compactable_after_successful_search_fallback = reduce_text(
+    ambiguous_compactable_after_search_fallback = reduce_text(
         "\n".join("added 451 packages in 12s" for _ in range(80)),
         command="rg missing src || rg -F -h 'added 451 packages in 12s' docs || npm install",
         tool_name="terminal",
         exit_code=0,
         options=compact_opts,
     )
-    assert skipped_compactable_after_successful_search_fallback.changed is False
+    assert ambiguous_compactable_after_search_fallback.changed is True
+    assert ambiguous_compactable_after_search_fallback.metadata["command_class"] == "node"
+
+    skipped_compactable_after_successful_hidden_search_left = reduce_text(
+        "\n".join("added 451 packages in 12s" for _ in range(80)),
+        command='rg -h "added 451 packages" src || { npm install; exit 7; }',
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert skipped_compactable_after_successful_hidden_search_left.changed is False
     assert (
-        skipped_compactable_after_successful_search_fallback.metadata["command_class"]
+        skipped_compactable_after_successful_hidden_search_left.metadata["command_class"]
+        == "source_search"
+    )
+
+    redirected_noisy_prefix_then_source_search = reduce_text(
+        "\n".join(
+            f"src/app.py:{index}:FAILED literal source hit" for index in range(80)
+        ),
+        command="npm install >/dev/null && rg FAILED src",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert redirected_noisy_prefix_then_source_search.changed is False
+    assert redirected_noisy_prefix_then_source_search.metadata["command_class"] == "source_search"
+
+    background_source_search_with_redirected_compactable_foreground = reduce_text(
+        "\n".join(
+            f"src/app.py:{index}:FAILED literal source hit" for index in range(80)
+        ),
+        command="rg FAILED src & pytest -q >/dev/null",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert background_source_search_with_redirected_compactable_foreground.changed is False
+    assert (
+        background_source_search_with_redirected_compactable_foreground.metadata[
+            "command_class"
+        ]
+        == "source_search"
+    )
+
+    hidden_background_source_search_owns_stdout_shaped_literal = reduce_text(
+        "\n".join("added 451 packages in 12s" for _ in range(80)),
+        command='rg -F -h "added 451 packages in 12s" src & npm install >/dev/null',
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert hidden_background_source_search_owns_stdout_shaped_literal.changed is False
+    assert (
+        hidden_background_source_search_owns_stdout_shaped_literal.metadata["command_class"]
+        == "source_search"
+    )
+
+    ambiguous_successful_or_fallback_with_compactable_output = reduce_text(
+        "\n".join("added 451 packages in 12s" for _ in range(80)),
+        command='rg -h "added 451 packages" src || npm install',
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert ambiguous_successful_or_fallback_with_compactable_output.changed is True
+    assert (
+        ambiguous_successful_or_fallback_with_compactable_output.metadata["command_class"]
+        == "node"
+    )
+
+    successful_intervening_fallback_skips_compactable_tail = reduce_text(
+        "\n".join("added 451 packages in 12s" for _ in range(80)),
+        command='rg -h "added 451 packages" src || true || npm install',
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert successful_intervening_fallback_skips_compactable_tail.changed is False
+    assert (
+        successful_intervening_fallback_skips_compactable_tail.metadata["command_class"]
+        == "source_search"
+    )
+
+    substitution_with_successful_or_guard_skips_compactable_tail = reduce_text(
+        "\n".join(
+            f"tests/test_demo.py:{index}:FAILED tests/test_demo.py::test_signal"
+            for index in range(80)
+        ),
+        command='rg "$(pytest -q)" src || true || npm install',
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert substitution_with_successful_or_guard_skips_compactable_tail.changed is True
+    assert (
+        substitution_with_successful_or_guard_skips_compactable_tail.metadata[
+            "command_class"
+        ]
+        == "pytest"
+    )
+
+    compactable_group_before_true_still_owns_output = reduce_text(
+        "\n".join("added 451 packages in 12s" for _ in range(80)),
+        command='rg -h "added 451 packages" src || { npm install; true; } || npm install',
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert compactable_group_before_true_still_owns_output.changed is True
+    assert compactable_group_before_true_still_owns_output.metadata["command_class"] == "node"
+
+    guarded_exit_does_not_make_compactable_fallback_unreachable = reduce_text(
+        "\n".join("added 451 packages in 12s" for _ in range(80)),
+        command='rg -h "added 451 packages" src || { npm install || exit 7; } || npm install',
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert guarded_exit_does_not_make_compactable_fallback_unreachable.changed is True
+    assert (
+        guarded_exit_does_not_make_compactable_fallback_unreachable.metadata["command_class"]
+        == "node"
+    )
+
+    shell_terminating_or_fallback_keeps_successful_exact_left = reduce_text(
+        "\n".join("added 451 packages in 12s" for _ in range(80)),
+        command='rg -h "added 451 packages" src || { npm install; exit 7; } || npm install',
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert shell_terminating_or_fallback_keeps_successful_exact_left.changed is False
+    assert (
+        shell_terminating_or_fallback_keeps_successful_exact_left.metadata["command_class"]
+        == "source_search"
+    )
+
+    compact_shell_terminating_or_fallback_keeps_successful_exact_left = reduce_text(
+        "\n".join("added 451 packages in 12s" for _ in range(80)),
+        command='rg -h "added 451 packages" src || { npm install; exit 7;}|| npm install',
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert compact_shell_terminating_or_fallback_keeps_successful_exact_left.changed is False
+    assert (
+        compact_shell_terminating_or_fallback_keeps_successful_exact_left.metadata[
+            "command_class"
+        ]
+        == "source_search"
+    )
+
+    for exit_status in (0, 7):
+        top_level_exit_makes_later_fallback_unreachable = reduce_text(
+            "\n".join("added 451 packages in 12s" for _ in range(80)),
+            command=(
+                f'rg -h "added 451 packages" src || exit {exit_status} || npm install'
+            ),
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert top_level_exit_makes_later_fallback_unreachable.changed is False, exit_status
+        assert (
+            top_level_exit_makes_later_fallback_unreachable.metadata["command_class"]
+            == "source_search"
+        ), exit_status
+
+    for command, expected_class in (
+        (
+            'rg -h "added 451 packages" src '
+            "|| { exit 7; npm install; } || npm install",
+            "source_search",
+        ),
+        (
+            'rg -h "added 451 packages" src '
+            "&& { exit 0; npm install; } && npm install",
+            "source_search",
+        ),
+        ("cat README && { exit 0; npm install; } && npm install", "file_read"),
+    ):
+        unreachable_commands_after_exit = reduce_text(
+            "\n".join("added 451 packages in 12s" for _ in range(80)),
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert unreachable_commands_after_exit.changed is False, command
+        assert unreachable_commands_after_exit.metadata["command_class"] == expected_class, command
+
+    for failed_fallback in ("false", "( exit 7 )", "{ false; }"):
+        reachable_second_fallback = reduce_text(
+            "\n".join("added 451 packages in 12s" for _ in range(80)),
+            command=(
+                'rg -F -h "added 451 packages in 12s" src '
+                f"|| {failed_fallback} || npm install"
+            ),
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert reachable_second_fallback.changed is True, failed_fallback
+        assert reachable_second_fallback.metadata["command_class"] == "node", failed_fallback
+
+    warning_fallback_output = "\n".join(
+        f"npm WARN deprecated package-{index}" for index in range(80)
+    )
+    warning_fallback_without_search_hits = reduce_text(
+        warning_fallback_output,
+        command="rg ERROR src || npm install",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert warning_fallback_without_search_hits.changed is True
+    assert warning_fallback_without_search_hits.metadata["command_class"] == "node"
+
+    warning_lines_that_match_search_pattern = reduce_text(
+        warning_fallback_output,
+        command="rg deprecated src || npm install",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert warning_lines_that_match_search_pattern.changed is False
+    assert warning_lines_that_match_search_pattern.metadata["command_class"] == "source_search"
+
+    for command in (
+        "npm install & rg target src",
+        "npm install & cat README",
+    ):
+        background_package_output_before_exact_tail = reduce_text(
+            warning_fallback_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert background_package_output_before_exact_tail.changed is True, command
+        assert (
+            background_package_output_before_exact_tail.metadata["command_class"] == "node"
+        ), command
+
+    for package_manager_output in (
+        warning_fallback_output,
+        "\n".join(
+            ["npm error code ERESOLVE"]
+            + [f"npm error dependency noise {index}" for index in range(80)]
+        ),
+        "\n".join(
+            ["pnpm error code ERESOLVE"]
+            + [f"pnpm error dependency noise {index}" for index in range(80)]
+        ),
+    ):
+        for command in (
+            "cat README && npm install",
+            "rg target src && npm install",
+        ):
+            foreground_package_output_after_exact_command = reduce_text(
+                package_manager_output,
+                command=command,
+                tool_name="terminal",
+                exit_code=1,
+                options=compact_opts,
+            )
+            assert foreground_package_output_after_exact_command.changed is True, command
+            assert (
+                foreground_package_output_after_exact_command.metadata["command_class"]
+                == "node"
+            ), command
+
+    exact_package_literal_output = "\n".join(
+        "added 451 packages in 12s" for _ in range(80)
+    )
+    for command, expected_class in (
+        (
+            'rg -F -h "added 451 packages in 12s" src || '
+            "npm install >/dev/null 2>&1",
+            "source_search",
+        ),
+        ("cat package.log && { npm install; } >/dev/null 2>&1", "file_read"),
+        ('cat package.log && echo "$(npm install)" >/dev/null', "file_read"),
+        (
+            "cat package.log && { true && exit 0; npm install; } && npm install",
+            "file_read",
+        ),
+        (
+            "cat package.log && { false || exit 0; npm install; } && npm install",
+            "file_read",
+        ),
+        (
+            'rg -F -h "added 451 packages in 12s" src && '
+            'echo "$(npm install)" >/dev/null',
+            "source_search",
+        ),
+    ):
+        hidden_compactable_output_keeps_exact_owner = reduce_text(
+            exact_package_literal_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert hidden_compactable_output_keeps_exact_owner.changed is False, command
+        assert (
+            hidden_compactable_output_keeps_exact_owner.metadata["command_class"]
+            == expected_class
+        ), command
+
+    for command in (
+        "npm install && true || cat README",
+        "npm install && false || cat README",
+        "npm install || true && cat README",
+        "npm install || false && cat README",
+    ):
+        skipped_or_unowned_file_read = reduce_text(
+            exact_package_literal_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert skipped_or_unowned_file_read.changed is True, command
+        assert skipped_or_unowned_file_read.metadata["command_class"] == "node", command
+
+    plain_read_after_compactable = "\n".join(
+        f"plain README line {index}" for index in range(80)
+    )
+    executed_file_read_after_compactable = reduce_text(
+        plain_read_after_compactable,
+        command="npm install && cat README",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert executed_file_read_after_compactable.changed is False
+    assert executed_file_read_after_compactable.metadata["command_class"] == "file_read"
+
+    for command in (
+        "npm install >/dev/null && cat README",
+        "{ npm install; } >/dev/null && cat README",
+        "npm install 2>&1 >/dev/null && cat README",
+    ):
+        hidden_earlier_compactable_keeps_later_file_read = reduce_text(
+            exact_package_literal_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert hidden_earlier_compactable_keeps_later_file_read.changed is False, command
+        assert (
+            hidden_earlier_compactable_keeps_later_file_read.metadata["command_class"]
+            == "file_read"
+        ), command
+
+    skipped_grouped_fallback_keeps_exact_source_search = reduce_text(
+        "\n".join("added 451 packages in 12s" for _ in range(80)),
+        command='rg -h "added 451 packages" src || { npm install; npm install; exit 7; }',
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert skipped_grouped_fallback_keeps_exact_source_search.changed is False
+    assert (
+        skipped_grouped_fallback_keeps_exact_source_search.metadata["command_class"]
+        == "source_search"
+    )
+
+    skipped_grouped_fallback_keeps_exact_file_read = reduce_text(
+        "\n".join(f"plain README line {index}" for index in range(80)),
+        command="cat README || { npm install; npm install; exit 7; }",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert skipped_grouped_fallback_keeps_exact_file_read.changed is False
+    assert skipped_grouped_fallback_keeps_exact_file_read.metadata["command_class"] == "file_read"
+
+    ambiguous_successful_grouped_fallback_with_compactable_output = reduce_text(
+        "\n".join("added 451 packages in 12s" for _ in range(80)),
+        command='rg -h "added 451 packages" src || { false; npm install; }',
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert ambiguous_successful_grouped_fallback_with_compactable_output.changed is True
+    assert (
+        ambiguous_successful_grouped_fallback_with_compactable_output.metadata[
+            "command_class"
+        ]
+        == "node"
+    )
+
+    unconditional_compactable_after_forced_nonzero_fallback = reduce_text(
+        "\n".join("added 451 packages in 12s" for _ in range(80)),
+        command='rg -h "added 451 packages" src || { npm install; exit 7; } && npm install',
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert unconditional_compactable_after_forced_nonzero_fallback.changed is True
+    assert (
+        unconditional_compactable_after_forced_nonzero_fallback.metadata["command_class"]
+        == "node"
+    )
+
+    compact_semicolon_after_grouped_fallback = reduce_text(
+        "\n".join("added 451 packages in 12s" for _ in range(80)),
+        command='rg -h "added 451 packages" src || { npm install; exit 7;}; npm install',
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert compact_semicolon_after_grouped_fallback.changed is True
+    assert compact_semicolon_after_grouped_fallback.metadata["command_class"] == "node"
+
+    compact_background_after_grouped_fallback = reduce_text(
+        "\n".join("added 451 packages in 12s" for _ in range(80)),
+        command='rg -h "added 451 packages" src || { npm install; exit 7; } & npm install',
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert compact_background_after_grouped_fallback.changed is True
+    assert compact_background_after_grouped_fallback.metadata["command_class"] == "node"
+
+    unconditional_compactable_after_successful_read_left = reduce_text(
+        "\n".join("added 451 packages in 12s" for _ in range(80)),
+        command="cat README || false; npm install",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert unconditional_compactable_after_successful_read_left.changed is True
+    assert (
+        unconditional_compactable_after_successful_read_left.metadata["command_class"]
+        == "node"
+    )
+
+    skipped_substitution_fallback_keeps_exact_file_read = reduce_text(
+        "\n".join(f"plain README line {index}" for index in range(80)),
+        command='cat README || rg "$(pytest -q)" src',
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert skipped_substitution_fallback_keeps_exact_file_read.changed is False
+    assert (
+        skipped_substitution_fallback_keeps_exact_file_read.metadata["command_class"]
+        == "file_read"
+    )
+
+    skipped_substitution_fallback_keeps_exact_source_search = reduce_text(
+        "\n".join(f"src/app.py:{index}:target source hit" for index in range(80)),
+        command='rg target src || rg "$(pytest -q)" src',
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert skipped_substitution_fallback_keeps_exact_source_search.changed is False
+    assert (
+        skipped_substitution_fallback_keeps_exact_source_search.metadata[
+            "command_class"
+        ]
+        == "source_search"
+    )
+
+    active_substitution_search_with_later_segment = reduce_text(
+        "\n".join(
+            f"tests/test_demo.py:{index}:FAILED tests/test_demo.py::test_signal"
+            for index in range(80)
+        ),
+        command='rg "$(pytest -q)" src && true',
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert active_substitution_search_with_later_segment.changed is True
+    assert active_substitution_search_with_later_segment.metadata["command_class"] == "pytest"
+
+    active_substitution_with_later_node_output = reduce_text(
+        "\n".join("added 451 packages in 12s" for _ in range(80)),
+        command='rg "$(pytest -q)" src && npm install',
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert active_substitution_with_later_node_output.changed is True
+    assert active_substitution_with_later_node_output.metadata["command_class"] == "node"
+
+    active_substitution_with_later_file_read_output = reduce_text(
+        "\n".join(f"plain README line {index}" for index in range(80)),
+        command='rg "$(pytest -q)" src && cat README',
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert active_substitution_with_later_file_read_output.changed is False
+    assert (
+        active_substitution_with_later_file_read_output.metadata["command_class"]
+        == "file_read"
+    )
+
+    active_substitution_with_later_source_search_output = reduce_text(
+        "\n".join(f"src/app.py:{index}:target source hit" for index in range(80)),
+        command='rg "$(pytest -q)" src && rg target src',
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert active_substitution_with_later_source_search_output.changed is False
+    assert (
+        active_substitution_with_later_source_search_output.metadata["command_class"]
+        == "source_search"
+    )
+
+    background_source_search_with_redirected_compactable_stderr = reduce_text(
+        "\n".join(
+            [
+                "npm ERR! code ERESOLVE",
+                *[f"npm ERR! dependency noise {index}" for index in range(80)],
+            ]
+        ),
+        command="rg NOMATCH src & npm install >/dev/null",
+        tool_name="terminal",
+        exit_code=1,
+        options=compact_opts,
+    )
+    assert background_source_search_with_redirected_compactable_stderr.changed is True
+    assert (
+        background_source_search_with_redirected_compactable_stderr.metadata[
+            "command_class"
+        ]
+        == "node"
+    )
+
+    background_source_search_with_unknown_redirected_compactable = reduce_text(
+        "\n".join(
+            f"src/app.py:{index}:FAILED literal source hit" for index in range(80)
+        ),
+        command="rg FAILED src & npm install >/dev/null",
+        tool_name="terminal",
+        exit_code=None,
+        options=compact_opts,
+    )
+    assert background_source_search_with_unknown_redirected_compactable.changed is False
+    assert (
+        background_source_search_with_unknown_redirected_compactable.metadata[
+            "command_class"
+        ]
+        == "source_search"
+    )
+
+    background_source_search_with_intervening_segment = reduce_text(
+        "\n".join(
+            f"src/app.py:{index}:FAILED literal source hit" for index in range(80)
+        ),
+        command="rg FAILED src & true & npm install >/dev/null",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert background_source_search_with_intervening_segment.changed is False
+    assert (
+        background_source_search_with_intervening_segment.metadata["command_class"]
+        == "source_search"
+    )
+
+    background_source_search_with_amp_redirected_compactable = reduce_text(
+        "\n".join(
+            f"src/app.py:{index}:FAILED literal source hit" for index in range(80)
+        ),
+        command="rg FAILED src & npm install &>/dev/null",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert background_source_search_with_amp_redirected_compactable.changed is False
+    assert (
+        background_source_search_with_amp_redirected_compactable.metadata[
+            "command_class"
+        ]
+        == "source_search"
+    )
+
+    background_redirected_compactable_stderr_with_unknown_exit = reduce_text(
+        "\n".join(
+            [
+                "npm ERR! code ERESOLVE",
+                *[f"npm ERR! dependency noise {index}" for index in range(80)],
+            ]
+        ),
+        command="rg NOMATCH src & npm install >/dev/null",
+        tool_name="terminal",
+        exit_code=None,
+        options=compact_opts,
+    )
+    assert background_redirected_compactable_stderr_with_unknown_exit.changed is True
+    assert (
+        background_redirected_compactable_stderr_with_unknown_exit.metadata[
+            "command_class"
+        ]
+        == "node"
+    )
+
+    file_read_then_redirected_compactable_stderr = reduce_text(
+        "\n".join(
+            [
+                "npm ERR! code ERESOLVE",
+                *[f"npm ERR! dependency noise {index}" for index in range(80)],
+            ]
+        ),
+        command="cat README && npm install >/dev/null",
+        tool_name="terminal",
+        exit_code=1,
+        options=compact_opts,
+    )
+    assert file_read_then_redirected_compactable_stderr.changed is True
+    assert file_read_then_redirected_compactable_stderr.metadata["command_class"] == "node"
+
+    mixed_file_read_and_redirected_compactable_stderr = reduce_text(
+        "\n".join(
+            [
+                "# README",
+                "plain project documentation",
+                "npm ERR! code ERESOLVE",
+                *[f"npm ERR! dependency noise {index}" for index in range(80)],
+            ]
+        ),
+        command="cat README && npm install >/dev/null",
+        tool_name="terminal",
+        exit_code=1,
+        options=compact_opts,
+    )
+    assert mixed_file_read_and_redirected_compactable_stderr.changed is True
+    assert (
+        mixed_file_read_and_redirected_compactable_stderr.metadata["command_class"]
+        == "node"
+    )
+
+    background_file_read_then_redirected_compactable_stderr = reduce_text(
+        "\n".join(
+            [
+                "npm ERR! code ERESOLVE",
+                *[f"npm ERR! dependency noise {index}" for index in range(80)],
+            ]
+        ),
+        command="cat README & npm install >/dev/null",
+        tool_name="terminal",
+        exit_code=1,
+        options=compact_opts,
+    )
+    assert background_file_read_then_redirected_compactable_stderr.changed is True
+    assert (
+        background_file_read_then_redirected_compactable_stderr.metadata[
+            "command_class"
+        ]
+        == "node"
+    )
+
+    fd_dup_redirection_does_not_create_fake_background_segment = reduce_text(
+        "\n".join(f"plain README line {index}" for index in range(80)),
+        command="cat README & npm install 2>&1 >/dev/null",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert fd_dup_redirection_does_not_create_fake_background_segment.changed is False
+    assert (
+        fd_dup_redirection_does_not_create_fake_background_segment.metadata[
+            "command_class"
+        ]
+        == "file_read"
+    )
+
+    failed_file_read_with_hidden_stderr_runs_compactable_fallback = reduce_text(
+        "\n".join("added 451 packages in 12s" for _ in range(80)),
+        command="cat MISSING 2>/dev/null || npm install",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert failed_file_read_with_hidden_stderr_runs_compactable_fallback.changed is True
+    assert (
+        failed_file_read_with_hidden_stderr_runs_compactable_fallback.metadata[
+            "command_class"
+        ]
+        == "node"
+    )
+
+    shell_terminating_fallback_proves_hidden_stderr_read_succeeded = reduce_text(
+        "\n".join("added 451 packages in 12s" for _ in range(80)),
+        command="cat README 2>/dev/null || { true; exit 7; } || npm install",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert shell_terminating_fallback_proves_hidden_stderr_read_succeeded.changed is False
+    assert (
+        shell_terminating_fallback_proves_hidden_stderr_read_succeeded.metadata[
+            "command_class"
+        ]
+        == "file_read"
+    )
+
+    zero_exit_fallback_can_own_hidden_stderr_read_output = reduce_text(
+        "\n".join("added 451 packages in 12s" for _ in range(80)),
+        command="cat MISSING 2>/dev/null || { npm install; exit 0; } || npm install",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert zero_exit_fallback_can_own_hidden_stderr_read_output.changed is True
+    assert zero_exit_fallback_can_own_hidden_stderr_read_output.metadata["command_class"] == "node"
+
+    background_source_search_with_nonzero_redirected_compactable = reduce_text(
+        "\n".join(
+            f"src/app.py:{index}:ERROR literal source hit" for index in range(80)
+        ),
+        command="rg ERROR src & npm install >/dev/null",
+        tool_name="terminal",
+        exit_code=1,
+        options=compact_opts,
+    )
+    assert background_source_search_with_nonzero_redirected_compactable.changed is False
+    assert (
+        background_source_search_with_nonzero_redirected_compactable.metadata[
+            "command_class"
+        ]
         == "source_search"
     )
 
@@ -3453,3 +4223,366 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
         )
         assert exact_runner_search.changed is False, command
         assert exact_runner_search.metadata["command_class"] == "source_search", command
+
+
+def test_tight_failure_excerpt_marks_gap_between_noncontiguous_anchors() -> None:
+    raw_stdout = "\n".join(
+        [
+            "ModuleNotFoundError: No module named missing_pkg",
+            *[f"pytest setup noise {index}" for index in range(16)],
+            "FAILED tests/test_demo.py::test_signal",
+        ]
+    )
+
+    result = reduce_text(
+        raw_stdout,
+        command="pytest -q",
+        tool_name="terminal",
+        exit_code=1,
+        options=NoisegateOptions(max_chars=220, max_lines=5),
+    )
+
+    assert result.changed is True
+    assert "ModuleNotFoundError: No module named missing_pkg" in result.text
+    assert "FAILED tests/test_demo.py::test_signal" in result.text
+    assert "[noisegate: omitted 16 lines]" in result.text
+    assert result.text.index("ModuleNotFoundError") < result.text.index("[noisegate: omitted")
+    assert result.text.index("[noisegate: omitted") < result.text.index("FAILED")
+
+
+def test_redirect_visibility_controls_exact_output_ownership() -> None:
+    compact_opts = opts(max_chars=220, max_lines=8, head_lines=1, tail_lines=1)
+    package_literal_output = "\n".join(
+        "added 451 packages in 12s" for _ in range(80)
+    )
+
+    hidden_search_tail = reduce_text(
+        package_literal_output,
+        command=(
+            'rg -F -h "added 451 packages in 12s" src '
+            "&& npm install >/dev/null"
+        ),
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert hidden_search_tail.changed is False
+    assert hidden_search_tail.text == package_literal_output
+    assert hidden_search_tail.metadata["command_class"] == "source_search"
+
+    hidden_read_tail = reduce_text(
+        package_literal_output,
+        command="cat README; npm install >/dev/null",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert hidden_read_tail.changed is False
+    assert hidden_read_tail.text == package_literal_output
+    assert hidden_read_tail.metadata["command_class"] == "file_read"
+
+    for fully_hidden_redirect in (
+        "&>/dev/null",
+        ">&/dev/null",
+        ">& /dev/null",
+        ">/dev/null 2>&1",
+    ):
+        hidden_bash_combined_redirect = reduce_text(
+            package_literal_output,
+            command=f"cat build.log && npm install {fully_hidden_redirect}",
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert hidden_bash_combined_redirect.changed is False, fully_hidden_redirect
+        assert hidden_bash_combined_redirect.text == package_literal_output
+        assert hidden_bash_combined_redirect.metadata["command_class"] == "file_read"
+
+    for redirect in (">&2", ">&1", ">/dev/stdout", ">/dev/stderr", "1>&2"):
+        visible_background_tail = reduce_text(
+            package_literal_output,
+            command=f'rg -h "foo" src & npm install {redirect}',
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert visible_background_tail.changed is True, redirect
+        assert visible_background_tail.metadata["command_class"] == "node", redirect
+
+    exact_search_output = "\n".join(
+        f"src/app.py:{index}:target source hit" for index in range(80)
+    )
+    exact_read_output = "\n".join(
+        f"plain README line {index}" for index in range(80)
+    )
+    for exit_code in (0, None, 1):
+        for command, exact_output, expected_class in (
+            ("rg target src & npm install >&2", exact_search_output, "source_search"),
+            ("cat README & npm install >&2", exact_read_output, "file_read"),
+        ):
+            visible_tail_without_own_output = reduce_text(
+                exact_output,
+                command=command,
+                tool_name="terminal",
+                exit_code=exit_code,
+                options=compact_opts,
+            )
+            assert visible_tail_without_own_output.changed is False, (command, exit_code)
+            assert visible_tail_without_own_output.text == exact_output, (command, exit_code)
+            assert visible_tail_without_own_output.metadata["command_class"] == expected_class, (
+                command,
+                exit_code,
+            )
+
+    for exact_read_redirect in ("2>&1", "1>&1", ">&1", "1>&2", ">&2"):
+        visible_exact_read_redirect = reduce_text(
+            exact_read_output,
+            command=f"cat README {exact_read_redirect}",
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert visible_exact_read_redirect.changed is False, exact_read_redirect
+        assert visible_exact_read_redirect.text == exact_read_output
+        assert visible_exact_read_redirect.metadata["command_class"] == "file_read"
+
+    for package_manager in ("npm", "pnpm"):
+        for prefix in ("", " ", "\t", "\u2009"):
+            redirected_stderr = "\n".join(
+                [
+                    "src/app.py:1:FAILED literal source hit",
+                    f"{prefix}{package_manager} error code ERESOLVE",
+                    *[
+                        f"{prefix}{package_manager} error dependency noise {index}"
+                        for index in range(80)
+                    ],
+                ]
+            )
+            for exit_code in (0, None, 1):
+                visible_redirected_error = reduce_text(
+                    redirected_stderr,
+                    command=f"rg FAILED src & {package_manager} install >/dev/null",
+                    tool_name="terminal",
+                    exit_code=exit_code,
+                    options=compact_opts,
+                )
+                assert visible_redirected_error.changed is True, (
+                    package_manager,
+                    prefix,
+                    exit_code,
+                )
+                assert visible_redirected_error.metadata["command_class"] == "node", (
+                    package_manager,
+                    prefix,
+                    exit_code,
+                )
+    for prefix in ("", " ", "\u2009"):
+        pnpm_redirected_stderr = "\n".join(
+            [
+                "# README",
+                "plain docs",
+                f"{prefix}ERR_PNPM_FETCH_404 GET https://registry.npmjs.org/missing: Not Found",
+                *[f"{prefix}ERR_PNPM dependency noise {index}" for index in range(80)],
+            ]
+        )
+        for command in (
+            "cat README && pnpm install >/dev/null",
+            "rg FAILED src & pnpm install >/dev/null",
+        ):
+            visible_pnpm_error = reduce_text(
+                pnpm_redirected_stderr,
+                command=command,
+                tool_name="terminal",
+                exit_code=1,
+                options=compact_opts,
+            )
+            assert visible_pnpm_error.changed is True, (prefix, command)
+            assert visible_pnpm_error.metadata["command_class"] == "node", (prefix, command)
+
+    stylized_pnpm_warnings = "\n".join(
+        f"\u2009WARN\u2009 deprecated package-{index}" for index in range(80)
+    )
+    stylized_visible_stderr = reduce_text(
+        stylized_pnpm_warnings,
+        command="cat README && pnpm install >/dev/null",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert stylized_visible_stderr.changed is True
+    assert stylized_visible_stderr.metadata["command_class"] == "node"
+
+    for prefix in (" ", "\t", "\u2009"):
+        indented_npm_warnings = "\n".join(
+            ["# README", "plain docs"]
+            + [f"{prefix}npm WARN dependency noise {index}" for index in range(80)]
+        )
+        for connector in ("&&", ";", "&"):
+            visible_indented_stderr = reduce_text(
+                indented_npm_warnings,
+                command=f"cat README {connector} npm install >/dev/null",
+                tool_name="terminal",
+                exit_code=0,
+                options=compact_opts,
+            )
+            assert visible_indented_stderr.changed is True, (prefix, connector)
+            assert visible_indented_stderr.metadata["command_class"] == "node", (
+                prefix,
+                connector,
+            )
+
+    visible_stderr_exact_left = reduce_text(
+        package_literal_output,
+        command="cat README 2>&1 || npm install",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert visible_stderr_exact_left.changed is False
+    assert visible_stderr_exact_left.text == package_literal_output
+    assert visible_stderr_exact_left.metadata["command_class"] == "file_read"
+
+    fallback_node_output = "\n".join(
+        ["npm error code ERESOLVE", *["added 451 packages in 12s" for _ in range(80)]]
+    )
+    hidden_middle_failed_then_visible_fallback = reduce_text(
+        fallback_node_output,
+        command="cat README && npm install >/dev/null || npm install",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert hidden_middle_failed_then_visible_fallback.changed is True
+    assert hidden_middle_failed_then_visible_fallback.metadata["command_class"] == "node"
+
+    npm_warning_output = "\n".join(
+        f"npm WARN deprecated package-{index}" for index in range(80)
+    )
+    visible_stderr_after_duplication = reduce_text(
+        npm_warning_output,
+        command="cat README && npm install 2>&1 >/dev/null",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert visible_stderr_after_duplication.changed is True
+    assert visible_stderr_after_duplication.metadata["command_class"] == "node"
+
+    fully_hidden_tail = reduce_text(
+        npm_warning_output,
+        command="cat README && npm install >/dev/null 2>&1",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert fully_hidden_tail.changed is False
+    assert fully_hidden_tail.text == npm_warning_output
+    assert fully_hidden_tail.metadata["command_class"] == "file_read"
+
+    hidden_error_output = "\n".join(
+        ["npm ERR! code ERESOLVE", *[f"npm ERR! dependency noise {index}" for index in range(220)]]
+    )
+    for command, expected_class in (
+        ("cat build.log && npm install >/dev/null 2>&1", "file_read"),
+        (
+            "rg -F -h 'npm ERR!' src && npm install >/dev/null 2>&1",
+            "source_search",
+        ),
+    ):
+        fully_hidden_error_tail = reduce_text(
+            hidden_error_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert fully_hidden_error_tail.changed is False, command
+        assert fully_hidden_error_tail.text == hidden_error_output, command
+        assert fully_hidden_error_tail.metadata["command_class"] == expected_class, command
+
+    for command in (
+        "cat empty.txt && npm install >/dev/null && npm install",
+        "rg target src && npm install >/dev/null && npm install",
+    ):
+        visible_tail_after_hidden_middle = reduce_text(
+            package_literal_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert visible_tail_after_hidden_middle.changed is True, command
+        assert visible_tail_after_hidden_middle.metadata["command_class"] == "node", command
+
+
+def test_active_substitution_in_later_segment_does_not_steal_prior_exact_output() -> None:
+    compact_opts = opts(max_chars=220, max_lines=8, head_lines=1, tail_lines=1)
+    read_output = "\n".join(f"plain README line {index}" for index in range(80))
+    search_output = "\n".join(
+        f"src/app.py:{index}:target source hit" for index in range(80)
+    )
+
+    for separator in ("&&", ";", "&"):
+        exact_read = reduce_text(
+            read_output,
+            command=f'cat README {separator} rg "$(pytest -q)" src',
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert exact_read.changed is False, separator
+        assert exact_read.text == read_output, separator
+        assert exact_read.metadata["command_class"] == "file_read", separator
+
+        exact_search = reduce_text(
+            search_output,
+            command=f'rg target src {separator} rg "$(pytest -q)" src',
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert exact_search.changed is False, separator
+        assert exact_search.text == search_output, separator
+        assert exact_search.metadata["command_class"] == "source_search", separator
+
+    for command, expected_class, exact_output in (
+        (
+            'cat README || { rg "$(pytest -q)" src; exit 7; } || npm install',
+            "file_read",
+            read_output,
+        ),
+        (
+            'rg target src || { rg "$(pytest -q)" src; exit 7; } || npm install',
+            "source_search",
+            search_output,
+        ),
+    ):
+        skipped_grouped_substitution = reduce_text(
+            exact_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert skipped_grouped_substitution.changed is False, command
+        assert skipped_grouped_substitution.text == exact_output, command
+        assert skipped_grouped_substitution.metadata["command_class"] == expected_class, command
+
+    pytest_output = "\n".join(
+        [
+            "Traceback (most recent call last):",
+            *[f"pytest setup noise {index}" for index in range(80)],
+            "AssertionError: substitution failed",
+            "FAILED tests/test_demo.py::test_signal",
+        ]
+    )
+    visible_substitution_failure = reduce_text(
+        pytest_output,
+        command='cat README && rg "$(pytest -q)" src',
+        tool_name="terminal",
+        exit_code=1,
+        options=compact_opts,
+    )
+    assert visible_substitution_failure.changed is True
+    assert visible_substitution_failure.metadata["command_class"] == "pytest"
+    assert "AssertionError: substitution failed" in visible_substitution_failure.text
