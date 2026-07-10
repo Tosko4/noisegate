@@ -51,16 +51,17 @@ Noisegate gives you two surfaces:
 It knows how to reduce common noisy outputs:
 
 - `pytest` and `unittest`
+- `apt` / `apt-get`, `pip`, and `uv` package-install/update logs
 - `npm`, `pnpm`, and `yarn`
 - `git status` and `git log`
-- search output from `rg`, `grep`, `ag`, and `ack`
-- Docker build-style logs
+- Docker build-style logs and explicit `docker logs` / `docker compose logs` output
 - generic long output with deterministic head/tail fallback
 
 And it refuses to touch things that should stay exact:
 
 - file reads
 - patches and diffs
+- source/code search output from `rg`, `grep`, `ag`, and `ack`
 - skill documents
 - memory, LCM, Hindsight, MCP, search, and web extraction results
 - unknown future tools unless explicitly allowed
@@ -72,6 +73,8 @@ Hermes-LCM stays a separate recovery layer. Noisegate does not depend on it and 
 terminal-style output preserves LCM externalized payload placeholders such as
 `[Externalized tool output: ... ref=...]`. The early terminal hook still disables Noisegate raw
 artifacts, so pre-redaction terminal output is not persisted just because an LCM ref appears.
+
+The maintainer checklist lives in [`docs/product-contract.md`](docs/product-contract.md). Product changes should improve context value and safety boundaries, not just make output shorter.
 
 ## Install or update
 
@@ -247,6 +250,7 @@ Operational rules:
 
 1. Use Noisegate for noisy terminal/tool output, not for exact source material.
 2. Do not compact file reads, patches, diffs, retrieved context, skill docs, memory results, MCP results, or web extraction output.
+   Treat code-search output (`rg`, `grep`, `ag`, `ack`) as source context and leave it exact.
 3. Do not treat Noisegate as a raw-output archive. Raw artifacts are off by default.
 4. Keep Hermes-LCM optional. Noisegate must work without it.
 5. Do not write raw terminal output into Hindsight.
@@ -309,6 +313,7 @@ web_extract
 execute_code
 search_files
 simple direct terminal file-display commands (`cat`, `sed -n`, `head`, `tail`, `less`, `more`, `nl`, `bat`, `git show REV:path`)
+rg / grep / ag / ack source search
 git diff / unified diffs / V4A patches
 unknown future tools
 ```

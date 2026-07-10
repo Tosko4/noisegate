@@ -1083,15 +1083,192 @@ def test_pytest_reducer_preserves_failure_context() -> None:
     assert "[noisegate: omitted" in result.text
 
 
-def test_search_reducer_keeps_first_and_last_matches() -> None:
+def test_pytest_reducer_keeps_exception_and_failed_node_under_tight_budget() -> None:
+    for exception_line in (
+        "AssertionError: expected signal, got noise",
+        "ModuleNotFoundError: missing",
+        "ImportError: cannot import name x",
+        "TypeError: bad",
+    ):
+        raw = "\n".join(
+            [
+                *[f"pytest setup noise {index}" for index in range(100)],
+                "Traceback (most recent call last):",
+                '  File "tests/test_demo.py", line 3, in test_signal',
+                exception_line,
+                "FAILED tests/test_demo.py::test_signal",
+                *[f"pytest teardown noise {index}" for index in range(100)],
+            ]
+        )
+
+        result = reduce_text(
+            raw,
+            command="pytest -q",
+            exit_code=1,
+            options=NoisegateOptions(
+                max_chars=400,
+                max_lines=8,
+                head_lines=1,
+                tail_lines=1,
+                important_context_lines=1,
+            ),
+        )
+
+        assert result.changed is True, exception_line
+        assert result.metadata["reducer"] == "pytest", exception_line
+        assert exception_line in result.text, exception_line
+        assert "FAILED tests/test_demo.py::test_signal" in result.text, exception_line
+
+
+def test_common_python_traceback_exception_survives_non_pytest_reducers() -> None:
+    raw = "\n".join(
+        [
+            *[f"noise {index}" for index in range(120)],
+            "Traceback (most recent call last):",
+            '  File "app.py", line 1, in <module>',
+            "ModuleNotFoundError: No module named 'missing_pkg'",
+            *[f"after {index}" for index in range(80)],
+        ]
+    )
+    commands = {
+        "python app.py": "generic_critical",
+        "pip install .": "python_package",
+        "docker logs api": "docker_logs",
+        "docker build .": "docker_build",
+    }
+
+    for command, reducer in commands.items():
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=NoisegateOptions(
+                max_chars=220,
+                max_lines=8,
+                head_lines=1,
+                tail_lines=1,
+                important_context_lines=1,
+            ),
+        )
+
+        assert result.changed is True, command
+        assert result.metadata["reducer"] == reducer, command
+        assert "Traceback (most recent call last):" in result.text, command
+        assert "ModuleNotFoundError: No module named 'missing_pkg'" in result.text, command
+
+
+def test_tiny_traceback_budget_keeps_concrete_failure_and_exit_notice() -> None:
+    raw = "\n".join(
+        [
+            *[f"noise before {index}" for index in range(100)],
+            "Traceback (most recent call last):",
+            '  File "tests/test_demo.py", line 3, in test_signal',
+            "ModuleNotFoundError: No module named missing_pkg",
+            "FAILED tests/test_demo.py::test_signal",
+            *[f"noise after {index}" for index in range(100)],
+        ]
+    )
+    commands = {
+        "pytest -q": "pytest",
+        "python app.py": "generic_critical",
+        "pip install .": "python_package",
+        "docker logs api": "docker_logs",
+        "docker build .": "docker_build",
+    }
+
+    for command, reducer in commands.items():
+        for max_lines in (3, 4, 5, 6):
+            result = reduce_text(
+                raw,
+                command=command,
+                tool_name="terminal",
+                exit_code=1,
+                options=NoisegateOptions(
+                    max_chars=360,
+                    max_lines=max_lines,
+                    head_lines=1,
+                    tail_lines=1,
+                    important_context_lines=1,
+                ),
+            )
+
+            case = f"{command} max_lines={max_lines}"
+            assert result.changed is True, case
+            assert result.metadata["reducer"] == reducer, case
+            assert "ModuleNotFoundError: No module named missing_pkg" in result.text, case
+            assert "FAILED tests/test_demo.py::test_signal" in result.text, case
+            assert "[noisegate: exit_code=1]" in result.text, case
+
+
+def test_plain_exception_root_cause_beats_generic_unhandled_banner() -> None:
+    raw = "\n".join(
+        [
+            *[f"noise {index}" for index in range(80)],
+            "Unhandled exception",
+            "Exception: root cause",
+            *[f"tail {index}" for index in range(80)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="python app.py",
+        tool_name="terminal",
+        exit_code=1,
+        options=NoisegateOptions(
+            max_chars=160,
+            max_lines=3,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=1,
+        ),
+    )
+
+    assert result.changed is True
+    assert "Exception: root cause" in result.text
+    assert "[noisegate: exit_code=1]" in result.text
+
+
+def test_program_output_piped_to_cat_still_compacts_as_runtime_failure() -> None:
+    raw = "\n".join(
+        [
+            *[f"noise {index}" for index in range(80)],
+            "Traceback (most recent call last):",
+            '  File "app.py", line 1, in <module>',
+            "ModuleNotFoundError: No module named 'missing_pkg'",
+            *[f"tail {index}" for index in range(80)],
+        ]
+    )
+
+    for command in ("python app.py | cat", "python app.py | head -100"):
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=NoisegateOptions(
+                max_chars=220,
+                max_lines=8,
+                head_lines=1,
+                tail_lines=1,
+                important_context_lines=1,
+            ),
+        )
+
+        assert result.changed is True, command
+        assert result.metadata["command_class"] == "generic", command
+        assert "ModuleNotFoundError: No module named 'missing_pkg'" in result.text, command
+
+
+def test_search_output_is_source_context_and_stays_exact() -> None:
     raw = "\n".join(f"src/file_{index}.py:match {index}" for index in range(1, 40))
 
     result = reduce_text(raw, command="rg match src", options=options())
 
-    assert result.changed is True
-    assert result.metadata["reducer"] == "search"
-    assert "src/file_1.py:match 1" in result.text
-    assert "src/file_39.py:match 39" in result.text
+    assert result.changed is False
+    assert result.metadata["reducer"] == "protected_source_search"
+    assert result.text == raw
 
 
 def test_bypass_marker_leaves_text_unchanged() -> None:
