@@ -4953,3 +4953,238 @@ def test_git_grep_follows_global_value_options_only_to_the_subcommand() -> None:
         "git --info-path grep target",
     ):
         assert classify_command(command, search_output, exit_code=0) != "source_search", command
+
+
+def test_unreachable_substitution_branches_do_not_veto_exact_ownership() -> None:
+    compact_opts = opts(max_chars=180, max_lines=8, head_lines=1, tail_lines=1)
+    plain_output = "\n".join(f"opaque payload record {index}" for index in range(100))
+
+    for command, expected_class in (
+        ('cat "$(false && pytest -q; cat path.txt)"', "file_read"),
+        (
+            'rg -I "$(false && pytest -q; cat pattern.txt)" "$(cat path.txt)"',
+            "source_search",
+        ),
+        ('cat "$(false && cat <(printf ignored); cat path.txt)"', "file_read"),
+        ('cat "$(false && echo $(pytest -q); cat path.txt)"', "file_read"),
+    ):
+        exact = reduce_text(
+            plain_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert exact.changed is False, command
+        assert exact.text == plain_output, command
+        assert exact.metadata["command_class"] == expected_class, command
+
+    for command, expected_class in (
+        ('cat "$(true ||\nfalse && pytest -q\ncat path.txt)"', "pytest"),
+        ('cat "$(false && (true || true) || pytest -q; cat path.txt)"', "pytest"),
+        ('cat "$(TRUE || pytest -q; cat path.txt)"', "pytest"),
+        ('cat "$(true$(printf x) || pytest -q; cat path.txt)"', "pytest"),
+        ('cat "$(true && echo $(pytest -q); cat path.txt)"', "pytest"),
+        ('cat "$(true$(printf x) || cat <(printf active); cat path.txt)"', "generic"),
+    ):
+        unsafe = reduce_text(
+            plain_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=compact_opts,
+        )
+        assert unsafe.changed is True, command
+        assert unsafe.metadata["command_class"] == expected_class, command
+
+
+def test_log_stream_filters_do_not_claim_exact_source_ownership() -> None:
+    compact_opts = opts(max_chars=180, max_lines=8, head_lines=1, tail_lines=1)
+    log_output = "\n".join(f"ERROR request failed {index}" for index in range(100))
+
+    for command in (
+        "journalctl -u api | grep ERROR",
+        "kubectl logs pod | rg ERROR",
+        "kubectl -n prod logs pod | rg ERROR",
+        "kubectl --namespace=prod logs pod | rg ERROR",
+    ):
+        result = reduce_text(
+            log_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=compact_opts,
+        )
+        assert result.changed is True, command
+        assert result.metadata["command_class"] == "generic", command
+
+    exact_file_search = reduce_text(
+        log_output,
+        command="cat api.log | grep ERROR",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert exact_file_search.changed is False
+    assert exact_file_search.text == log_output
+    assert exact_file_search.metadata["command_class"] == "source_search"
+
+
+def test_later_failed_test_command_owns_sparse_failure_output() -> None:
+    compact_opts = opts(max_chars=180, max_lines=8, head_lines=1, tail_lines=1)
+    cases = (
+        (
+            "cat README && npm test",
+            "\n".join(
+                [
+                    *(f"plain README line {index}" for index in range(100)),
+                    "Error: Cannot find module demo",
+                ]
+            ),
+            "node",
+        ),
+        (
+            "cat README && /usr/bin/npm test",
+            "\n".join(
+                [
+                    *(f"plain README line {index}" for index in range(100)),
+                    "Error: Cannot find module demo",
+                ]
+            ),
+            "node",
+        ),
+        (
+            "cat README && pytest -q",
+            "\n".join(
+                [
+                    *(f"plain README line {index}" for index in range(100)),
+                    "FAILED tests/test_demo.py::test_signal",
+                ]
+            ),
+            "pytest",
+        ),
+        (
+            "cat README && pytest -q",
+            "\n".join(
+                [
+                    *(f"plain README line {index}" for index in range(100)),
+                    "FAILED specs/test_demo.py::test_signal",
+                ]
+            ),
+            "pytest",
+        ),
+    )
+    for command, raw, expected_class in cases:
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=compact_opts,
+        )
+        assert result.changed is True, command
+        assert result.metadata["command_class"] == expected_class, command
+
+    literal_read = "\n".join(
+        [
+            *(f"plain README line {index}" for index in range(100)),
+            "FAILED tests/test_demo.py::test_signal",
+        ]
+    )
+    hidden_pytest = reduce_text(
+        literal_read,
+        command="cat README && pytest -q >/dev/null 2>&1",
+        tool_name="terminal",
+        exit_code=1,
+        options=compact_opts,
+    )
+    assert hidden_pytest.changed is False
+    assert hidden_pytest.text == literal_read
+    assert hidden_pytest.metadata["command_class"] == "file_read"
+
+    hidden_npm_stderr = "\n".join(
+        [
+            *(f"plain README line {index}" for index in range(100)),
+            "Error: Cannot find module demo",
+        ]
+    )
+    hidden_npm = reduce_text(
+        hidden_npm_stderr,
+        command="cat README && npm test 2>/dev/null",
+        tool_name="terminal",
+        exit_code=1,
+        options=compact_opts,
+    )
+    assert hidden_npm.changed is False
+    assert hidden_npm.text == hidden_npm_stderr
+    assert hidden_npm.metadata["command_class"] == "file_read"
+
+
+def test_successful_regex_search_owns_skipped_package_fallback() -> None:
+    compact_opts = opts(max_chars=180, max_lines=8, head_lines=1, tail_lines=1)
+    search_output = "\n".join(f"Error: boom {index}" for index in range(100))
+
+    exact_search = reduce_text(
+        search_output,
+        command="grep 'Error: .*' file || npm install",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert exact_search.changed is False
+    assert exact_search.text == search_output
+    assert exact_search.metadata["command_class"] == "source_search"
+
+    package_output = "\n".join(f"added {100 + index} packages in 12s" for index in range(100))
+    case_mismatch_output = "\n".join(
+        f"error: fallback diagnostic {index}" for index in range(100)
+    )
+    for command, raw in (
+        ("grep 'Error: .*' file || npm install", package_output),
+        ("grep -F 'Error: .*' file || npm install", package_output),
+        ("grep 'Error: .*' file || npm install", case_mismatch_output),
+    ):
+        fallback = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+        assert fallback.changed is True, command
+        assert fallback.metadata["command_class"] == "node", command
+
+    ignored_case = reduce_text(
+        case_mismatch_output,
+        command="grep -i 'Error: .*' file || npm install",
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert ignored_case.changed is False
+    assert ignored_case.text == case_mismatch_output
+    assert ignored_case.metadata["command_class"] == "source_search"
+
+
+def test_apt_fix_broken_flag_does_not_consume_install_subcommand() -> None:
+    compact_opts = opts(max_chars=180, max_lines=8, head_lines=1, tail_lines=1)
+    apt_output = "\n".join(
+        [
+            "Reading package lists... Done",
+            *(f"apt package progress {index}" for index in range(100)),
+        ]
+    )
+
+    for command in (
+        "apt-get -f install imaginary-package",
+        "apt-get --fix-broken install imaginary-package",
+    ):
+        result = reduce_text(
+            apt_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=compact_opts,
+        )
+        assert result.changed is True, command
+        assert result.metadata["command_class"] == "apt", command

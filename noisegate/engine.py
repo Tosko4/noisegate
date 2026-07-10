@@ -504,7 +504,7 @@ def classify_command(command: str | None, text: str, *, exit_code: int | None = 
     if _is_source_search_command(
         command_s,
         sample=sample_l,
-        text=text_l,
+        text=text,
         exit_code=exit_code,
     ):
         return "source_search"
@@ -2416,10 +2416,6 @@ def _command_substitutions(command: str) -> list[tuple[str, str]]:
     return substitutions
 
 
-def _command_substitution_bodies(command: str) -> list[str]:
-    return [body for _kind, body in _command_substitutions(command)]
-
-
 def _unquoted_shell_lines(command: str) -> list[str]:
     lines: list[str] = []
     current: list[str] = []
@@ -2456,17 +2452,118 @@ def _unquoted_shell_lines(command: str) -> list[str]:
     return lines
 
 
-def _process_substitution_compactable_class(command: str, sample: str, text: str) -> str | None:
-    for body in _command_substitution_bodies(command):
-        nested_class = _process_substitution_compactable_class(body, sample, text)
-        if nested_class is not None:
-            return nested_class
-        token_groups = [_shell_tokens(body)]
-        token_groups.extend(
-            tokens
-            for line in _unquoted_shell_lines(body)
-            for tokens in (_shell_tokens(line), *_command_token_segments(line))
+def _proven_reachable_substitution_tokens(body: str) -> list[list[str]] | None:
+    """Evaluate only simple top-level true/false AND-OR lists."""
+    if not body.strip() or any(char in body for char in "'\"`\\#{}"):
+        return None
+    substitutions = _command_substitutions(body)
+    masked_body = body
+    markers: list[str] = []
+    for index, (kind, nested) in enumerate(substitutions):
+        if kind == "arithmetic":
+            return None
+        candidates = (
+            [f"$({nested})"]
+            if kind == "command"
+            else [f"<({nested})", f">({nested})"]
         )
+        matches = [
+            (masked_body.find(candidate), candidate)
+            for candidate in candidates
+            if masked_body.find(candidate) >= 0
+        ]
+        if not matches:
+            return None
+        start, matched = min(matches)
+        marker = f"__noisegate_nested_{index}__"
+        masked_body = (
+            f"{masked_body[:start]}{marker}{masked_body[start + len(matched):]}"
+        )
+        markers.append(marker)
+    if "$" in masked_body or any(char in masked_body for char in "()"):
+        return None
+    if any(
+        re.search(r"(?:&&|\|\||[;|&<>(){}\r\n])", nested)
+        for _kind, nested in substitutions
+    ):
+        return None
+
+    logical_lines: list[str] = []
+    pending = ""
+    for line in masked_body.splitlines():
+        pending = f"{pending} {line.strip()}".strip()
+        if re.search(r"(?:&&|\|\|)\s*$", pending):
+            continue
+        if pending:
+            logical_lines.append(pending)
+        pending = ""
+    if pending or not logical_lines:
+        return None
+    normalized = " ; ".join(logical_lines)
+    if re.search(r"(?:&&|\|\||[;&])\s*$", normalized):
+        return None
+    tokens = _shell_tokens(normalized)
+    if any(token in {"|", "|&", "&", "{", "}"} for token in tokens):
+        return None
+    for index, token in enumerate(tokens):
+        if "<" not in token and ">" not in token:
+            continue
+        if token in {"<", ">"} and index + 1 < len(tokens) and tokens[index + 1] == "(":
+            continue
+        return None
+
+    reachable: list[list[str]] = []
+    statuses: set[bool] = set()
+    for separator, command_tokens in _background_segments(normalized):
+        if not command_tokens:
+            return None
+        if command_tokens == ["true"] or command_tokens == [":"]:
+            command_statuses = {True}
+        elif command_tokens == ["false"]:
+            command_statuses = {False}
+        else:
+            command_statuses = {True, False}
+
+        if separator in {None, ";"}:
+            runs = True
+            statuses = command_statuses
+        elif separator == "&&":
+            runs = True in statuses
+            statuses = ({False} if False in statuses else set()) | (
+                command_statuses if runs else set()
+            )
+        elif separator == "||":
+            runs = False in statuses
+            statuses = ({True} if True in statuses else set()) | (
+                command_statuses if runs else set()
+            )
+        else:
+            return None
+        if not runs:
+            continue
+        if any(token in {"(", ")"} for token in command_tokens):
+            return None
+        reachable.append(command_tokens)
+    if any(marker in token for command in reachable for token in command for marker in markers):
+        return None
+    return reachable
+
+
+def _process_substitution_compactable_class(command: str, sample: str, text: str) -> str | None:
+    for kind, body in _command_substitutions(command):
+        token_groups = (
+            _proven_reachable_substitution_tokens(body) if kind == "command" else None
+        )
+        if token_groups is None:
+            nested_class = _process_substitution_compactable_class(body, sample, text)
+            if nested_class is not None:
+                return nested_class
+            token_groups = [_shell_tokens(body)]
+            token_groups.extend(
+                tokens
+                for line in _unquoted_shell_lines(body)
+                for tokens in (_shell_tokens(line), *_command_token_segments(line))
+            )
         for tokens in token_groups:
             command_class = _compactable_output_class_for_tokens(tokens, sample, text)
             if command_class is not None:
@@ -2484,16 +2581,22 @@ def _substitutions_are_ordinary(command: str) -> bool:
     for kind, body in substitutions:
         if kind != "command" or not body.strip():
             return False
+        if _proven_reachable_substitution_tokens(body) is not None:
+            continue
         if _command_substitutions(body) and not _substitutions_are_ordinary(body):
             return False
     return True
 
 
 def _command_has_process_substitution(command: str) -> bool:
-    return any(
-        kind == "process" or _command_has_process_substitution(body)
-        for kind, body in _command_substitutions(command)
-    )
+    for kind, body in _command_substitutions(command):
+        if kind == "process":
+            return True
+        if kind == "command" and _proven_reachable_substitution_tokens(body) is not None:
+            continue
+        if _command_has_process_substitution(body):
+            return True
+    return False
 
 
 def _has_active_process_substitution(command: str) -> bool:
@@ -2907,6 +3010,13 @@ def _looks_like_file_read_command(
                 text,
             ):
                 return True
+            if _visible_failed_test_tail_owns_output(
+                later_segments,
+                sample,
+                text,
+                exit_code,
+            ):
+                return False
             if _later_compactable_output_dominates(
                 later_segments,
                 sample,
@@ -3162,7 +3272,10 @@ def _is_apt_command(command: str) -> bool:
     for tokens in _command_segments_after_wrappers(command):
         if not tokens or Path(tokens[0]).name not in {"apt", "apt-get"}:
             continue
-        rest = _skip_option_tokens(tokens[1:])
+        rest = _skip_option_tokens(
+            tokens[1:],
+            valueless_options={"-f", "--fix-broken"},
+        )
         if rest and rest[0] in {
             "update",
             "install",
@@ -3905,6 +4018,40 @@ def _hidden_compactable_tail_preserves_exact_output(
         if _contains_redirected_compactable_stderr(text):
             return False
     return saw_hidden_stdout
+
+
+def _visible_failed_test_tail_owns_output(
+    segments: list[tuple[str | None, list[str]]],
+    sample: str,
+    text: str,
+    exit_code: int | None,
+) -> bool:
+    if exit_code in {None, 0}:
+        return False
+    for index, (separator, tokens) in enumerate(segments):
+        if separator != "&&":
+            continue
+        effective_tokens = _segment_tokens_with_enclosing_group_redirects(segments, index)
+        stdout_visible, stderr_visible = _redirected_stream_visibility(effective_tokens)
+        if not stdout_visible and not stderr_visible:
+            continue
+        command_class = _compactable_class_for_tokens(tokens, sample, text)
+        stripped = _strip_command_wrappers(tokens)
+        if (
+            command_class == "node"
+            and len(stripped) >= 2
+            and Path(stripped[0]).name == "npm"
+            and stripped[1] == "test"
+            and stderr_visible
+            and re.search(r"(?im)^\s*error:\s+cannot find module\b", text)
+        ):
+            return True
+        if command_class == "pytest" and stdout_visible and re.search(
+            r"(?im)^\s*failed\s+\S+\.py::",
+            text,
+        ):
+            return True
+    return False
 
 
 def _background_tail_command_class(
@@ -5466,11 +5613,40 @@ def _source_search_pattern_owns_text(tokens: list[str], text: str) -> bool:
     looks_like_test_failure = _looks_like_test_failure_output(text)
     return any(
         len(pattern) >= 3
-        and pattern.lower() in text_l
+        and (
+            pattern.lower() in text_l
+            or _safe_source_search_regex_matches_text(tokens, pattern, text)
+        )
         and not _source_search_pattern_is_compactable_signal(pattern)
         and not (looks_like_test_failure and _source_search_pattern_is_traceback_path(pattern))
         for pattern in patterns
     )
+
+
+def _safe_source_search_regex_matches_text(
+    tokens: list[str],
+    pattern: str,
+    text: str,
+) -> bool:
+    if _tokens_source_search_uses_fixed_strings(tokens) or pattern.count(".*") != 1:
+        return False
+    ignore_case = bool(
+        {"-i", "--ignore-case"} & set(_source_search_option_flags(tokens))
+    )
+    prefix, suffix = pattern.split(".*")
+    if ignore_case:
+        prefix = prefix.casefold()
+        suffix = suffix.casefold()
+    if len(prefix) + len(suffix) < 3 or any(
+        char in r"\[]^$*.+?(){}|" for char in prefix + suffix
+    ):
+        return False
+    for line in text.splitlines():
+        searchable_line = line.casefold() if ignore_case else line
+        start = searchable_line.find(prefix)
+        if start >= 0 and suffix in searchable_line[start + len(prefix) :]:
+            return True
+    return False
 
 
 def _tokens_source_search_uses_fixed_strings(tokens: list[str]) -> bool:
@@ -5496,7 +5672,7 @@ def _source_search_pattern_owns_non_source_line(
     allow_compactable_signals: bool = False,
 ) -> bool:
     patterns = [
-        pattern.lower()
+        pattern
         for pattern in _source_search_patterns(tokens)
         if len(pattern) >= 3
         and (allow_compactable_signals or not _source_search_pattern_is_compactable_signal(pattern))
@@ -5509,7 +5685,10 @@ def _source_search_pattern_owns_non_source_line(
             continue
         line_l = line.lower()
         for pattern in patterns:
-            if pattern in line_l and not (
+            if (
+                pattern.lower() in line_l
+                or _safe_source_search_regex_matches_text(tokens, pattern, line)
+            ) and not (
                 looks_like_test_failure and _source_search_pattern_is_traceback_path(pattern)
             ):
                 return True
@@ -6057,6 +6236,30 @@ def _tokens_pipe_to_file_read(tokens: list[str]) -> bool:
     return False
 
 
+def _tokens_start_direct_log_stream(tokens: list[str]) -> bool:
+    tokens = _strip_command_wrappers(tokens)
+    if not tokens:
+        return False
+    command_name = Path(tokens[0]).name
+    if command_name == "journalctl":
+        return True
+    if command_name != "kubectl":
+        return False
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"-n", "--namespace"}:
+            index += 2
+            continue
+        if token.startswith("--namespace=") or (
+            token.startswith("-n") and len(token) > 2
+        ):
+            index += 1
+            continue
+        break
+    return index < len(tokens) and tokens[index] == "logs"
+
+
 def _tokens_pipe_to_source_search(tokens: list[str]) -> bool:
     tokens = _strip_command_wrappers(tokens)
     for index, token in enumerate(tokens[:-1]):
@@ -6064,6 +6267,8 @@ def _tokens_pipe_to_source_search(tokens: list[str]) -> bool:
             downstream = tokens[index + 1 :]
             if _tokens_start_source_search(downstream):
                 upstream = tokens[:index]
+                if _tokens_start_direct_log_stream(upstream):
+                    continue
                 if _tokens_start_compactable_command(upstream):
                     continue
                 return True
@@ -6380,7 +6585,11 @@ def _git_subcommand_tokens(tokens: list[str]) -> list[str]:
     return []
 
 
-def _skip_option_tokens(tokens: list[str]) -> list[str]:
+def _skip_option_tokens(
+    tokens: list[str],
+    *,
+    valueless_options: set[str] | frozenset[str] = frozenset(),
+) -> list[str]:
     index = 0
     while index < len(tokens):
         token = tokens[index]
@@ -6390,7 +6599,12 @@ def _skip_option_tokens(tokens: list[str]) -> list[str]:
             break
         index += 1
         option_name = token.split("=", 1)[0]
-        if option_name in OPTIONS_WITH_VALUES and "=" not in token and index < len(tokens):
+        if (
+            option_name in OPTIONS_WITH_VALUES
+            and option_name not in valueless_options
+            and "=" not in token
+            and index < len(tokens)
+        ):
             index += 1
     return tokens[index:]
 
