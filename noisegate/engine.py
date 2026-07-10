@@ -6501,9 +6501,11 @@ def _skip_sudo_options(tokens: list[str]) -> list[str]:
     """Return sudo's executable child after parsing documented option arities."""
 
     short_value_options = frozenset(
-        {"a", "C", "c", "D", "d", "g", "h", "p", "R", "r", "t", "T", "u", "U"}
+        {"a", "C", "c", "D", "d", "g", "h", "p", "R", "r", "t", "T", "u"}
     )
-    short_empty_value_options = frozenset({"p", "T"})
+    short_empty_value_options = frozenset({"p"})
+    # Follow upstream's cross-platform grammar rather than this host's sudo --help:
+    # BSD builds expose auth/login classes, and policy plugins may support remote hosts.
     long_value_options = frozenset(
         {
             "--auth-type",
@@ -6518,10 +6520,9 @@ def _skip_sudo_options(tokens: list[str]) -> list[str]:
             "--type",
             "--command-timeout",
             "--user",
-            "--other-user",
         }
     )
-    short_no_child_modes = frozenset({"e", "l", "v", "V", "K"})
+    short_no_child_modes = frozenset({"e", "l", "v", "V", "K", "U"})
     long_no_child_modes = frozenset(
         {
             "--edit",
@@ -6530,6 +6531,7 @@ def _skip_sudo_options(tokens: list[str]) -> list[str]:
             "--version",
             "--help",
             "--remove-timestamp",
+            "--other-user",
         }
     )
     long_flag_options = frozenset(
@@ -6549,7 +6551,7 @@ def _skip_sudo_options(tokens: list[str]) -> list[str]:
         }
     )
     supported_long_options = long_value_options | long_no_child_modes | long_flag_options
-    empty_attached_value_options = frozenset({"--command-timeout", "--prompt"})
+    empty_value_options = frozenset({"--prompt"})
     index = 0
     while index < len(tokens):
         token = tokens[index]
@@ -6579,18 +6581,18 @@ def _skip_sudo_options(tokens: list[str]) -> list[str]:
                 if "=" in token:
                     if (
                         not token.partition("=")[2]
-                        and normalized_option not in empty_attached_value_options
+                        and normalized_option not in empty_value_options
                     ):
                         return []
                 elif index < len(tokens):
                     if (
                         tokens[index] in SHELL_SEPARATORS
-                        and normalized_option not in empty_attached_value_options
+                        and normalized_option not in empty_value_options
                     ):
                         return []
                     if (
                         not tokens[index]
-                        and normalized_option not in empty_attached_value_options
+                        and normalized_option not in empty_value_options
                     ):
                         return []
                     index += 1
