@@ -1576,7 +1576,7 @@ def test_later_chained_compactable_commands_override_exact_passthrough() -> None
             1,
         ),
         (
-            "rg -h target src && pytest -q",
+            "rg -I target src && pytest -q",
             pytest_raw,
             "pytest",
             "FAILED tests/test_demo.py::test_signal",
@@ -1639,7 +1639,7 @@ def test_later_chained_compactable_commands_override_exact_passthrough() -> None
             1,
         ),
         (
-            "rg -h -e NotPresent src/app.py; pytest -q",
+            "rg -I -e NotPresent src/app.py; pytest -q",
             realistic_pytest_with_frame,
             "pytest",
             "FAILED tests/test_artifacts.py::test_writes_config",
@@ -1674,7 +1674,7 @@ def test_later_chained_compactable_commands_override_exact_passthrough() -> None
             1,
         ),
         (
-            "rg -h -e NotPresent src/app.py && pytest -q",
+            "rg -I -e NotPresent src/app.py && pytest -q",
             traceback_only_pytest,
             "pytest",
             "ModuleNotFoundError: No module named 'missing_package'",
@@ -2022,7 +2022,7 @@ def test_short_circuit_semantics_do_not_override_exact_reads_blindly() -> None:
     )
     hidden_source_search_or_pytest = reduce_text(
         hidden_source_search_literal,
-        command='rg -h "123 passed" notes.md || pytest -q',
+        command='rg -I "123 passed" notes.md || pytest -q',
         tool_name="terminal",
         exit_code=0,
         options=opts(max_chars=400),
@@ -2368,7 +2368,7 @@ def test_short_circuit_semantics_do_not_override_exact_reads_blindly() -> None:
     )
     exact_hidden_context_search = reduce_text(
         hidden_context_search_with_literal_error,
-        command="rg -h -C1 ERROR src && uv sync",
+        command="rg -I -C1 ERROR src && uv sync",
         tool_name="terminal",
         exit_code=1,
         options=opts(max_chars=400),
@@ -2589,7 +2589,6 @@ def test_source_and_exact_terminal_commands_stay_byte_for_byte_unchanged() -> No
         "rg '`fixture`' src 2>/dev/null": search_output,
         "rg target '<(fixture)'": search_output,
         'rg "$(cat pattern.txt)" src': search_output,
-        "rg -f <(cat patterns.txt) src": search_output,
         "/usr/local/bin/rg target src": search_output,
         "grep -R target src": search_output,
         "/opt/homebrew/bin/grep -R target src": search_output,
@@ -2814,7 +2813,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
     )
     exact_fixed_string = reduce_text(
         fixed_string_source,
-        command="rg -F -h ERROR src && uv sync",
+        command="rg -F -I ERROR src && uv sync",
         tool_name="terminal",
         exit_code=1,
         options=compact_opts,
@@ -2988,7 +2987,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
     literal = "literal source line with target token"
     exact_hidden_fixed_package_literal = reduce_text(
         "\n".join(literal for _ in range(80)),
-        command=f"rg -F -h '{literal}' src || npm install",
+        command=f"rg -F -I '{literal}' src || npm install",
         tool_name="terminal",
         exit_code=0,
         options=compact_opts,
@@ -2998,7 +2997,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
 
     ambiguous_hidden_fixed_package_output = reduce_text(
         "\n".join("added 451 packages in 12s" for _ in range(80)),
-        command="rg -F -h 'added 451 packages in 12s' src || npm install",
+        command="rg -F -I 'added 451 packages in 12s' src || npm install",
         tool_name="terminal",
         exit_code=0,
         options=compact_opts,
@@ -3013,7 +3012,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
         for separator in ("&&", ";"):
             compacted_hidden_fixed_signal_literal = reduce_text(
                 "\n".join(literal for _ in range(80)),
-                command=f"rg -F -h '{literal}' src {separator} {later_command}",
+                command=f"rg -F -I '{literal}' src {separator} {later_command}",
                 tool_name="terminal",
                 exit_code=0,
                 options=compact_opts,
@@ -3035,32 +3034,32 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
 
     for command, raw, expected_class in (
         (
-            "rg -F -h -C40 'added 451 packages in 12s' src && npm install",
+            "rg -F -I -C40 'added 451 packages in 12s' src && npm install",
             plain_context("added 451 packages in 12s"),
             "source_search",
         ),
         (
-            "rg -F -h -C40 '123 passed in 2.00s' src && pytest -q",
+            "rg -F -I -C40 '123 passed in 2.00s' src && pytest -q",
             plain_context("123 passed in 2.00s"),
             "source_search",
         ),
         (
-            "rg -F -h -C40 'Reading package lists' src && apt-get update",
+            "rg -F -I -C40 'Reading package lists' src && apt-get update",
             plain_context("Reading package lists... Done"),
             "source_search",
         ),
         (
-            "rg -F -h -C40 'writing image' src && docker build .",
+            "rg -F -I -C40 'writing image' src && docker build .",
             plain_context("#3 writing image sha256:abc"),
             "source_search",
         ),
         (
-            "rg -h -C40 'added 451 packages in 12s' src && npm install",
+            "rg -I -C40 'added 451 packages in 12s' src && npm install",
             plain_context("added 451 packages in 12s"),
             "source_search",
         ),
         (
-            "rg -h -C40 'Reading package lists' src && apt-get update",
+            "rg -I -C40 'Reading package lists' src && apt-get update",
             plain_context("Reading package lists... Done"),
             "source_search",
         ),
@@ -3209,7 +3208,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
 
     ambiguous_compactable_after_search_fallback = reduce_text(
         "\n".join("added 451 packages in 12s" for _ in range(80)),
-        command="rg missing src || rg -F -h 'added 451 packages in 12s' docs || npm install",
+        command="rg missing src || rg -F -I 'added 451 packages in 12s' docs || npm install",
         tool_name="terminal",
         exit_code=0,
         options=compact_opts,
@@ -3219,7 +3218,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
 
     skipped_compactable_after_successful_hidden_search_left = reduce_text(
         "\n".join("added 451 packages in 12s" for _ in range(80)),
-        command='rg -h "added 451 packages" src || { npm install; exit 7; }',
+        command='rg -I "added 451 packages" src || { npm install; exit 7; }',
         tool_name="terminal",
         exit_code=0,
         options=compact_opts,
@@ -3261,7 +3260,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
 
     hidden_background_source_search_owns_stdout_shaped_literal = reduce_text(
         "\n".join("added 451 packages in 12s" for _ in range(80)),
-        command='rg -F -h "added 451 packages in 12s" src & npm install >/dev/null',
+        command='rg -F -I "added 451 packages in 12s" src & npm install >/dev/null',
         tool_name="terminal",
         exit_code=0,
         options=compact_opts,
@@ -3274,7 +3273,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
 
     ambiguous_successful_or_fallback_with_compactable_output = reduce_text(
         "\n".join("added 451 packages in 12s" for _ in range(80)),
-        command='rg -h "added 451 packages" src || npm install',
+        command='rg -I "added 451 packages" src || npm install',
         tool_name="terminal",
         exit_code=0,
         options=compact_opts,
@@ -3287,7 +3286,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
 
     successful_intervening_fallback_skips_compactable_tail = reduce_text(
         "\n".join("added 451 packages in 12s" for _ in range(80)),
-        command='rg -h "added 451 packages" src || true || npm install',
+        command='rg -I "added 451 packages" src || true || npm install',
         tool_name="terminal",
         exit_code=0,
         options=compact_opts,
@@ -3318,7 +3317,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
 
     compactable_group_before_true_still_owns_output = reduce_text(
         "\n".join("added 451 packages in 12s" for _ in range(80)),
-        command='rg -h "added 451 packages" src || { npm install; true; } || npm install',
+        command='rg -I "added 451 packages" src || { npm install; true; } || npm install',
         tool_name="terminal",
         exit_code=0,
         options=compact_opts,
@@ -3328,7 +3327,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
 
     guarded_exit_does_not_make_compactable_fallback_unreachable = reduce_text(
         "\n".join("added 451 packages in 12s" for _ in range(80)),
-        command='rg -h "added 451 packages" src || { npm install || exit 7; } || npm install',
+        command='rg -I "added 451 packages" src || { npm install || exit 7; } || npm install',
         tool_name="terminal",
         exit_code=0,
         options=compact_opts,
@@ -3341,7 +3340,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
 
     shell_terminating_or_fallback_keeps_successful_exact_left = reduce_text(
         "\n".join("added 451 packages in 12s" for _ in range(80)),
-        command='rg -h "added 451 packages" src || { npm install; exit 7; } || npm install',
+        command='rg -I "added 451 packages" src || { npm install; exit 7; } || npm install',
         tool_name="terminal",
         exit_code=0,
         options=compact_opts,
@@ -3354,7 +3353,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
 
     compact_shell_terminating_or_fallback_keeps_successful_exact_left = reduce_text(
         "\n".join("added 451 packages in 12s" for _ in range(80)),
-        command='rg -h "added 451 packages" src || { npm install; exit 7;}|| npm install',
+        command='rg -I "added 451 packages" src || { npm install; exit 7;}|| npm install',
         tool_name="terminal",
         exit_code=0,
         options=compact_opts,
@@ -3371,7 +3370,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
         top_level_exit_makes_later_fallback_unreachable = reduce_text(
             "\n".join("added 451 packages in 12s" for _ in range(80)),
             command=(
-                f'rg -h "added 451 packages" src || exit {exit_status} || npm install'
+                f'rg -I "added 451 packages" src || exit {exit_status} || npm install'
             ),
             tool_name="terminal",
             exit_code=0,
@@ -3385,12 +3384,12 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
 
     for command, expected_class in (
         (
-            'rg -h "added 451 packages" src '
+            'rg -I "added 451 packages" src '
             "|| { exit 7; npm install; } || npm install",
             "source_search",
         ),
         (
-            'rg -h "added 451 packages" src '
+            'rg -I "added 451 packages" src '
             "&& { exit 0; npm install; } && npm install",
             "source_search",
         ),
@@ -3410,7 +3409,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
         reachable_second_fallback = reduce_text(
             "\n".join("added 451 packages in 12s" for _ in range(80)),
             command=(
-                'rg -F -h "added 451 packages in 12s" src '
+                'rg -F -I "added 451 packages in 12s" src '
                 f"|| {failed_fallback} || npm install"
             ),
             tool_name="terminal",
@@ -3492,7 +3491,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
     )
     for command, expected_class in (
         (
-            'rg -F -h "added 451 packages in 12s" src || '
+            'rg -F -I "added 451 packages in 12s" src || '
             "npm install >/dev/null 2>&1",
             "source_search",
         ),
@@ -3507,7 +3506,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
             "file_read",
         ),
         (
-            'rg -F -h "added 451 packages in 12s" src && '
+            'rg -F -I "added 451 packages in 12s" src && '
             'echo "$(npm install)" >/dev/null',
             "source_search",
         ),
@@ -3574,7 +3573,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
 
     skipped_grouped_fallback_keeps_exact_source_search = reduce_text(
         "\n".join("added 451 packages in 12s" for _ in range(80)),
-        command='rg -h "added 451 packages" src || { npm install; npm install; exit 7; }',
+        command='rg -I "added 451 packages" src || { npm install; npm install; exit 7; }',
         tool_name="terminal",
         exit_code=0,
         options=compact_opts,
@@ -3597,7 +3596,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
 
     ambiguous_successful_grouped_fallback_with_compactable_output = reduce_text(
         "\n".join("added 451 packages in 12s" for _ in range(80)),
-        command='rg -h "added 451 packages" src || { false; npm install; }',
+        command='rg -I "added 451 packages" src || { false; npm install; }',
         tool_name="terminal",
         exit_code=0,
         options=compact_opts,
@@ -3612,7 +3611,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
 
     unconditional_compactable_after_forced_nonzero_fallback = reduce_text(
         "\n".join("added 451 packages in 12s" for _ in range(80)),
-        command='rg -h "added 451 packages" src || { npm install; exit 7; } && npm install',
+        command='rg -I "added 451 packages" src || { npm install; exit 7; } && npm install',
         tool_name="terminal",
         exit_code=0,
         options=compact_opts,
@@ -3625,7 +3624,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
 
     compact_semicolon_after_grouped_fallback = reduce_text(
         "\n".join("added 451 packages in 12s" for _ in range(80)),
-        command='rg -h "added 451 packages" src || { npm install; exit 7;}; npm install',
+        command='rg -I "added 451 packages" src || { npm install; exit 7;}; npm install',
         tool_name="terminal",
         exit_code=0,
         options=compact_opts,
@@ -3635,7 +3634,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
 
     compact_background_after_grouped_fallback = reduce_text(
         "\n".join("added 451 packages in 12s" for _ in range(80)),
-        command='rg -h "added 451 packages" src || { npm install; exit 7; } & npm install',
+        command='rg -I "added 451 packages" src || { npm install; exit 7; } & npm install',
         tool_name="terminal",
         exit_code=0,
         options=compact_opts,
@@ -4104,7 +4103,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
             "writing image",
         ),
         (
-            "rg -F -h 'npm ERR! code ERESOLVE' src && npm install",
+            "rg -F -I 'npm ERR! code ERESOLVE' src && npm install",
             "\n".join(
                 [
                     *[f"npm progress before {index}" for index in range(80)],
@@ -4116,7 +4115,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
             "npm ERR! code ERESOLVE",
         ),
         (
-            "rg -F -h 'ERROR: No matching distribution found' src && uv sync",
+            "rg -F -I 'ERROR: No matching distribution found' src && uv sync",
             "\n".join(
                 [
                     *[f"uv progress before {index}" for index in range(80)],
@@ -4128,7 +4127,7 @@ def test_local_codex_p2_exact_owner_and_later_dominance_regressions() -> None:
             "No matching distribution found",
         ),
         (
-            "rg -F -h '0 upgraded, 1 newly installed' src && apt install jq",
+            "rg -F -I '0 upgraded, 1 newly installed' src && apt install jq",
             "\n".join(
                 [
                     *[f"apt progress before {index}" for index in range(80)],
@@ -4259,7 +4258,7 @@ def test_redirect_visibility_controls_exact_output_ownership() -> None:
     hidden_search_tail = reduce_text(
         package_literal_output,
         command=(
-            'rg -F -h "added 451 packages in 12s" src '
+            'rg -F -I "added 451 packages in 12s" src '
             "&& npm install >/dev/null"
         ),
         tool_name="terminal",
@@ -4301,7 +4300,7 @@ def test_redirect_visibility_controls_exact_output_ownership() -> None:
     for redirect in (">&2", ">&1", ">/dev/stdout", ">/dev/stderr", "1>&2"):
         visible_background_tail = reduce_text(
             package_literal_output,
-            command=f'rg -h "foo" src & npm install {redirect}',
+            command=f'rg -I "foo" src & npm install {redirect}',
             tool_name="terminal",
             exit_code=0,
             options=compact_opts,
@@ -4485,7 +4484,7 @@ def test_redirect_visibility_controls_exact_output_ownership() -> None:
     for command, expected_class in (
         ("cat build.log && npm install >/dev/null 2>&1", "file_read"),
         (
-            "rg -F -h 'npm ERR!' src && npm install >/dev/null 2>&1",
+            "rg -F -I 'npm ERR!' src && npm install >/dev/null 2>&1",
             "source_search",
         ),
     ):
@@ -4586,3 +4585,371 @@ def test_active_substitution_in_later_segment_does_not_steal_prior_exact_output(
     assert visible_substitution_failure.changed is True
     assert visible_substitution_failure.metadata["command_class"] == "pytest"
     assert "AssertionError: substitution failed" in visible_substitution_failure.text
+
+
+def test_direct_dynamic_file_reads_require_noncompactable_ordinary_substitutions() -> None:
+    compact_opts = opts(max_chars=180, max_lines=8, head_lines=1, tail_lines=1)
+    plain_output = "\n".join(f"opaque payload record {index}" for index in range(100))
+
+    for command in (
+        "cat README # <(printf ignored)", 'cat README "# <(printf literal)"',
+        "cat README \\\n# <(printf ignored)",
+        'cat "$(cat path.txt)"',
+        "cat $(cat path.txt)",
+        'cat "$(printf %s fixtures)/$(cat path.txt)"',
+        'cat "$(printf \'# )\'; cat path.txt)"',
+    ):
+        exact_read = reduce_text(
+            plain_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+
+        assert exact_read.changed is False, command
+        assert exact_read.text == plain_output, command
+        assert exact_read.metadata["command_class"] == "file_read", command
+
+    pytest_output = "\n".join(
+        [
+            *[f"pytest substitution noise {index}" for index in range(100)],
+            "FAILED tests/test_demo.py::test_signal",
+        ]
+    )
+    for command in (
+        'cat "$(pytest -q)"',
+        'cat "$(cat path.txt # )\npytest -q\n)"',
+        'cat "$(cat path.txt \\\n# )\npytest -q\n)"',
+    ):
+        compactable_substitution = reduce_text(
+            pytest_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=compact_opts,
+        )
+
+        assert compactable_substitution.changed is True, command
+        assert compactable_substitution.metadata["command_class"] == "pytest", command
+        assert "FAILED tests/test_demo.py::test_signal" in compactable_substitution.text, command
+
+    compound_dynamic_read = reduce_text(
+        plain_output,
+        command='echo heading && cat "$(cat path.txt)"',
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+
+    assert compound_dynamic_read.changed is True
+    assert compound_dynamic_read.metadata["command_class"] == "generic"
+
+    source_shaped_output = "\n".join(
+        f"def generated_{index}(): return {index}" for index in range(100)
+    )
+    for command in (
+        "cat <(cat path.txt)", "cat >(cat path.txt)",
+        "cat README foo#<(printf active)", "cat README # ignored\ncat <(printf active)",
+        "cat README foo\\\n#<(printf active)",
+    ):
+        process_substitution = reduce_text(
+            source_shaped_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+
+        assert process_substitution.changed is True, command
+        assert process_substitution.metadata["command_class"] == "generic", command
+
+def test_direct_hidden_dynamic_searches_use_command_specific_filename_flags() -> None:
+    compact_opts = opts(max_chars=180, max_lines=8, head_lines=1, tail_lines=1)
+    hidden_output = "\n".join(f"opaque matching record {index}" for index in range(100))
+
+    for command in (
+        'rg -I "$(cat pattern.txt)" "$(cat path.txt)"',
+        "rg -I $(cat pattern.txt) $(cat path.txt)",
+        'rg --no-filename "$(cat pattern.txt)" "$(cat path.txt)"',
+        'rg -nI "$(cat pattern.txt)" "$(cat path.txt)"',
+        'grep -h "$(cat pattern.txt)" "$(cat path.txt)"',
+    ):
+        exact_search = reduce_text(
+            hidden_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+
+        assert exact_search.changed is False, command
+        assert exact_search.text == hidden_output, command
+        assert exact_search.metadata["command_class"] == "source_search", command
+
+    pytest_output = "\n".join(
+        [
+            *[f"pytest dynamic-pattern noise {index}" for index in range(100)],
+            "FAILED tests/test_demo.py::test_signal",
+        ]
+    )
+    for command in (
+        'rg -I "$(pytest -q)" src',
+        'rg --no-filename "$(pytest -q)" src',
+        'rg -nI "$(pytest -q)" src',
+        'grep -h "$(pytest -q)" src',
+    ):
+        compactable_substitution = reduce_text(
+            pytest_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=compact_opts,
+        )
+
+        assert compactable_substitution.changed is True, command
+        assert compactable_substitution.metadata["command_class"] == "pytest", command
+
+    for command in ('rg -h', 'rg -h "$(cat pattern.txt)" src'):
+        ripgrep_help = reduce_text(
+            hidden_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+
+        assert ripgrep_help.changed is True, command
+        assert ripgrep_help.metadata["command_class"] == "generic", command
+
+    for command in (
+        'true && rg -I "$(cat pattern.txt)" "$(cat path.txt)"',
+        "rg -I target <(cat paths.txt)",
+        "grep -h target >(cat paths.txt)",
+    ):
+        indirect_dynamic_search = reduce_text(
+            hidden_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+
+        assert indirect_dynamic_search.changed is True, command
+        assert indirect_dynamic_search.metadata["command_class"] == "generic", command
+
+
+def test_concatenated_process_substitutions_never_prove_exact_ownership() -> None:
+    compact_opts = opts(max_chars=180, max_lines=8, head_lines=1, tail_lines=1)
+    package_output = "added 451 packages in 12s\n" + package_progress("npm fallback", 100)
+
+    for command in (
+        "cat $UNSET<(printf source.py) || npm install",
+        "rg -I target $UNSET>(printf paths.txt) || npm install",
+    ):
+        result = reduce_text(
+            package_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+
+        assert result.changed is True, command
+        assert result.metadata["command_class"] == "node", command
+
+
+def test_dynamic_search_filename_mode_uses_the_last_effective_flag() -> None:
+    compact_opts = opts(max_chars=180, max_lines=8, head_lines=1, tail_lines=1)
+    hidden_output = "\n".join(f"opaque matching record {index}" for index in range(100))
+
+    hidden_commands = (
+        'rg -HI "$(cat pattern.txt)" "$(cat path.txt)"',
+        'grep -Hh "$(cat pattern.txt)" "$(cat path.txt)"',
+        'rg --with-filename --no-filename "$(cat pattern.txt)" "$(cat path.txt)"',
+        'grep --with-filename --no-filename "$(cat pattern.txt)" "$(cat path.txt)"',
+        'grep -h --group-separator -H "$(cat pattern.txt)" "$(cat path.txt)"',
+        'rg -I --type -H "$(cat pattern.txt)" "$(cat path.txt)"',
+        'rg -Ir -H "$(cat pattern.txt)" "$(cat path.txt)"',
+        'grep -he -H "$(cat path.txt)"',
+    )
+    visible_commands = (
+        'rg -IH "$(cat pattern.txt)" "$(cat path.txt)"',
+        'grep -hH "$(cat pattern.txt)" "$(cat path.txt)"',
+        'rg --no-filename --with-filename "$(cat pattern.txt)" "$(cat path.txt)"',
+        'grep --no-filename --with-filename "$(cat pattern.txt)" "$(cat path.txt)"',
+        'grep -h --group-separator -H -H "$(cat pattern.txt)" "$(cat path.txt)"',
+        'rg -I --type -H -H "$(cat pattern.txt)" "$(cat path.txt)"',
+        'rg -Ir -H -H "$(cat pattern.txt)" "$(cat path.txt)"',
+        'grep -he -H -H "$(cat path.txt)"',
+    )
+    for command in hidden_commands + visible_commands:
+        result = reduce_text(
+            hidden_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+
+        assert result.changed is (command in visible_commands), command
+        expected_class = "generic" if command in visible_commands else "source_search"
+        assert result.metadata["command_class"] == expected_class, command
+        if command in hidden_commands:
+            assert result.text == hidden_output, command
+
+
+def test_jq_null_input_requires_a_valid_explicit_file_option() -> None:
+    compact_opts = opts(max_chars=180, max_lines=8, head_lines=1, tail_lines=1)
+    file_output = "\n".join(f"loaded file value {index}" for index in range(100))
+
+    for tool in ("jq", "yq"):
+        for option, path in (
+            ("--rawfile", "data.txt"),
+            ("--slurpfile", "data.json"),
+            ("--argfile", "data.json"),
+        ):
+            command = f"{tool} -n {option} payload {path} '$payload'"
+            exact_file_option = reduce_text(
+                file_output,
+                command=command,
+                tool_name="terminal",
+                exit_code=0,
+                options=compact_opts,
+            )
+
+            assert exact_file_option.changed is False, command
+            assert exact_file_option.text == file_output, command
+            assert exact_file_option.metadata["command_class"] == "file_read", command
+
+    for command in ("jq -Lvendor . data.json", "jq -f filter.jq input.json"):
+        explicit_jq_read = reduce_text(
+            file_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+
+        assert explicit_jq_read.changed is False, command
+        assert explicit_jq_read.text == file_output, command
+        assert explicit_jq_read.metadata["command_class"] == "file_read", command
+
+    for command in (
+        "yq config.yaml", "yq -P -oy sample.json",
+        "yq -p yaml config.yaml", "yq -pyaml config.yaml",
+        "yq --output-format=json config.yaml", "yq --indent=2 config.yaml",
+        "yq eval '.' config.yaml", "yq e '.' config.yaml",
+        "yq eval-all '.' config.yaml", "yq ea '.' config.yaml",
+        "yq eval config.yaml", "yq e config.yaml",
+        "yq eval --from-file filter.yq config.yaml",
+        "yq config.toml",
+        "yq -f extract config.yaml", "yq --front-matter extract config.yaml",
+    ):
+        implicit_yq_read = reduce_text(
+            file_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+
+        assert implicit_yq_read.changed is False, command
+        assert implicit_yq_read.text == file_output, command
+        assert implicit_yq_read.metadata["command_class"] == "file_read", command
+
+    generated_output = "\n".join(str(index) for index in range(1000))
+    for command in (
+        "jq -n 'range(0;1000)'", "jq -c --arg x --rawfile .",
+        "jq data.json", "jq --library-path vendor .",
+        "jq --args '$ARGS.positional' foo bar", "jq --jsonargs '$ARGS.positional' 1 2",
+    ):
+        generator = reduce_text(
+            generated_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+
+        assert generator.changed is True, command
+        assert generator.metadata["command_class"] == "generic", command
+        assert "[noisegate: omitted" in generator.text, command
+
+
+def test_yq_value_options_leave_single_expressions_on_stdin() -> None:
+    raw = "\n".join(str(index) for index in range(1000))
+    commands = (
+        "yq -p yaml '.'", "yq -pyaml '.'", "yq --input-format=yaml '.'",
+        "yq -o json '.'", "yq --output-format=json '.'", "yq -I 2 '.'",
+        "yq -I2 '.'", "yq --indent=2 '.'", "yq '.metadata.config.json'",
+        "yq eval '.'", "yq e '.'", "yq eval-all '.'", "yq ea '.'",
+        "yq -f extract '.'", "yq --front-matter extract '.'",
+        "yq --front-matter=extract '.'",
+        "yq '.config.toml'", "yq '.metadata.config.hcl'", "yq '.config.ini'",
+    )
+
+    assert {command: classify_command(command, raw) for command in commands} == dict.fromkeys(
+        commands, "generic"
+    )
+    for suffix in (
+        "yaml", "yml", "y", "kyaml", "ky", "json", "j", "props", "properties", "p",
+        "csv", "c", "tsv", "t", "xml", "x", "base64", "uri", "toml", "hcl", "h", "tf",
+        "lua", "l", "ini", "i",
+    ):
+        assert classify_command(f"yq config.{suffix}", raw) == "file_read", suffix
+
+
+def test_git_grep_follows_global_value_options_only_to_the_subcommand() -> None:
+    compact_opts = opts(max_chars=180, max_lines=8, head_lines=1, tail_lines=1)
+    search_output = "\n".join(
+        f"src/module_{index}.py:{index}:target source hit" for index in range(100)
+    )
+
+    for command in (
+        "git --git-dir .git grep target",
+        "git --git-dir=.git grep target",
+        "git --work-tree repo grep target",
+        "git --work-tree=repo grep target",
+        "git --attr-source HEAD grep target",
+        "git --attr-source=HEAD grep target",
+        "git --git-dir .git --work-tree repo --attr-source HEAD grep target",
+        "git -P grep target",
+        "git --no-pager grep target",
+        "git --no-advice grep target",
+        "git --no-lazy-fetch grep target",
+        "git -Crepo grep target",
+        "git -ccolor.grep=false grep target",
+        "git --namespace ns grep target",
+        "git --namespace=ns grep target",
+        "git --config-env token=GIT_TOKEN grep target",
+        "git --exec-path=/usr/lib/git-core grep target",
+        "git --exec-path= grep target",
+    ):
+        exact_search = reduce_text(
+            search_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=0,
+            options=compact_opts,
+        )
+
+        assert exact_search.changed is False, command
+        assert exact_search.text == search_output, command
+        assert exact_search.metadata["command_class"] == "source_search", command
+
+    for command in (
+        "git --git-dir .git status",
+        "git --git-dir=.git status",
+        "git --work-tree repo status",
+        "git --work-tree=repo status",
+        "git --attr-source HEAD status",
+        "git --attr-source=HEAD status",
+        "git --no-advice status",
+        "git --no-lazy-fetch status",
+        "git --exec-path grep target",
+        "git --html-path grep target",
+        "git --man-path grep target",
+        "git --info-path grep target",
+    ):
+        assert classify_command(command, search_output, exit_code=0) != "source_search", command

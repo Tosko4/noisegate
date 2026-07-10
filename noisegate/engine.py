@@ -56,6 +56,34 @@ LCM_EXTERNALIZED_PATTERNS = tuple(
 )
 SHELL_SEPARATORS = {"|", "|&", "||", "&&", ";", "&", "(", ")", "{", "}"}
 SOURCE_SEARCH_COMMANDS = {"rg", "grep", "ag", "ack"}
+SOURCE_SEARCH_OPTIONS_WITH_VALUES = frozenset({
+    "-A", "-B", "-C", "-f", "-g", "-m",
+    "--after-context", "--before-context", "--colors", "--context", "--encoding",
+    "--engine", "--field-context-separator", "--field-match-separator", "--glob",
+    "--iglob", "--ignore-file", "--include", "--exclude", "--exclude-dir",
+    "--exclude-from", "--label", "--max-count", "--path-separator", "--pre-glob",
+    "--replace", "--sort", "--type", "--type-add",
+})
+RG_OPTIONS_WITH_VALUES = SOURCE_SEARCH_OPTIONS_WITH_VALUES | {
+    "-E", "-j", "-M", "-r", "-t", "-T",
+    "--context-separator", "--dfa-size-limit", "--max-columns", "--max-depth",
+    "--regex-size-limit", "--sortr", "--threads", "--type-clear", "--type-not",
+}
+GREP_OPTIONS_WITH_VALUES = frozenset({
+    "-A", "-B", "-C", "-D", "-d", "-e", "-f", "-m",
+    "--after-context", "--before-context", "--binary-files", "--context",
+    "--devices", "--directories", "--exclude", "--exclude-dir", "--exclude-from",
+    "--file", "--group-separator", "--include", "--label", "--max-count", "--regexp",
+})
+GIT_GLOBAL_OPTIONS_WITH_VALUES = frozenset({
+    "-C", "-c", "--attr-source", "--config-env", "--git-dir", "--namespace",
+    "--super-prefix", "--work-tree",
+})
+GIT_GLOBAL_OPTIONS_WITHOUT_VALUES = frozenset({
+    "-p", "--paginate", "-P", "--no-pager", "--bare", "--no-replace-objects",
+    "--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs",
+    "--icase-pathspecs", "--no-optional-locks", "--no-advice", "--no-lazy-fetch",
+})
 OPTIONS_WITH_VALUES = {
     "-C",
     "-F",
@@ -139,6 +167,21 @@ SOURCE_READ_COMMANDS = {
     "tail",
     "yq",
 }
+JQ_OPTION_ARITIES = {
+    "--arg": 2, "--argfile": 2, "--argjson": 2,
+    "--indent": 1, "--rawfile": 2, "--slurpfile": 2,
+    "--from-file": 1, "--library-path": 1, "-f": 1, "-L": 1,
+}
+JQ_FILE_OPTIONS = frozenset({"--argfile", "--rawfile", "--slurpfile"})
+YQ_OPTION_ARITIES = {
+    "--front-matter": 1, "--input-format": 1, "--output-format": 1,
+    "-I": 1, "-o": 1, "-p": 1,
+}
+YQ_INPUT_SUFFIXES = frozenset({
+    ".base64", ".c", ".csv", ".h", ".hcl", ".i", ".ini", ".j", ".json", ".ky",
+    ".kyaml", ".l", ".lua", ".p", ".properties", ".props", ".t", ".tf", ".toml",
+    ".tsv", ".uri", ".x", ".xml", ".y", ".yaml", ".yml",
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -483,7 +526,7 @@ def classify_command(command: str | None, text: str, *, exit_code: int | None = 
         return "git_diff"
 
     source_consumer_class = _source_consumer_command_class(
-        command_l,
+        command_s,
         sample_l,
         text_l,
         exit_code=exit_code,
@@ -2247,15 +2290,18 @@ def _is_pytest_command(command: str) -> bool:
     return False
 
 
-def _command_substitution_bodies(command: str) -> list[str]:
-    bodies: list[str] = []
+def _command_substitutions(command: str) -> list[tuple[str, str]]:
+    substitutions: list[tuple[str, str]] = []
     quote: str | None = None
     escaped = False
+    word_start = True
     index = 0
     while index < len(command) - 1:
         char = command[index]
         if escaped:
             escaped = False
+            if char not in "\n\r":
+                word_start = False
             index += 1
             continue
         if quote == "'":
@@ -2274,7 +2320,15 @@ def _command_substitution_bodies(command: str) -> list[str]:
                 continue
         elif char in {"'", '"'}:
             quote = char
+            word_start = False
             index += 1
+            continue
+        if quote is None and char == "#" and word_start:
+            newline = command.find("\n", index)
+            if newline < 0:
+                break
+            index = newline + 1
+            word_start = True
             continue
         if char == "`":
             scan = index + 1
@@ -2292,11 +2346,12 @@ def _command_substitution_bodies(command: str) -> list[str]:
                     scan += 1
                     continue
                 if current == "`":
-                    bodies.append("".join(body_chars))
+                    substitutions.append(("command", "".join(body_chars)))
                     index = scan
                     break
                 body_chars.append(current)
                 scan += 1
+            word_start = False
         if (
             char == "$" or (quote is None and char in {"<", ">"})
         ) and command[index + 1] == "(":
@@ -2305,10 +2360,20 @@ def _command_substitution_bodies(command: str) -> list[str]:
             scan = body_start
             inner_quote: str | None = None
             inner_escaped = False
+            inner_comment = False
+            inner_word_start = True
             while scan < len(command):
                 current = command[scan]
+                if inner_comment:
+                    if current not in "\n\r":
+                        scan += 1
+                        continue
+                    inner_comment = False
+                    inner_word_start = True
                 if inner_escaped:
                     inner_escaped = False
+                    if current not in "\n\r":
+                        inner_word_start = False
                     scan += 1
                     continue
                 if current == "\\":
@@ -2322,6 +2387,11 @@ def _command_substitution_bodies(command: str) -> list[str]:
                     continue
                 if current in {"'", '"'}:
                     inner_quote = current
+                    inner_word_start = False
+                    scan += 1
+                    continue
+                if current == "#" and inner_word_start:
+                    inner_comment = True
                     scan += 1
                     continue
                 if current == "(":
@@ -2329,12 +2399,61 @@ def _command_substitution_bodies(command: str) -> list[str]:
                 elif current == ")":
                     depth -= 1
                     if depth == 0:
-                        bodies.append(command[body_start:scan])
+                        kind = "command"
+                        if char in {"<", ">"}:
+                            kind = "process"
+                        elif command[index + 2 : index + 3] == "(":
+                            kind = "arithmetic"
+                        substitutions.append((kind, command[body_start:scan]))
                         index = scan
                         break
+                inner_word_start = current.isspace() or current in ";&|()<>"
                 scan += 1
+            word_start = False
+        elif quote is None:
+            word_start = char.isspace() or char in ";&|()<>"
         index += 1
-    return bodies
+    return substitutions
+
+
+def _command_substitution_bodies(command: str) -> list[str]:
+    return [body for _kind, body in _command_substitutions(command)]
+
+
+def _unquoted_shell_lines(command: str) -> list[str]:
+    lines: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for char in command:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == "\\" and quote != "'":
+            current.append(char)
+            escaped = True
+            continue
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char in {"'", '"', "`"}:
+            current.append(char)
+            quote = char
+            continue
+        if char in "\n\r":
+            line = "".join(current).strip()
+            if line:
+                lines.append(line)
+            current = []
+            continue
+        current.append(char)
+    tail = "".join(current).strip()
+    if tail:
+        lines.append(tail)
+    return lines
 
 
 def _process_substitution_compactable_class(command: str, sample: str, text: str) -> str | None:
@@ -2343,7 +2462,11 @@ def _process_substitution_compactable_class(command: str, sample: str, text: str
         if nested_class is not None:
             return nested_class
         token_groups = [_shell_tokens(body)]
-        token_groups.extend(_command_token_segments(body))
+        token_groups.extend(
+            tokens
+            for line in _unquoted_shell_lines(body)
+            for tokens in (_shell_tokens(line), *_command_token_segments(line))
+        )
         for tokens in token_groups:
             command_class = _compactable_output_class_for_tokens(tokens, sample, text)
             if command_class is not None:
@@ -2352,6 +2475,57 @@ def _process_substitution_compactable_class(command: str, sample: str, text: str
             if command_class is not None:
                 return command_class
     return None
+
+
+def _substitutions_are_ordinary(command: str) -> bool:
+    substitutions = _command_substitutions(command)
+    if not substitutions:
+        return False
+    for kind, body in substitutions:
+        if kind != "command" or not body.strip():
+            return False
+        if _command_substitutions(body) and not _substitutions_are_ordinary(body):
+            return False
+    return True
+
+
+def _command_has_process_substitution(command: str) -> bool:
+    return any(
+        kind == "process" or _command_has_process_substitution(body)
+        for kind, body in _command_substitutions(command)
+    )
+
+
+def _has_active_process_substitution(command: str) -> bool:
+    return any(_command_has_process_substitution(v) for v in _command_intent_variants(command))
+
+
+def _direct_noncompactable_substitution_tokens(
+    command: str,
+    sample: str,
+    text: str,
+) -> list[str] | None:
+    segments = _background_segments(command)
+    if len(segments) != 1 or segments[0][0] is not None:
+        return None
+    tokens = segments[0][1]
+    if (
+        not tokens
+        or Path(tokens[0]).name not in SOURCE_READ_COMMANDS | SOURCE_SEARCH_COMMANDS
+        or any(token in {"|", "|&", "||", "&&", ";", "&", "{", "}"} for token in tokens)
+        or _tokens_redirect_stdout(tokens)
+        or not _substitutions_are_ordinary(command)
+        or _process_substitution_compactable_class(command, sample, text) is not None
+    ):
+        return None
+    return tokens
+
+
+def _tokens_show_command_substitution(tokens: list[str]) -> bool:
+    return any("$(" in token or "`" in token for token in tokens) or any(
+        token == "$" and index + 1 < len(tokens) and tokens[index + 1] == "("
+        for index, token in enumerate(tokens)
+    )
 
 
 def _contains_process_substitution_pytest(command: str) -> bool:
@@ -2477,6 +2651,8 @@ def _looks_like_file_read_command(
 ) -> bool:
     if not command or _has_suspicious_shell_quote_escape(command):
         return False
+    if _has_active_process_substitution(command):
+        return False
     segments = _background_segments(command)
     if _leading_exact_output_owns_before_only_or_fallbacks(
         segments,
@@ -2495,6 +2671,10 @@ def _looks_like_file_read_command(
     for substitution_command in (command, *_command_intent_variants(command)):
         if _process_substitution_compactable_class(substitution_command, sample, text) is not None:
             return False
+    dynamic_tokens = _direct_noncompactable_substitution_tokens(command, sample, text)
+    if dynamic_tokens is not None and _tokens_start_file_read(dynamic_tokens):
+        return True
+    has_command_substitution = bool(_command_substitutions(command))
     if (
         _has_unsafe_shell_expansion(command)
         and not _has_only_safe_file_read_redirection(command)
@@ -2611,6 +2791,18 @@ def _looks_like_file_read_command(
                 or _contains_multiple_likely_source_search_lines(text)
             ):
                 continue
+        if (
+            len(segments) > 1
+            and has_command_substitution
+            and _tokens_show_command_substitution(tokens)
+            and not (
+                _contains_likely_file_read_output(text)
+                or _starts_like_file_read_output(text)
+                or _contains_likely_source_search_output(text)
+                or _contains_multiple_likely_source_search_lines(text)
+            )
+        ):
+            continue
         if not _tokens_start_file_read(tokens):
             if _compactable_class_for_tokens(tokens, sample, text) is not None:
                 prior_compactable = True
@@ -2738,9 +2930,18 @@ def _looks_like_file_read_command(
 def _has_unsafe_shell_expansion(command: str) -> bool:
     quote: str | None = None
     escaped = False
+    comment = False
+    word_start = True
     for index, char in enumerate(command):
+        if comment:
+            if char not in "\n\r":
+                continue
+            comment = False
+            word_start = True
         if escaped:
             escaped = False
+            if char not in "\n\r":
+                word_start = False
             continue
         if quote == "'":
             if char == "'":
@@ -2761,18 +2962,32 @@ def _has_unsafe_shell_expansion(command: str) -> bool:
             continue
         if char in {"'", '"'}:
             quote = char
+            word_start = False
+            continue
+        if char == "#" and word_start:
+            comment = True
             continue
         if char in "><`\n\r" or (char == "$" and command[index + 1 : index + 2] == "("):
             return True
+        word_start = char.isspace() or char in ";&|()<>"
     return quote is not None
 
 
 def _has_unquoted_command_or_process_substitution(command: str) -> bool:
     quote: str | None = None
     escaped = False
+    comment = False
+    word_start = True
     for index, char in enumerate(command):
+        if comment:
+            if char not in "\n\r":
+                continue
+            comment = False
+            word_start = True
         if escaped:
             escaped = False
+            if char not in "\n\r":
+                word_start = False
             continue
         if quote == "'":
             if char == "'":
@@ -2793,9 +3008,14 @@ def _has_unquoted_command_or_process_substitution(command: str) -> bool:
             continue
         if char in {"'", '"'}:
             quote = char
+            word_start = False
+            continue
+        if char == "#" and word_start:
+            comment = True
             continue
         if char == "`" or (char in {"$", "<", ">"} and command[index + 1 : index + 2] == "("):
             return True
+        word_start = char.isspace() or char in ";&|()<>"
     return quote is not None
 
 
@@ -3126,6 +3346,8 @@ def _is_source_search_command(
 ) -> bool:
     if not command:
         return False
+    if _has_active_process_substitution(command):
+        return False
     segments = _background_segments(command)
     if _leading_exact_output_owns_before_only_or_fallbacks(
         segments,
@@ -3134,6 +3356,14 @@ def _is_source_search_command(
         expected_class="source_search",
     ):
         return True
+    dynamic_tokens = _direct_noncompactable_substitution_tokens(command, sample, text)
+    if (
+        dynamic_tokens is not None
+        and _tokens_start_source_search(dynamic_tokens)
+        and _tokens_source_search_hides_filenames(dynamic_tokens)
+    ):
+        return True
+    has_command_substitution = bool(_command_substitutions(command))
     if _has_unsafe_shell_expansion(command) and not _has_only_safe_file_read_redirection(command):
         if _process_substitution_compactable_class(command, sample, text) is not None:
             return False
@@ -3269,6 +3499,16 @@ def _is_source_search_command(
                 is not None
             ):
                 continue
+        if (
+            len(segments) > 1
+            and has_command_substitution
+            and _tokens_show_command_substitution(tokens)
+            and not (
+                _contains_likely_source_search_output(text)
+                or _contains_multiple_likely_source_search_lines(text)
+            )
+        ):
+            continue
         if _tokens_start_source_search(tokens) or _tokens_pipe_to_source_search(tokens):
             if (
                 separator == "&&"
@@ -3412,6 +3652,9 @@ def _source_consumer_command_class(
     exit_code: int | None = None,
 ) -> str | None:
     substitution_class = _process_substitution_compactable_class(command, sample, text)
+    has_process_substitution = _has_active_process_substitution(command)
+    if has_process_substitution and substitution_class is not None:
+        return substitution_class
     if substitution_class is not None:
         segments = _background_segments(command)
         substitution_index = next(
@@ -3482,15 +3725,16 @@ def _source_consumer_command_class(
             if later_output_class is not None:
                 return later_output_class
         return substitution_class
-    for variant in _command_intent_variants(command):
-        command_class = _background_tail_command_class(
-            variant,
-            sample,
-            text,
-            exit_code=exit_code,
-        )
-        if command_class is not None:
-            return command_class
+    if not has_process_substitution:
+        for variant in _command_intent_variants(command):
+            command_class = _background_tail_command_class(
+                variant,
+                sample,
+                text,
+                exit_code=exit_code,
+            )
+            if command_class is not None:
+                return command_class
     for variant in _command_intent_variants(command):
         command_class = _pipeline_compactable_class(variant, sample, text)
         if command_class is not None:
@@ -5062,6 +5306,47 @@ def _text_has_dominant_exact_output_for_tokens(tokens: list[str], text: str) -> 
     return False
 
 
+def _source_search_options_with_values(tokens: list[str]) -> frozenset[str] | set[str]:
+    command_name = Path(tokens[0]).name if tokens else ""
+    if command_name == "rg":
+        return RG_OPTIONS_WITH_VALUES | {"-e", "--regexp"}
+    if command_name == "grep":
+        return GREP_OPTIONS_WITH_VALUES
+    return SOURCE_SEARCH_OPTIONS_WITH_VALUES | {"-e", "--regexp"}
+
+
+def _source_search_option_flags(tokens: list[str]) -> list[str]:
+    flags: list[str] = []
+    value_options = _source_search_options_with_values(tokens)
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            break
+        if token in value_options:
+            index += 2
+            continue
+        if token.startswith("--"):
+            flags.append(token)
+            index += 1
+            continue
+        if token.startswith("-"):
+            short_flags = token[1:]
+            for flag_index, flag in enumerate(short_flags):
+                flags.append(f"-{flag}")
+                if f"-{flag}" in value_options:
+                    if flag_index == len(short_flags) - 1 and index + 1 < len(tokens):
+                        index += 1
+                    break
+        index += 1
+    return flags
+
+
+def _tokens_request_ripgrep_help(tokens: list[str]) -> bool:
+    flags = _source_search_option_flags(tokens)
+    return bool(tokens and Path(tokens[0]).name == "rg" and {"-h", "--help"} & set(flags))
+
+
 def _tokens_source_search_hides_filenames(tokens: list[str]) -> bool:
     tokens = _strip_command_wrappers(tokens)
     if tokens and Path(tokens[0]).name in {"bash", "sh", "zsh"}:
@@ -5076,11 +5361,33 @@ def _tokens_source_search_hides_filenames(tokens: list[str]) -> bool:
     runner_tokens = _command_runner_payload(tokens)
     if runner_tokens is not None:
         return _tokens_source_search_hides_filenames(runner_tokens)
-    return any(
-        token == "--no-filename"
-        or (token.startswith("-") and not token.startswith("--") and "h" in token[1:])
-        for token in tokens
-    )
+    if not tokens:
+        return False
+    command_name = Path(tokens[0]).name
+    if command_name == "git":
+        subcommand = _git_subcommand_tokens(tokens)
+        return bool(
+            subcommand
+            and subcommand[0] == "grep"
+            and _tokens_source_search_hides_filenames(subcommand)
+        )
+    flags = _source_search_option_flags(tokens)
+    if command_name == "rg":
+        hidden_flags = {"-I", "--no-filename"}
+        visible_flags = {"-H", "--with-filename"}
+    elif command_name == "grep":
+        hidden_flags = {"-h", "--no-filename"}
+        visible_flags = {"-H", "--with-filename"}
+    else:
+        hidden_flags = {"-h", "--no-filename"}
+        visible_flags = {"--with-filename"}
+    hidden: bool | None = None
+    for flag in flags:
+        if flag in hidden_flags:
+            hidden = True
+        elif flag in visible_flags:
+            hidden = False
+    return hidden is True
 
 
 def _source_search_pattern_is_compactable_signal(pattern: str) -> bool:
@@ -5373,9 +5680,9 @@ def _source_search_patterns(tokens: list[str]) -> list[str]:
     if not tokens or Path(tokens[0]).name not in SOURCE_SEARCH_COMMANDS | {"git"}:
         return []
     if Path(tokens[0]).name == "git":
-        for index, token in enumerate(tokens[1:], start=1):
-            if token == "grep":
-                return _source_search_patterns(tokens[index:])
+        subcommand = _git_subcommand_tokens(tokens)
+        if subcommand and subcommand[0] == "grep":
+            return _source_search_patterns(subcommand)
         return []
 
     if any(
@@ -5421,38 +5728,7 @@ def _source_search_patterns(tokens: list[str]) -> list[str]:
     if has_pattern_file:
         return []
 
-    source_options_with_values = {
-        "-A",
-        "-B",
-        "-C",
-        "-f",
-        "-g",
-        "-m",
-        "--after-context",
-        "--before-context",
-        "--colors",
-        "--context",
-        "--encoding",
-        "--engine",
-        "--field-context-separator",
-        "--field-match-separator",
-        "--glob",
-        "--iglob",
-        "--ignore-file",
-        "--include",
-        "--exclude",
-        "--exclude-dir",
-        "--exclude-from",
-        "--label",
-        "--max-count",
-        "--path-separator",
-        "--pre-glob",
-        "--replace",
-        "--sort",
-        "--type",
-        "--type-add",
-    }
-
+    value_options = _source_search_options_with_values(tokens)
     option_value_next = False
     for token in tokens[1:]:
         if option_value_next:
@@ -5460,7 +5736,7 @@ def _source_search_patterns(tokens: list[str]) -> list[str]:
             continue
         if token == "--":
             continue
-        if token in source_options_with_values or token in {"-e", "--regexp"}:
+        if token in value_options:
             option_value_next = True
             continue
         if token.startswith("--") and "=" in token:
@@ -5603,8 +5879,10 @@ def _tokens_start_source_search(tokens: list[str]) -> bool:
     runner_tokens = _command_runner_payload(tokens)
     if runner_tokens is not None:
         return _tokens_start_source_search(runner_tokens)
+    if _tokens_request_ripgrep_help(tokens):
+        return False
     if tokens and Path(tokens[0]).name == "git":
-        rest = _skip_option_tokens(tokens[1:])
+        rest = _git_subcommand_tokens(tokens)
         return bool(rest and Path(rest[0]).name == "grep")
     if tokens and Path(tokens[0]).name == "xargs":
         rest = _skip_option_tokens(tokens[1:])
@@ -5639,16 +5917,95 @@ def _tokens_start_file_read(tokens: list[str]) -> bool:
 def _looks_like_jq_file_read_tokens(tokens: list[str]) -> bool:
     if not tokens or Path(tokens[0]).name not in {"jq", "yq"}:
         return False
-    for token in tokens[1:]:
+    command_name = Path(tokens[0]).name
+    null_input = False
+    file_filter = False
+    explicit_file_option = False
+    argument_mode = False
+    positional: list[str] = []
+    option_arities = JQ_OPTION_ARITIES | (YQ_OPTION_ARITIES if command_name == "yq" else {})
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
         if token == "--":
+            remaining = tokens[index + 1 :]
+            if argument_mode and not positional and not file_filter and remaining:
+                positional.append(remaining[0])
+            elif not argument_mode:
+                positional.extend(remaining)
             break
-        if token in {"-n", "--null-input", "--help", "--version"}:
+        if token in {"--help", "--version"}:
             return False
         if token.startswith("--null-input="):
             return False
-        if token.startswith("-") and not token.startswith("--") and "n" in token[1:]:
+        if token == "--null-input":
+            null_input = True
+            index += 1
+            continue
+        if token in {"--args", "--jsonargs"}:
+            argument_mode = True
+            index += 1
+            continue
+        if token in option_arities:
+            arity = option_arities[token]
+            operands = tokens[index + 1 : index + 1 + arity]
+            if len(operands) != arity:
+                return False
+            explicit_file_option |= token in JQ_FILE_OPTIONS
+            file_filter |= command_name == "jq" and token in {"-f", "--from-file"}
+            index += arity + 1
+            continue
+        option_name = token.split("=", 1)[0]
+        if command_name == "yq" and "=" in token and option_name in option_arities:
+            index += 1
+            continue
+        if command_name == "yq" and token.startswith(("-I", "-f", "-o", "-p")) and len(token) > 2:
+            index += 1
+            continue
+        if token.startswith("-L") and not token.startswith("--") and len(token) > 2:
+            index += 1
+            continue
+        if token.startswith("-") and not token.startswith("--"):
+            flags = token[1:]
+            flag_index = 0
+            while flag_index < len(flags):
+                flag = flags[flag_index]
+                if flag == "n":
+                    null_input = True
+                if flag == "L":
+                    if flag_index + 1 == len(flags):
+                        if index + 1 >= len(tokens):
+                            return False
+                        index += 1
+                    break
+                flag_index += 1
+            index += 1
+            continue
+        if token.startswith("--"):
+            index += 1
+            continue
+        if not argument_mode or (not positional and not file_filter):
+            positional.append(token)
+        index += 1
+    yq_subcommand = bool(
+        command_name == "yq"
+        and positional
+        and positional[0] in {"e", "ea", "eval", "eval-all"}
+    )
+    if yq_subcommand:
+        positional = positional[1:]
+    if explicit_file_option:
+        return True
+    if null_input:
+        return False
+    if file_filter:
+        return bool(positional)
+    if command_name == "yq" and len(positional) == 1:
+        operand = positional[0]
+        if operand.startswith(".") and not operand.startswith(("./", "../")):
             return False
-    return True
+        return Path(operand).suffix.lower() in YQ_INPUT_SUFFIXES
+    return len(positional) >= 2
 
 
 def _tokens_start_compactable_command(tokens: list[str]) -> bool:
@@ -5988,6 +6345,39 @@ def _command_segments_after_wrappers(command: str) -> list[list[str]]:
                         segments.extend(_command_segments_after_wrappers(shell_command))
                     break
     return segments
+
+
+def _git_subcommand_tokens(tokens: list[str]) -> list[str]:
+    if not tokens or Path(tokens[0]).name != "git":
+        return []
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in SHELL_SEPARATORS:
+            return []
+        if token == "--":
+            return tokens[index + 1 :]
+        if not token.startswith("-"):
+            return tokens[index:]
+        if token.startswith("--exec-path="):
+            index += 1
+            continue
+        if token in GIT_GLOBAL_OPTIONS_WITHOUT_VALUES:
+            index += 1
+            continue
+        if any(token.startswith(option) and token != option for option in {"-C", "-c"}):
+            index += 1
+            continue
+        option_name = token.split("=", 1)[0]
+        if option_name not in GIT_GLOBAL_OPTIONS_WITH_VALUES:
+            return []
+        if "=" in token:
+            index += 1
+            continue
+        if index + 1 >= len(tokens) or tokens[index + 1] in SHELL_SEPARATORS:
+            return []
+        index += 2
+    return []
 
 
 def _skip_option_tokens(tokens: list[str]) -> list[str]:
