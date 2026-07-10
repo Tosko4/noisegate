@@ -14,7 +14,7 @@ from ._version import __version__
 from .artifacts import ArtifactError, ArtifactStore
 from .engine import NoisegateOptions, _is_compactable_tool_name, env_diagnostics, reduce_text
 from .installer import DEFAULT_PACKAGE_SPEC, InstallHermesError, install_hermes
-from .plugin import transform_tool_result
+from .plugin import _extract_exit_code, _select_command, transform_tool_result
 from .wrap import DEFAULT_MAX_CAPTURE_BYTES, WrappedCommandInterrupted, run_wrapped_command
 
 
@@ -322,14 +322,21 @@ def _reduce_json_value(
             or ""
         )
         call_args = _combined_call_args(parsed.get("args"), parsed.get("arguments"))
-        top_level_command = _extract_command_arg(parsed)
-        if not _has_command_arg(call_args) and top_level_command:
-            call_args = {**call_args, "command": top_level_command}
         result_text = parsed["result"]
+        command_sources = tuple(
+            source
+            for source in (parsed.get("args"), parsed.get("arguments"), parsed)
+            if isinstance(source, dict)
+        )
+        exit_code = _result_exit_code(result_text, parsed, tool_name)
+        command = _select_command(result_text, *command_sources, exit_code=exit_code)
+        if command:
+            call_args = {**call_args, "command": command}
         transformed = transform_tool_result(
             result_text,
             tool_name=tool_name,
             args=call_args,
+            noisegate_exit_code=exit_code,
             **hook_kwargs,
         )
         if (
@@ -337,12 +344,12 @@ def _reduce_json_value(
             and _is_compactable_tool_name(tool_name)
             and not _is_json_text(result_text)
         ):
-            command = _extract_command_arg(call_args)
             reduced = reduce_text(
                 result_text,
                 command=command,
                 tool_name=tool_name,
                 source="reduce-json",
+                exit_code=exit_code,
                 options=options,
             )
             if metadata_out is not None:
@@ -355,7 +362,8 @@ def _reduce_json_value(
         return raw
 
     tool_name = ""
-    call_args: dict[Any, Any] = {}
+    args_map: dict[Any, Any] = {}
+    arguments_map: dict[Any, Any] = {}
     if isinstance(parsed, dict):
         tool_name = str(
             parsed.get("tool_name")
@@ -363,13 +371,19 @@ def _reduce_json_value(
             or parsed.get("tool")
             or ""
         )
-        call_args = _combined_call_args(parsed.get("args"), parsed.get("arguments"))
-        top_level_command = _extract_command_arg(parsed)
-        if not _has_command_arg(call_args) and top_level_command:
-            call_args = {**call_args, "command": top_level_command}
+        if isinstance(parsed.get("args"), dict):
+            args_map = parsed["args"]
+        if isinstance(parsed.get("arguments"), dict):
+            arguments_map = parsed["arguments"]
         if not tool_name and _looks_terminal_payload(parsed):
             tool_name = "terminal"
-    transformed = transform_tool_result(raw, tool_name=tool_name, args=call_args, **hook_kwargs)
+    transformed = transform_tool_result(
+        raw,
+        tool_name=tool_name,
+        args=args_map,
+        arguments=arguments_map,
+        **hook_kwargs,
+    )
     return transformed if transformed is not None else raw
 
 
@@ -377,10 +391,6 @@ def _looks_terminal_payload(payload: dict[Any, Any]) -> bool:
     return any(key in payload for key in ("stdout", "stderr", "output")) and any(
         key in payload for key in ("command", "exit", "exit_code", "status")
     )
-
-
-def _has_command_arg(args: dict[Any, Any]) -> bool:
-    return bool(_extract_command_arg(args))
 
 
 def _combined_call_args(args: object, arguments: object) -> dict[Any, Any]:
@@ -404,6 +414,17 @@ def _extract_command_arg(args: dict[Any, Any]) -> str:
     if isinstance(argv, list) and argv and all(isinstance(item, str) for item in argv):
         return shlex.join(argv)
     return ""
+
+
+def _result_exit_code(result: str, outer: dict[Any, Any], tool_name: str) -> int | None:
+    nested: Any = None
+    with suppress(json.JSONDecodeError):
+        nested = json.loads(result)
+    if isinstance(nested, dict):
+        exit_code = _extract_exit_code(nested, tool_name)
+        if exit_code is not None:
+            return exit_code
+    return _extract_exit_code(outer, tool_name)
 
 
 def _is_json_text(value: str) -> bool:

@@ -3182,15 +3182,6 @@ def _has_suspicious_shell_quote_escape(command: str) -> bool:
     return bool(re.search(r"['\"][^'\"]*\\['\"]\s*[;&|]", command))
 
 
-def _looks_like_sed_print_script(token: str) -> bool:
-    script = token.strip()
-    return bool(
-        re.fullmatch(r"\d+(,\d+)?p", script)
-        or re.fullmatch(r"\d+,\$p", script)
-        or re.fullmatch(r"\$p", script)
-    )
-
-
 def _looks_like_sed_search_script(token: str) -> bool:
     return bool(re.fullmatch(r"/.+/p", token.strip()))
 
@@ -3201,36 +3192,103 @@ def _looks_like_sed_file_read_tokens(tokens: list[str]) -> bool:
     saw_script = False
     has_file_arg = False
     index = 1
+    valueless_long_options = {
+        "--follow-symlinks",
+        "--null-data",
+        "--posix",
+        "--quiet",
+        "--regexp-extended",
+        "--sandbox",
+        "--separate",
+        "--silent",
+        "--unbuffered",
+    }
     while index < len(tokens):
         token = tokens[index]
         if token == "--":
-            has_file_arg = any(not item.startswith("-") for item in tokens[index + 1 :])
+            remaining = tokens[index + 1 :]
+            if not saw_script:
+                if not remaining or _looks_like_sed_search_script(remaining[0]):
+                    return False
+                saw_script = True
+                remaining = remaining[1:]
+            has_file_arg = bool(remaining)
             break
-        if token == "-i" or token == "--in-place" or token.startswith("-i"):
+        long_option, separator, attached_value = token.partition("=")
+        if long_option.startswith("--i") and "--in-place".startswith(long_option):
             return False
-        if token in {"-e", "--expression"} and index + 1 < len(tokens):
-            script = tokens[index + 1]
+        if long_option.startswith("--e") and "--expression".startswith(long_option):
+            if separator:
+                script = attached_value
+                consumed = 1
+            elif index + 1 < len(tokens):
+                script = tokens[index + 1]
+                consumed = 2
+            else:
+                return False
             if _looks_like_sed_search_script(script):
+                return False
+            saw_script = True
+            index += consumed
+            continue
+        if long_option.startswith("--l") and "--line-length".startswith(long_option):
+            if separator:
+                index += 1
+            elif index + 1 < len(tokens):
+                index += 2
+            else:
+                return False
+            continue
+        if long_option.startswith("--fi") and "--file".startswith(long_option):
+            if separator:
+                if not attached_value:
+                    return False
+                saw_script = True
+                index += 1
+                continue
+            if index + 1 >= len(tokens):
                 return False
             saw_script = True
             index += 2
             continue
-        if token.startswith("--expression="):
-            script = token.split("=", 1)[1]
-            if _looks_like_sed_search_script(script):
-                return False
-            saw_script = True
+        if token in {"--help", "--version"}:
+            return False
+        if token in valueless_long_options:
             index += 1
             continue
-        if token in {"-f", "--file"}:
-            index += 2
+        if token.startswith("-") and not token.startswith("--"):
+            short_options = token[1:]
+            consumed = 1
+            option_index = 0
+            while option_index < len(short_options):
+                option = short_options[option_index]
+                if option in {"i", "I"}:
+                    return False
+                if option == "l":
+                    operand = short_options[option_index + 1 :]
+                    if operand.isdigit():
+                        break
+                    if not operand and index + 1 < len(tokens) and tokens[index + 1].isdigit():
+                        consumed = 2
+                        break
+                    option_index += 1
+                    continue
+                if option in {"e", "f"}:
+                    operand = short_options[option_index + 1 :]
+                    if not operand:
+                        if index + 1 >= len(tokens):
+                            return False
+                        operand = tokens[index + 1]
+                        consumed = 2
+                    if option == "e" and _looks_like_sed_search_script(operand):
+                        return False
+                    if operand:
+                        saw_script = True
+                    break
+                option_index += 1
+            index += consumed
             continue
-        if token.startswith("--file="):
-            index += 1
-            continue
-        if token in {"-n", "-E", "-r", "-u", "-s"} or (
-            token.startswith("-") and not _looks_like_sed_print_script(token)
-        ):
+        if token.startswith("--"):
             index += 1
             continue
         if not saw_script:
@@ -6410,23 +6468,7 @@ def _strip_command_wrappers(tokens: list[str]) -> list[str]:
         command = Path(tokens[0]).name
         command_name = Path(command).name
         if command_name == "sudo":
-            tokens = _strip_assignment_tokens(
-                _skip_wrapper_options(
-                    tokens[1:],
-                    value_options={
-                        "-c",
-                        "-d",
-                        "-g",
-                        "-p",
-                        "-t",
-                        "-u",
-                        "--chdir",
-                        "--group",
-                        "--prompt",
-                        "--user",
-                    },
-                )
-            )
+            tokens = _strip_assignment_tokens(_skip_sudo_options(tokens[1:]))
             continue
         if command_name == "env":
             tokens = _strip_assignment_tokens(
@@ -6453,6 +6495,133 @@ def _strip_command_wrappers(tokens: list[str]) -> list[str]:
             continue
         break
     return tokens
+
+
+def _skip_sudo_options(tokens: list[str]) -> list[str]:
+    """Return sudo's executable child after parsing documented option arities."""
+
+    short_value_options = frozenset(
+        {"a", "C", "c", "D", "d", "g", "h", "p", "R", "r", "t", "T", "u", "U"}
+    )
+    short_empty_value_options = frozenset({"p", "T"})
+    long_value_options = frozenset(
+        {
+            "--auth-type",
+            "--close-from",
+            "--login-class",
+            "--chdir",
+            "--group",
+            "--host",
+            "--prompt",
+            "--chroot",
+            "--role",
+            "--type",
+            "--command-timeout",
+            "--user",
+            "--other-user",
+        }
+    )
+    short_no_child_modes = frozenset({"e", "l", "v", "V", "K"})
+    long_no_child_modes = frozenset(
+        {
+            "--edit",
+            "--list",
+            "--validate",
+            "--version",
+            "--help",
+            "--remove-timestamp",
+        }
+    )
+    long_flag_options = frozenset(
+        {
+            "--askpass",
+            "--background",
+            "--bell",
+            "--login",
+            "--no-update",
+            "--non-interactive",
+            "--preserve-env",
+            "--preserve-groups",
+            "--reset-timestamp",
+            "--set-home",
+            "--shell",
+            "--stdin",
+        }
+    )
+    supported_long_options = long_value_options | long_no_child_modes | long_flag_options
+    empty_attached_value_options = frozenset({"--command-timeout", "--prompt"})
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in SHELL_SEPARATORS:
+            return []
+        if token == "--":
+            return tokens[index + 1 :]
+        if not token.startswith("-") or token == "-":
+            break
+        index += 1
+        if token.startswith("--"):
+            option_name = token.split("=", 1)[0]
+            if option_name in supported_long_options:
+                normalized_option = option_name
+            else:
+                prefix_matches = tuple(
+                    candidate
+                    for candidate in supported_long_options
+                    if candidate.startswith(option_name)
+                )
+                if len(prefix_matches) != 1:
+                    return []
+                normalized_option = prefix_matches[0]
+            if normalized_option in long_no_child_modes:
+                return []
+            if normalized_option in long_value_options:
+                if "=" in token:
+                    if (
+                        not token.partition("=")[2]
+                        and normalized_option not in empty_attached_value_options
+                    ):
+                        return []
+                elif index < len(tokens):
+                    if (
+                        tokens[index] in SHELL_SEPARATORS
+                        and normalized_option not in empty_attached_value_options
+                    ):
+                        return []
+                    if (
+                        not tokens[index]
+                        and normalized_option not in empty_attached_value_options
+                    ):
+                        return []
+                    index += 1
+                else:
+                    return []
+            elif "=" in token and normalized_option != "--preserve-env":
+                return []
+            continue
+        for option_index, option in enumerate(token[1:]):
+            if option in short_no_child_modes:
+                return []
+            # Some sudo builds use -h for help and others for a required host.
+            # Either interpretation makes exposing a later token as a child unsafe.
+            if option == "h":
+                return []
+            if option not in short_value_options:
+                continue
+            has_attached_operand = option_index < len(token) - 2
+            if not has_attached_operand:
+                if index >= len(tokens):
+                    return []
+                if (
+                    tokens[index] in SHELL_SEPARATORS
+                    and option not in short_empty_value_options
+                ):
+                    return []
+                if not tokens[index] and option not in short_empty_value_options:
+                    return []
+                index += 1
+            break
+    return tokens[index:]
 
 
 def _skip_wrapper_options(tokens: list[str], *, value_options: set[str]) -> list[str]:

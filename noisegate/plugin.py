@@ -25,6 +25,13 @@ HookCallback: TypeAlias = Callable[..., str | None]
 
 TERMINAL_TOOL_NAMES = frozenset({"terminal", "process", "read_terminal"})
 TERMINAL_TEXT_FIELDS = ("stdout", "stderr", "output")
+ALWAYS_PROTECTED_COMMAND_CLASSES = frozenset({"file_read", "source_search", "patch"})
+CONDITIONALLY_PROTECTED_COMMAND_CLASSES = frozenset({"git_diff"})
+EXACT_COMMAND_CLASSES = (
+    ALWAYS_PROTECTED_COMMAND_CLASSES | CONDITIONALLY_PROTECTED_COMMAND_CLASSES
+)
+OUTPUT_ASSISTED_COMMAND_CLASSES = frozenset({"file_read", "source_search"})
+COMMAND_ALIASES = ("command", "cmd", "shell_command", "code")
 GENERIC_TEXT_FIELDS = (
     "stdout",
     "stderr",
@@ -55,6 +62,10 @@ def transform_tool_result(
     **kwargs: Any,
 ) -> str | None:
     try:
+        override = kwargs.pop("noisegate_exit_code", None)
+        exit_code_override = (
+            override if isinstance(override, int) and not isinstance(override, bool) else None
+        )
         if not _is_compactable_tool_name(tool_name) or not isinstance(result, str):
             return None
         options = NoisegateOptions.from_env().with_mapping(kwargs)
@@ -62,23 +73,34 @@ def transform_tool_result(
             return None
 
         parsed = json.loads(result)
-        call_args = _combined_call_args(args, arguments)
+        args_map = args if isinstance(args, Mapping) else {}
+        arguments_map = arguments if isinstance(arguments, Mapping) else {}
 
         if isinstance(parsed, str):
-            command = _extract_command({}, call_args)
+            command = _select_command(
+                parsed,
+                args_map,
+                arguments_map,
+                exit_code=exit_code_override,
+            )
             reduce_options = replace(options, artifact_enabled=False)
             reduced = reduce_text(
                 parsed,
                 command=command,
                 tool_name=tool_name,
                 source="json_string",
+                exit_code=exit_code_override,
                 options=reduce_options,
             )
             if not reduced.changed:
                 return None
             metadata = dict(reduced.metadata)
             text = reduced.text
-            preserve_patterns = _preserve_patterns_for(command, parsed)
+            preserve_patterns = _preserve_patterns_for(
+                command,
+                parsed,
+                exit_code=exit_code_override,
+            )
             if options.artifact_enabled:
                 metadata["artifact"] = _plan_artifact(parsed, options)
                 _drop_artifact_if_notice_cannot_fit(
@@ -115,9 +137,22 @@ def transform_tool_result(
             return None
 
         payload: dict[str, JsonValue] = dict(parsed)
-        command = _extract_command(payload, call_args)
         exit_code = _extract_exit_code(payload, tool_name)
+        if exit_code is None:
+            exit_code = exit_code_override
         fields = _candidate_fields(tool_name, payload)
+        command_text = "\n".join(
+            value
+            for field in fields
+            if isinstance((value := payload.get(field)), str)
+        )
+        command = _select_command(
+            command_text,
+            args_map,
+            arguments_map,
+            payload,
+            exit_code=exit_code,
+        )
         field_metadata: dict[str, JsonValue] = {}
         original_values: dict[str, str] = {}
         reduced_values: dict[str, str] = {}
@@ -264,31 +299,61 @@ def _candidate_fields(tool_name: str, payload: Mapping[str, JsonValue]) -> tuple
     return tuple(field for field in candidates if field in payload)
 
 
-def _combined_call_args(
-    args: Mapping[str, Any] | None,
-    arguments: Mapping[str, Any] | None,
-) -> dict[str, Any]:
-    combined: dict[str, Any] = {}
-    args_map = args if isinstance(args, Mapping) else {}
-    arguments_map = arguments if isinstance(arguments, Mapping) else {}
-    combined.update(arguments_map)
-    combined.update(args_map)
-    command = _extract_command({}, args_map) or _extract_command({}, arguments_map)
-    if command:
-        combined["command"] = command
-    return combined
-
-
-def _extract_command(payload: Mapping[str, JsonValue], args: Mapping[str, Any]) -> str:
-    for source in (args, payload):
-        for key in ("command", "cmd", "shell_command", "code"):
+def _select_command(
+    text: str,
+    *sources: Mapping[str, Any],
+    exit_code: int | None = None,
+) -> str:
+    evidence = _command_evidence_text(text)
+    candidates: list[str] = []
+    for source in sources:
+        for key in COMMAND_ALIASES:
             value = source.get(key)
             if isinstance(value, str) and value.strip():
-                return value
-    argv = args.get("argv")
-    if isinstance(argv, list) and all(isinstance(item, str) for item in argv):
-        return shlex.join(argv)
-    return ""
+                candidates.append(value)
+        argv = source.get("argv")
+        if isinstance(argv, list) and argv and all(isinstance(item, str) for item in argv):
+            candidates.append(shlex.join(argv))
+
+    classified = [
+        (
+            command,
+            classify_command(command, "", exit_code=exit_code),
+            classify_command(command, evidence, exit_code=exit_code),
+        )
+        for command in candidates
+    ]
+    for command, command_class, evidence_class in classified:
+        if (
+            command_class in ALWAYS_PROTECTED_COMMAND_CLASSES
+            and evidence_class in EXACT_COMMAND_CLASSES
+        ):
+            return command
+    for command, _, evidence_class in classified:
+        if evidence_class in OUTPUT_ASSISTED_COMMAND_CLASSES:
+            return command
+    for command, command_class, evidence_class in classified:
+        if (
+            command_class in CONDITIONALLY_PROTECTED_COMMAND_CLASSES
+            and evidence_class in EXACT_COMMAND_CLASSES
+        ):
+            return command
+    return candidates[0] if candidates else ""
+
+
+def _command_evidence_text(text: str) -> str:
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+    if isinstance(parsed, str):
+        return parsed
+    if isinstance(parsed, dict):
+        fields = [parsed.get(field) for field in TERMINAL_TEXT_FIELDS]
+        values = [value for value in fields if isinstance(value, str)]
+        if values:
+            return "\n".join(values)
+    return text
 
 
 def _extract_exit_code(payload: Mapping[str, JsonValue], tool_name: str) -> int | None:

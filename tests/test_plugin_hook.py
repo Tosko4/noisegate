@@ -370,6 +370,99 @@ def test_terminal_tool_result_args_command_alias_wins_over_payload_command() -> 
     )
 
 
+def test_terminal_tool_result_protected_payload_command_wins_over_stale_args_command() -> None:
+    exact = source_like_payload()
+    raw = terminal_result(exact, command="cat src/source_fixture.py")
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="terminal",
+            args={"command": "pytest -q"},
+            noisegate_max_chars=200,
+        )
+        is None
+    )
+
+
+def test_command_derived_file_read_wins_before_output_inferred_diff_class() -> None:
+    diff = "\n".join(
+        [
+            "diff --git a/app.py b/app.py",
+            "--- a/app.py",
+            "+++ b/app.py",
+            "@@ -1,2 +1,2 @@",
+            "-old",
+            "+new",
+            *[f"+exact diff line {index:03d}" for index in range(120)],
+        ]
+    )
+    raw = terminal_result(diff, command="cat patches/change.diff")
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="terminal",
+            args={"command": "pytest -q"},
+            noisegate_max_chars=200,
+            noisegate_max_lines=20,
+            noisegate_preserve_diffs=False,
+        )
+        is None
+    )
+
+
+def test_evidence_backed_search_beats_stale_compound_empty_text_exact() -> None:
+    exact = "\n".join(
+        f"tests/test_{index}.py::test_target_{index} PASSED" for index in range(180)
+    )
+    raw = terminal_result(exact, command="cat README && pytest -q")
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="terminal",
+            args={"command": 'rg "$(printf target)" src'},
+            noisegate_max_chars=200,
+            noisegate_max_lines=20,
+        )
+        is None
+    )
+
+
+def test_evidence_backed_search_beats_stale_git_diff_when_diff_preservation_is_off() -> None:
+    exact = "\n".join(
+        f"patches/change.diff:{index}:target +exact diff line" for index in range(180)
+    )
+    raw = terminal_result(exact, command="git diff -- app.py")
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="terminal",
+            args={"command": 'rg "$(printf target)" patches'},
+            noisegate_max_chars=200,
+            noisegate_max_lines=20,
+            noisegate_preserve_diffs=False,
+        )
+        is None
+    )
+
+
+def test_terminal_tool_result_keeps_args_precedence_for_noisy_commands() -> None:
+    raw = terminal_result(numbered("stdout", 80), command="npm install")
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        args={"command": "pytest -q"},
+        noisegate_max_chars=200,
+    )
+
+    payload = parse_hook_result(transformed)
+    assert payload["noisegate"]["fields"]["stdout"]["command_class"] == "pytest"
+
+
 def test_terminal_tool_result_preserves_argv_file_display_with_metachar_paths() -> None:
     exact = source_like_payload()
     raw = terminal_result(exact, command="")

@@ -2500,6 +2500,85 @@ def test_unsafe_search_substitutions_and_null_input_generators_are_compacted() -
     assert "[noisegate: omitted" in null_input_jq.text
 
 
+def test_sed_mutating_and_search_options_do_not_receive_exact_passthrough() -> None:
+    raw = "\n".join(f"def function_{index}(): return {index}" for index in range(160))
+    compactable_commands = (
+        'sed -i "1,20p" file.py',
+        'sed -I .bak -n "1,20p" file.py',
+        'sed -I.bak -n "1,20p" file.py',
+        'sed -i.bak -n "1,20p" file.py',
+        'sed --in-place -n "1,20p" file.py',
+        'sed --in-place=.bak -n "1,20p" file.py',
+        'sed --i -n "1,20p" file.py',
+        'sed --in -n "1,20p" file.py',
+        'sed --in- -n "1,20p" file.py',
+        'sed --in-p -n "1,20p" file.py',
+        'sed --in-plac=.bak -n "1,20p" file.py',
+        'sed -ni "1,20p" file.py',
+        'sed -Ein "1,20p" file.py',
+        'sed -n -e/ERROR/p build.log',
+        'sed -n -- /ERROR/p build.log',
+        'sed --quiet -- /ERROR/p build.log',
+        'sed -nl /ERROR/p build.log',
+        'sed -n -l /ERROR/p build.log',
+        'sed -n -l 80 /ERROR/p build.log',
+        'sed -nl 80 /ERROR/p build.log',
+        'sed -nl80 /ERROR/p build.log',
+        'sed -n --line-length 80 /ERROR/p build.log',
+        'sed -n --line-length=80 /ERROR/p build.log',
+        'sed -n --exp=/ERROR/p build.log',
+        'sed -n --exp /ERROR/p build.log',
+        'sed --quiet /ERROR/p build.log',
+    )
+    display_commands = (
+        'sed -e "1,200p" -n file.py',
+        'sed --expression="1,200p" --quiet file.py',
+        'sed -n "1,200p" file.py',
+        "sed -es/inline/visible/ file.py",
+        "sed -finline.sed file.py",
+        "sed -n -e1,20p file.py",
+        "sed -n -es/inline/visible/ file.py",
+        "sed -n -finput.sed file.py",
+        'sed -n -l 80 "1,20p" file.py',
+        'sed -nl80 "1,20p" file.py',
+        'sed -n --line-length=80 "1,20p" file.py',
+        'sed -n --line-length=+80 "1,20p" file.py',
+        'sed -n --line-length +80 "1,20p" file.py',
+        'sed -n --exp="1,20p" file.py',
+        'sed --quiet "1,20p" file.py',
+        'sed -n -- 1,20p file.py',
+        'sed -nl 1,20p file.py',
+        'sed -n -l 1,20p file.py',
+        "sed --file effects.sed /tmp/p",
+        "sed --file=effects.sed /tmp/p",
+        "sed --fil effects.sed /tmp/p",
+        "sed --fil=effects.sed /tmp/p",
+    )
+
+    for command in compactable_commands:
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            options=opts(max_chars=400),
+        )
+
+        assert result.changed is True, command
+        assert result.metadata["command_class"] == "generic", command
+
+    for command in display_commands:
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            options=opts(max_chars=400),
+        )
+
+        assert result.changed is False, command
+        assert result.metadata["command_class"] == "file_read", command
+        assert result.text == raw, command
+
+
 def test_source_and_exact_terminal_commands_stay_byte_for_byte_unchanged() -> None:
     raw_source = "\n".join(f"def function_{index}(): return {index}" for index in range(160))
     diff = "\n".join(
@@ -2685,6 +2764,164 @@ def test_source_and_exact_terminal_commands_stay_byte_for_byte_unchanged() -> No
 
         assert result.changed is False, command
         assert result.text == raw
+
+
+def test_sudo_value_options_preserve_exact_command_intent() -> None:
+    raw_source = "\n".join(
+        f"def function_{index}(): return 'FAILED ERROR {index}'" for index in range(160)
+    )
+    search_output = "\n".join(
+        f"src/module_{index}.py:{index}:def target_{index}():" for index in range(180)
+    )
+    cases = {
+        "sudo -a auth cat file.py": (raw_source, "file_read"),
+        "sudo -C 3 cat file.py": (raw_source, "file_read"),
+        "sudo -C3 rg target src": (search_output, "source_search"),
+        "sudo -c login_class cat file.py": (raw_source, "file_read"),
+        "sudo -D /root cat file.py": (raw_source, "file_read"),
+        "sudo -D/root cat file.py": (raw_source, "file_read"),
+        "sudo -nD/root cat file.py": (raw_source, "file_read"),
+        "sudo -g staff cat file.py": (raw_source, "file_read"),
+        "sudo -p prompt cat file.py": (raw_source, "file_read"),
+        "sudo -p '' cat file.py": (raw_source, "file_read"),
+        "sudo -p '|' cat file.py": (raw_source, "file_read"),
+        "sudo -R/root cat file.py": (raw_source, "file_read"),
+        "sudo -r role cat file.py": (raw_source, "file_read"),
+        "sudo -t type cat file.py": (raw_source, "file_read"),
+        "sudo -T5 cat file.py": (raw_source, "file_read"),
+        "sudo -T '' cat file.py": (raw_source, "file_read"),
+        "sudo -n -Eu root cat file.py": (raw_source, "file_read"),
+        "sudo -nEu root rg target src": (search_output, "source_search"),
+        "sudo -uroot cat file.py": (raw_source, "file_read"),
+        "sudo -U other cat file.py": (raw_source, "file_read"),
+        "sudo -d legacy cat file.py": (raw_source, "file_read"),
+        "sudo --auth-type pam cat file.py": (raw_source, "file_read"),
+        "sudo --close-from 3 cat file.py": (raw_source, "file_read"),
+        "sudo --clo 3 cat file.py": (raw_source, "file_read"),
+        "sudo --login-class default cat file.py": (raw_source, "file_read"),
+        "sudo --chdir=/root cat file.py": (raw_source, "file_read"),
+        "sudo --chd /root cat file.py": (raw_source, "file_read"),
+        "sudo --group staff cat file.py": (raw_source, "file_read"),
+        "sudo --host localhost cat file.py": (raw_source, "file_read"),
+        "sudo --prompt prompt cat file.py": (raw_source, "file_read"),
+        "sudo --prompt '' cat file.py": (raw_source, "file_read"),
+        "sudo --prompt '|' cat file.py": (raw_source, "file_read"),
+        "sudo --prompt= cat file.py": (raw_source, "file_read"),
+        "sudo --prom= cat file.py": (raw_source, "file_read"),
+        "sudo --chroot /root cat file.py": (raw_source, "file_read"),
+        "sudo --role role cat file.py": (raw_source, "file_read"),
+        "sudo --type type cat file.py": (raw_source, "file_read"),
+        "sudo --command-timeout 5 cat file.py": (raw_source, "file_read"),
+        "sudo --command-timeout '' cat file.py": (raw_source, "file_read"),
+        "sudo --command-timeout= cat file.py": (raw_source, "file_read"),
+        "sudo --user root cat file.py": (raw_source, "file_read"),
+        "sudo --other-user other cat file.py": (raw_source, "file_read"),
+        "sudo --non cat file.py": (raw_source, "file_read"),
+        "sudo --res cat file.py": (raw_source, "file_read"),
+        "sudo -H -P rg target src": (search_output, "source_search"),
+    }
+
+    observed: dict[str, tuple[bool, object]] = {}
+    for command, (raw, _expected_class) in cases.items():
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            options=opts(max_chars=400),
+        )
+        observed[command] = (result.changed, result.metadata["command_class"])
+
+    assert observed == {
+        command: (False, expected_class)
+        for command, (_raw, expected_class) in cases.items()
+    }
+
+
+def test_sudo_value_options_preserve_compactable_command_intent() -> None:
+    raw = package_progress("underlying command output")
+    cases = {
+        "sudo -a auth pytest -q": "pytest",
+        "sudo -C 3 pytest -q": "pytest",
+        "sudo -C3 apt-get update": "apt",
+        "sudo -D /root pytest -q": "pytest",
+        "sudo -D/root apt-get update": "apt",
+        "sudo -nD/root pytest -q": "pytest",
+        "sudo -R/root apt-get update": "apt",
+        "sudo -T5 pytest -q": "pytest",
+        "sudo -n -Eu root pytest -q": "pytest",
+        "sudo -nEu root apt-get update": "apt",
+        "sudo -uroot pytest -q": "pytest",
+        "sudo -U other apt-get update": "apt",
+        "sudo --chdir /root pytest -q": "pytest",
+        "sudo --chd /root pytest -q": "pytest",
+        "sudo --command-timeout=5 apt-get update": "apt",
+        "sudo -H -P apt-get update": "apt",
+    }
+
+    observed: dict[str, tuple[bool, object]] = {}
+    for command in cases:
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            options=opts(max_chars=400),
+        )
+        observed[command] = (result.changed, result.metadata["command_class"])
+
+    assert observed == {
+        command: (True, expected_class) for command, expected_class in cases.items()
+    }
+
+
+def test_sudo_short_options_remain_case_sensitive() -> None:
+    raw_source = "\n".join(f"def function_{index}(): return {index}" for index in range(160))
+
+    assert classify_command("sudo -P cat file.py", raw_source) == "file_read"
+    assert classify_command("sudo -p cat file.py", raw_source) == "generic"
+
+
+def test_sudo_nonexecuting_modes_do_not_expose_apparent_child_commands() -> None:
+    raw_source = "\n".join(f"def function_{index}(): return {index}" for index in range(160))
+    nonexecuting_commands = (
+        "sudo -nlu root cat file.py",
+        "sudo -ne cat file.py",
+        "sudo -nl cat file.py",
+        "sudo -nv cat file.py",
+        "sudo -nV cat file.py",
+        "sudo -nK cat file.py",
+        "sudo --edit cat file.py",
+        "sudo --list cat file.py",
+        "sudo --validate cat file.py",
+        "sudo --version cat file.py",
+        "sudo --help cat file.py",
+        "sudo --remove-timestamp cat file.py",
+        "sudo --ed cat file.py",
+        "sudo --lis cat file.py",
+        "sudo --val cat file.py",
+        "sudo --vers cat file.py",
+        "sudo --hel cat file.py",
+        "sudo --rem cat file.py",
+        "sudo --ch /root cat file.py",
+        "sudo --pres cat file.py",
+        "sudo --l cat file.py",
+        "sudo --v cat file.py",
+        "sudo --user '' cat file.py",
+        "sudo -u '' cat file.py",
+        "sudo -h cat file.py",
+        "sudo -h localhost cat file.py",
+        "sudo -hcat cat file.py",
+    )
+
+    for command in nonexecuting_commands:
+        assert classify_command(command, raw_source) == "generic", command
+
+    for command in (
+        "sudo -k cat file.py",
+        "sudo --reset-timestamp cat file.py",
+        "sudo -urootV cat file.py",
+        "sudo -pvalidate cat file.py",
+    ):
+        assert classify_command(command, raw_source) == "file_read", command
 
 
 def test_package_command_flags_still_preserve_failure_signal() -> None:
