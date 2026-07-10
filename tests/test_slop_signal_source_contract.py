@@ -4997,6 +4997,16 @@ def test_unreachable_substitution_branches_do_not_veto_exact_ownership() -> None
         assert unsafe.changed is True, command
         assert unsafe.metadata["command_class"] == expected_class, command
 
+    escaped_backtick = reduce_text(
+        plain_output,
+        command=r'cat "`true\; || pytest -q; cat path.txt`"',
+        tool_name="terminal",
+        exit_code=0,
+        options=compact_opts,
+    )
+    assert escaped_backtick.changed is True
+    assert escaped_backtick.metadata["command_class"] == "pytest"
+
 
 def test_log_stream_filters_do_not_claim_exact_source_ownership() -> None:
     compact_opts = opts(max_chars=180, max_lines=8, head_lines=1, tail_lines=1)

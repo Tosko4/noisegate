@@ -2342,6 +2342,7 @@ def _command_substitutions(command: str) -> list[tuple[str, str]]:
                     scan += 1
                     continue
                 if current == "\\":
+                    body_chars.append(current)
                     inner_escaped = True
                     scan += 1
                     continue
