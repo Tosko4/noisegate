@@ -12,7 +12,10 @@ from .engine import (
     JsonValue,
     NoisegateOptions,
     _append_recovery_notices,
+    _command_has_compactable_intent,
+    _compactable_command_output_class,
     _drop_artifact_if_notice_cannot_fit,
+    _exact_command_output_class,
     _is_compactable_tool_name,
     _plan_artifact,
     _preserve_patterns_for_output,
@@ -31,6 +34,9 @@ EXACT_COMMAND_CLASSES = (
     ALWAYS_PROTECTED_COMMAND_CLASSES | CONDITIONALLY_PROTECTED_COMMAND_CLASSES
 )
 OUTPUT_ASSISTED_COMMAND_CLASSES = frozenset({"file_read", "source_search"})
+NOISY_COMMAND_CLASSES = frozenset(
+    {"apt", "docker_build", "docker_logs", "node", "pytest", "python_package", "unittest"}
+)
 COMMAND_ALIASES = ("command", "cmd", "shell_command", "code")
 GENERIC_TEXT_FIELDS = (
     "stdout",
@@ -299,21 +305,25 @@ def _candidate_fields(tool_name: str, payload: Mapping[str, JsonValue]) -> tuple
     return tuple(field for field in candidates if field in payload)
 
 
+def _commands_from_source(source: Mapping[str, Any]) -> tuple[str, ...]:
+    commands = tuple(
+        value
+        for key in COMMAND_ALIASES
+        if isinstance((value := source.get(key)), str) and value.strip()
+    )
+    argv = source.get("argv")
+    if isinstance(argv, list) and argv and all(isinstance(item, str) for item in argv):
+        commands += (shlex.join(argv),)
+    return commands
+
+
 def _select_command(
     text: str,
     *sources: Mapping[str, Any],
     exit_code: int | None = None,
 ) -> str:
     evidence = _command_evidence_text(text)
-    candidates: list[str] = []
-    for source in sources:
-        for key in COMMAND_ALIASES:
-            value = source.get(key)
-            if isinstance(value, str) and value.strip():
-                candidates.append(value)
-        argv = source.get("argv")
-        if isinstance(argv, list) and argv and all(isinstance(item, str) for item in argv):
-            candidates.append(shlex.join(argv))
+    candidates = [command for source in sources for command in _commands_from_source(source)]
 
     classified = [
         (
@@ -323,6 +333,25 @@ def _select_command(
         )
         for command in candidates
     ]
+    for command, command_class, _evidence_class in classified:
+        if (
+            command_class in ALWAYS_PROTECTED_COMMAND_CLASSES
+            and not _command_has_compactable_intent(command)
+        ):
+            return command
+    output_class = (
+        _compactable_command_output_class(classified[0][0], evidence) if classified else None
+    )
+    if output_class in NOISY_COMMAND_CLASSES:
+        for command, _command_class, _evidence_class in classified[1:]:
+            if _exact_command_output_class(command, evidence, exit_code=exit_code) is not None:
+                return command
+    if (
+        classified
+        and output_class in NOISY_COMMAND_CLASSES
+        and classified[0][2] == output_class
+    ):
+        return classified[0][0]
     for command, command_class, evidence_class in classified:
         if (
             command_class in ALWAYS_PROTECTED_COMMAND_CLASSES

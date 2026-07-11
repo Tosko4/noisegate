@@ -372,8 +372,29 @@ def test_terminal_tool_result_args_command_alias_wins_over_payload_command() -> 
 
 def test_terminal_tool_result_protected_payload_command_wins_over_stale_args_command() -> None:
     exact = source_like_payload()
-    raw = terminal_result(exact, command="cat src/source_fixture.py")
 
+    for payload_command in (
+        "cat src/source_fixture.py",
+        "cat '>README'",
+        "cat src/source_fixture.py >/dev/stdout",
+    ):
+        raw = terminal_result(exact, command=payload_command)
+
+        assert (
+            transform_tool_result(
+                raw,
+                tool_name="terminal",
+                args={"command": "pytest -q"},
+                noisegate_max_chars=200,
+            )
+            is None
+        ), payload_command
+
+    dominant_source = exact + "\ntests/test_api.py::test_literal PASSED"
+    raw = terminal_result(
+        dominant_source,
+        command="cat src/source_fixture.py >/dev/stdout",
+    )
     assert (
         transform_tool_result(
             raw,
@@ -461,6 +482,87 @@ def test_terminal_tool_result_keeps_args_precedence_for_noisy_commands() -> None
 
     payload = parse_hook_result(transformed)
     assert payload["noisegate"]["fields"]["stdout"]["command_class"] == "pytest"
+
+
+def test_protected_aliases_win_when_exact_content_looks_noisy() -> None:
+    npm_like_source = "\n".join(
+        f"npm ERR! code E404 exact-source-{index}" for index in range(180)
+    )
+    cases = (
+        ({"command": "npm install missing-package", "cmd": "cat build.log"}, {}, ""),
+        ({"command": "npm install missing-package", "argv": ["cat", "build.log"]}, {}, ""),
+        ({"command": "npm install missing-package"}, {"command": "cat build.log"}, ""),
+        ({"command": "npm install missing-package"}, {}, "cat build.log"),
+        ({"command": "npm install missing-package"}, {}, "rg --no-filename target src"),
+    )
+
+    for args, arguments, payload_command in cases:
+        raw = terminal_result(npm_like_source, command=payload_command, exit_code=1)
+        assert (
+            transform_tool_result(
+                raw,
+                tool_name="terminal",
+                args=args,
+                arguments=arguments,
+                noisegate_max_chars=300,
+                noisegate_max_lines=20,
+            )
+            is None
+        ), (args, arguments, payload_command)
+
+    pytest_outputs = (
+        "\n".join(
+            [
+                *[f"tests/test_{index}.py::test_case_{index} PASSED" for index in range(180)],
+                "================ 180 passed in 2.00s ================",
+            ]
+        ),
+        "\n".join(
+            [
+                "============================= test session starts =============================",
+                "tests/test_api.py::test_broken FAILED",
+                "_______________________________ test_broken _______________________________",
+                "def test_broken():",
+                "    assert False",
+                "E   assert False",
+                *[f"tests/test_{index}.py::test_case_{index} PASSED" for index in range(160)],
+                "=========================== short test summary info ===========================",
+                "FAILED tests/test_api.py::test_broken - assert False",
+                "1 failed, 160 passed in 2.00s",
+            ]
+        ),
+    )
+    for exact in pytest_outputs:
+        assert (
+            transform_tool_result(
+                terminal_result(exact, command="cat test-results.txt"),
+                tool_name="terminal",
+                args={"command": "pytest -q"},
+                noisegate_max_chars=400,
+                noisegate_max_lines=20,
+            )
+            is None
+        )
+
+    partial_read = json.dumps(
+        {
+            "command": "cat build.log missing.txt",
+            "stdout": npm_like_source,
+            "stderr": "cat: missing.txt: No such file or directory",
+            "exit": 1,
+            "status": "failed",
+        }
+    )
+    assert (
+        transform_tool_result(
+            partial_read,
+            tool_name="terminal",
+            args={"command": "npm install"},
+            noisegate_max_chars=300,
+            noisegate_max_lines=20,
+        )
+        is None
+    )
 
 
 def test_terminal_tool_result_preserves_argv_file_display_with_metachar_paths() -> None:

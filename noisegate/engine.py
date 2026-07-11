@@ -14,6 +14,32 @@ from .artifacts import DEFAULT_SIZE_CAP, ArtifactError, ArtifactStore, ArtifactT
 
 JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 
+
+class _ShellToken(str):
+    """A shell token carrying lexical provenance for quoted operators."""
+
+    redirection_operator_was_quoted: bool
+    assignment_prefix_was_quoted: bool
+    numeric_redirection_was_separated: bool
+    was_quoted: bool
+
+    def __new__(
+        cls,
+        value: str,
+        *,
+        redirection_operator_was_quoted: bool = False,
+        assignment_prefix_was_quoted: bool = False,
+        numeric_redirection_was_separated: bool = False,
+        was_quoted: bool = False,
+    ) -> _ShellToken:
+        token = super().__new__(cls, value)
+        token.redirection_operator_was_quoted = redirection_operator_was_quoted
+        token.assignment_prefix_was_quoted = assignment_prefix_was_quoted
+        token.numeric_redirection_was_separated = numeric_redirection_was_separated
+        token.was_quoted = was_quoted
+        return token
+
+
 TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}
 FALSE_VALUES = {"0", "false", "no", "off", "disabled"}
 MIN_HEAD_TAIL_CHARS = 2
@@ -571,6 +597,66 @@ def classify_command(command: str | None, text: str, *, exit_code: int | None = 
     if any(_is_node_command(variant, sample_l) for variant in command_variants):
         return "node"
     return "generic"
+
+
+def _compactable_command_output_class(command: str, text: str) -> str | None:
+    return _compactable_output_class_for_tokens(
+        _shell_tokens(command),
+        text[:2_000].lower(),
+        text.lower(),
+    )
+
+
+def _command_has_compactable_intent(command: str) -> bool:
+    return any(
+        _compactable_class_for_tokens(tokens, "", "") is not None
+        for tokens in _command_execution_segments(command)
+    )
+
+
+def _exact_command_output_class(
+    command: str,
+    text: str,
+    *,
+    exit_code: int | None = None,
+) -> str | None:
+    tokens = _shell_tokens(command)
+    sample = text[:2_000].lower()
+    lowered = text.lower()
+    command_class = _exact_class_for_tokens(tokens)
+    if command_class is None and _looks_like_file_read_command(
+        command,
+        sample=sample,
+        text=lowered,
+        exit_code=exit_code,
+    ):
+        command_class = "file_read"
+    if command_class is None and _is_source_search_command(
+        command,
+        sample=sample,
+        text=lowered,
+        exit_code=exit_code,
+    ):
+        command_class = "source_search"
+    if command_class == "source_search" and (
+        _text_has_exact_owner_output_against_later_compactable(
+            tokens,
+            text,
+            exit_code=exit_code,
+        )
+        or (
+            not _tokens_source_search_hides_filenames(tokens)
+            and _contains_likely_source_search_output(text)
+        )
+    ):
+        return command_class
+    if command_class == "file_read" and _text_has_exact_owner_output_against_later_compactable(
+        tokens,
+        text,
+        exit_code=exit_code,
+    ):
+        return command_class
+    return None
 
 
 def _is_protected_tool_name(tool_name: str | None) -> bool:
@@ -3131,7 +3217,7 @@ def _has_unquoted_command_or_process_substitution(command: str) -> bool:
 
 
 def _has_only_safe_file_read_redirection(command: str) -> bool:
-    """Allow read-only/diagnostic redirections that preserve stdout payloads."""
+    """Allow valid redirections only when captured stdout remains visible."""
 
     if (
         _has_unquoted_command_or_process_substitution(command)
@@ -3140,41 +3226,21 @@ def _has_only_safe_file_read_redirection(command: str) -> bool:
     ):
         return False
     tokens = _shell_tokens(command)
+    stdout_visible, _stderr_visible = _redirected_stream_visibility(tokens)
+    if not stdout_visible:
+        return False
     index = 0
     saw_safe_redirection = False
     while index < len(tokens):
-        token = tokens[index]
-        if re.fullmatch(r"[12]?>&[12]", token):
-            saw_safe_redirection = True
+        redirection = _simple_shell_redirection(tokens, index)
+        if redirection is None:
             index += 1
             continue
-        if token in {">", "1>", ">>", "1>>"} or re.match(r"^(?:[01]?>|[01]>>|>>|>)", token):
-            if _redirected_stream_visibility(tokens)[0]:
-                saw_safe_redirection = True
-                index += 1
-                continue
+        consumed, _supplies_stdin_path = redirection
+        if not consumed:
             return False
-        if token in {"<", "0<"}:
-            if index + 1 >= len(tokens) or tokens[index + 1].startswith("-"):
-                return False
-            saw_safe_redirection = True
-            index += 2
-            continue
-        if token.startswith("<") or token.startswith("0<"):
-            saw_safe_redirection = True
-            index += 1
-            continue
-        if token in {"2>", "2>>"}:
-            if index + 1 >= len(tokens) or tokens[index + 1] != "/dev/null":
-                return False
-            saw_safe_redirection = True
-            index += 2
-            continue
-        if token in {"2>/dev/null", "2>>/dev/null"}:
-            saw_safe_redirection = True
-            index += 1
-            continue
-        index += 1
+        saw_safe_redirection = True
+        index += consumed
     return saw_safe_redirection
 
 
@@ -3184,6 +3250,86 @@ def _has_suspicious_shell_quote_escape(command: str) -> bool:
 
 def _looks_like_sed_search_script(token: str) -> bool:
     return bool(re.fullmatch(r"/.+/p", token.strip()))
+
+
+def _simple_shell_redirection(tokens: list[str], index: int) -> tuple[int, bool] | None:
+    """Return (tokens consumed, supplies stdin path) for a simple shell redirect."""
+
+    if index >= len(tokens):
+        return None
+    token = tokens[index]
+    if getattr(token, "redirection_operator_was_quoted", False):
+        return None
+    if re.fullmatch(r"[0-9]*[<>]&(?:[0-9]+|-)", token):
+        return 1, False
+    for operator in ("&>>", "&>"):
+        if not token.startswith(operator):
+            continue
+        if token[len(operator) :]:
+            return 1, False
+        if index + 1 >= len(tokens) or _is_unquoted_shell_separator(tokens[index + 1]):
+            return 0, False
+        return 2, False
+
+    match = re.fullmatch(r"([0-9]*)(<>|>>?|>\||<)(.*)", token)
+    if match is None:
+        return None
+    descriptor, operator, target = match.groups()
+    if target.startswith(("&", "<", ">")):
+        return 0, False
+    consumed = 1
+    target_path = target
+    if not target:
+        if index + 1 >= len(tokens) or _is_unquoted_shell_separator(tokens[index + 1]):
+            return 0, False
+        consumed = 2
+        target_path = tokens[index + 1]
+    supplies_stdin_path = (
+        operator in {"<", "<>"}
+        and descriptor in {"", "0"}
+        and target_path not in {"/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"}
+    )
+    return consumed, supplies_stdin_path
+
+
+def _sed_tokens_have_file_input(tokens: list[str]) -> bool:
+    stdin_aliases = {"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"}
+    index = 0
+    while index < len(tokens):
+        redirection = _simple_shell_redirection(tokens, index)
+        if redirection is not None:
+            consumed, supplies_stdin_path = redirection
+            if not consumed:
+                return False
+            if supplies_stdin_path:
+                return True
+            index += consumed
+            continue
+        if _is_unquoted_shell_separator(tokens[index]):
+            return False
+        if tokens[index] not in stdin_aliases:
+            return True
+        index += 1
+    return False
+
+
+def _shell_operand_after_redirections(
+    tokens: list[str],
+    index: int,
+) -> tuple[int, bool] | None:
+    supplies_stdin_path = False
+    while index < len(tokens):
+        redirection = _simple_shell_redirection(tokens, index)
+        if redirection is None:
+            break
+        consumed, redirect_supplies_stdin = redirection
+        if not consumed:
+            return None
+        supplies_stdin_path |= redirect_supplies_stdin
+        index += consumed
+    if index >= len(tokens) or _is_unquoted_shell_separator(tokens[index]):
+        return None
+    return index, supplies_stdin_path
 
 
 def _looks_like_sed_file_read_tokens(tokens: list[str]) -> bool:
@@ -3205,6 +3351,14 @@ def _looks_like_sed_file_read_tokens(tokens: list[str]) -> bool:
     }
     while index < len(tokens):
         token = tokens[index]
+        redirection = _simple_shell_redirection(tokens, index)
+        if redirection is not None:
+            consumed, supplies_stdin_path = redirection
+            if not consumed:
+                return False
+            has_file_arg |= supplies_stdin_path
+            index += consumed
+            continue
         if token == "--":
             remaining = tokens[index + 1 :]
             if not saw_script:
@@ -3212,7 +3366,7 @@ def _looks_like_sed_file_read_tokens(tokens: list[str]) -> bool:
                     return False
                 saw_script = True
                 remaining = remaining[1:]
-            has_file_arg = bool(remaining)
+            has_file_arg |= _sed_tokens_have_file_input(remaining)
             break
         long_option, separator, attached_value = token.partition("=")
         if long_option.startswith("--i") and "--in-place".startswith(long_option):
@@ -3222,8 +3376,13 @@ def _looks_like_sed_file_read_tokens(tokens: list[str]) -> bool:
                 script = attached_value
                 consumed = 1
             elif index + 1 < len(tokens):
-                script = tokens[index + 1]
-                consumed = 2
+                operand = _shell_operand_after_redirections(tokens, index + 1)
+                if operand is None:
+                    return False
+                operand_index, supplies_stdin_path = operand
+                script = tokens[operand_index]
+                has_file_arg |= supplies_stdin_path
+                consumed = operand_index - index + 1
             else:
                 return False
             if _looks_like_sed_search_script(script):
@@ -3233,10 +3392,19 @@ def _looks_like_sed_file_read_tokens(tokens: list[str]) -> bool:
             continue
         if long_option.startswith("--l") and "--line-length".startswith(long_option):
             if separator:
+                line_length = attached_value
                 index += 1
             elif index + 1 < len(tokens):
-                index += 2
+                operand = _shell_operand_after_redirections(tokens, index + 1)
+                if operand is None:
+                    return False
+                operand_index, supplies_stdin_path = operand
+                line_length = tokens[operand_index]
+                has_file_arg |= supplies_stdin_path
+                index = operand_index + 1
             else:
+                return False
+            if re.fullmatch(r"[+-]?\d+", line_length.strip()) is None:
                 return False
             continue
         if long_option.startswith("--fi") and "--file".startswith(long_option):
@@ -3248,8 +3416,13 @@ def _looks_like_sed_file_read_tokens(tokens: list[str]) -> bool:
                 continue
             if index + 1 >= len(tokens):
                 return False
+            operand = _shell_operand_after_redirections(tokens, index + 1)
+            if operand is None:
+                return False
+            operand_index, supplies_stdin_path = operand
+            has_file_arg |= supplies_stdin_path
             saw_script = True
-            index += 2
+            index = operand_index + 1
             continue
         if token in {"--help", "--version"}:
             return False
@@ -3258,7 +3431,7 @@ def _looks_like_sed_file_read_tokens(tokens: list[str]) -> bool:
             continue
         if token.startswith("-") and not token.startswith("--"):
             short_options = token[1:]
-            consumed = 1
+            next_index = index + 1
             option_index = 0
             while option_index < len(short_options):
                 option = short_options[option_index]
@@ -3266,11 +3439,17 @@ def _looks_like_sed_file_read_tokens(tokens: list[str]) -> bool:
                     return False
                 if option == "l":
                     operand = short_options[option_index + 1 :]
-                    if operand.isdigit():
+                    if re.fullmatch(r"[+-]?\d+", operand):
                         break
-                    if not operand and index + 1 < len(tokens) and tokens[index + 1].isdigit():
-                        consumed = 2
-                        break
+                    if not operand and index + 1 < len(tokens):
+                        shell_operand = _shell_operand_after_redirections(tokens, index + 1)
+                        if shell_operand is not None:
+                            operand_index, supplies_stdin_path = shell_operand
+                            candidate = tokens[operand_index]
+                            if re.fullmatch(r"[+-]?\d+", candidate.strip()):
+                                has_file_arg |= supplies_stdin_path
+                                next_index = operand_index + 1
+                                break
                     option_index += 1
                     continue
                 if option in {"e", "f"}:
@@ -3278,27 +3457,33 @@ def _looks_like_sed_file_read_tokens(tokens: list[str]) -> bool:
                     if not operand:
                         if index + 1 >= len(tokens):
                             return False
-                        operand = tokens[index + 1]
-                        consumed = 2
+                        shell_operand = _shell_operand_after_redirections(tokens, index + 1)
+                        if shell_operand is None:
+                            return False
+                        operand_index, supplies_stdin_path = shell_operand
+                        operand = tokens[operand_index]
+                        has_file_arg |= supplies_stdin_path
+                        next_index = operand_index + 1
                     if option == "e" and _looks_like_sed_search_script(operand):
                         return False
-                    if operand:
+                    if option == "e" or operand:
                         saw_script = True
                     break
+                if option not in {"E", "H", "a", "b", "n", "r", "s", "u", "z"}:
+                    return False
                 option_index += 1
-            index += consumed
+            index = next_index
             continue
         if token.startswith("--"):
-            index += 1
-            continue
+            return False
         if not saw_script:
             if _looks_like_sed_search_script(token):
                 return False
             saw_script = True
         else:
-            has_file_arg = True
+            has_file_arg |= _sed_tokens_have_file_input([token])
         index += 1
-    return saw_script or has_file_arg
+    return saw_script and has_file_arg
 
 
 def _looks_like_git_show_file_read_tokens(tokens: list[str]) -> bool:
@@ -4212,7 +4397,7 @@ def _background_segments(command: str) -> list[tuple[str | None, list[str]]]:
     separator: str | None = None
     current: list[str] = []
     for token in _shell_tokens(command):
-        if token in {"&&", "||", ";", "&"}:
+        if token in {"&&", "||", ";", "&"} and not getattr(token, "was_quoted", False):
             if current:
                 segments.append((separator, current))
                 current = []
@@ -4653,7 +4838,11 @@ def _exact_class_for_tokens(tokens: list[str]) -> str | None:
 
 def _tokens_redirect_stdout(tokens: list[str]) -> bool:
     for index, token in enumerate(tokens):
+        if getattr(token, "redirection_operator_was_quoted", False):
+            continue
         if token in {">", ">>", "1>", ">|"}:
+            return True
+        if token.startswith("1<>"):
             return True
         if token.startswith((">", "1>")) and token not in {"2>", "2>>"}:
             return True
@@ -4663,7 +4852,13 @@ def _tokens_redirect_stdout(tokens: list[str]) -> bool:
             return True
         if token in {"2>", "2>>"}:
             continue
-        if token == "2" and index + 1 < len(tokens) and tokens[index + 1] in {">", ">>"}:
+        if (
+            token == "2"
+            and not getattr(token, "was_quoted", False)
+            and index + 1 < len(tokens)
+            and tokens[index + 1] in {">", ">>"}
+            and not getattr(tokens[index + 1], "redirection_operator_was_quoted", False)
+        ):
             continue
     return False
 
@@ -4682,6 +4877,9 @@ def _redirected_stream_visibility(tokens: list[str]) -> tuple[bool, bool]:
     index = 0
     while index < len(tokens):
         token = tokens[index]
+        if getattr(token, "redirection_operator_was_quoted", False):
+            index += 1
+            continue
         if token in {"&>", "&>>"} or token.startswith(("&>", "&>>")):
             target = token[2:]
             if token.startswith("&>>"):
@@ -4697,18 +4895,55 @@ def _redirected_stream_visibility(tokens: list[str]) -> tuple[bool, bool]:
 
         fd_prefix = ""
         redirect_token = token
-        if token in {"1", "2"} and index + 1 < len(tokens):
+        if (
+            token in {"1", "2"}
+            and not getattr(token, "was_quoted", False)
+            and not getattr(token, "numeric_redirection_was_separated", False)
+            and index + 1 < len(tokens)
+        ):
             next_token = tokens[index + 1]
-            if next_token in {">", ">>", ">|"}:
+            if next_token in {
+                ">",
+                ">>",
+                ">|",
+                "<>",
+                "<",
+                "<&",
+                "<<",
+                "<<<",
+            } and not getattr(
+                next_token,
+                "redirection_operator_was_quoted",
+                False,
+            ):
                 fd_prefix = token
                 redirect_token = next_token
                 index += 1
 
-        match = re.fullmatch(r"([12]?)(>>?|>\|)(.*)", redirect_token)
+        input_match = re.fullmatch(r"([12]?)(<&|<<<|<<|<)(.*)", redirect_token)
+        if input_match is not None:
+            fd = fd_prefix or input_match.group(1) or "0"
+            operator = input_match.group(2)
+            target = input_match.group(3)
+            if not target and index + 1 < len(tokens):
+                target = tokens[index + 1]
+                index += 1
+            if fd == "1":
+                if operator == "<&" and target in {"1", "&1"}:
+                    pass
+                elif operator == "<&" and target in {"2", "&2"}:
+                    stdout_visible = stderr_visible
+                else:
+                    stdout_visible = False
+            index += 1
+            continue
+
+        match = re.fullmatch(r"([12]?)(<>|>>?|>\|)(.*)", redirect_token)
         if match is None:
             index += 1
             continue
-        fd = fd_prefix or match.group(1) or "1"
+        operator = match.group(2)
+        fd = fd_prefix or match.group(1) or ("0" if operator == "<>" else "1")
         target = match.group(3)
         if not target and index + 1 < len(tokens):
             target = tokens[index + 1]
@@ -4716,7 +4951,7 @@ def _redirected_stream_visibility(tokens: list[str]) -> tuple[bool, bool]:
         visibility = target_visibility(target)
         if fd == "2":
             stderr_visible = visibility
-        else:
+        elif fd == "1":
             stdout_visible = visibility
         index += 1
 
@@ -4735,11 +4970,21 @@ def _tokens_hide_stderr_from_capture(tokens: list[str]) -> bool:
 
 def _tokens_redirect_stderr(tokens: list[str]) -> bool:
     for index, token in enumerate(tokens):
+        if getattr(token, "redirection_operator_was_quoted", False):
+            continue
         if token in {"2>", "2>>", "&>"}:
+            return True
+        if token.startswith("2<>"):
             return True
         if token.startswith(("2>", "&>")):
             return True
-        if token == "2" and index + 1 < len(tokens) and tokens[index + 1] in {">", ">>"}:
+        if (
+            token == "2"
+            and not getattr(token, "was_quoted", False)
+            and index + 1 < len(tokens)
+            and tokens[index + 1] in {">", ">>"}
+            and not getattr(tokens[index + 1], "redirection_operator_was_quoted", False)
+        ):
             return True
     return False
 
@@ -4752,11 +4997,15 @@ def _tokens_have_unsafe_shell_expansion(tokens: list[str]) -> bool:
             return True
         if token.endswith("$") and index + 1 < len(tokens) and tokens[index + 1] == "(":
             return True
+        redirection_is_quoted = getattr(token, "redirection_operator_was_quoted", False)
         if (
             "`" in token
-            or token.startswith(("<(", ">("))
-            or token in {">", ">>", "1>", "&>", ">|"}
-            or token.startswith((">", "1>", "&>"))
+            or (token.startswith(("<(", ">(")) and not redirection_is_quoted)
+            or (
+                token in {">", ">>", "1>", "&>", ">|"}
+                and not redirection_is_quoted
+            )
+            or (token.startswith((">", "1>", "&>")) and not redirection_is_quoted)
         ):
             return True
     return False
@@ -4784,7 +5033,7 @@ def _pipeline_compactable_class(command: str, sample: str, text: str) -> str | N
     token_variants.extend(_command_token_segments(command))
     for tokens in token_variants:
         for index, token in enumerate(tokens[:-1]):
-            if token not in {"|", "|&"}:
+            if token not in {"|", "|&"} or getattr(token, "was_quoted", False):
                 continue
             upstream = tokens[:index]
             if not _tokens_start_exact_output_producer(upstream):
@@ -4803,7 +5052,7 @@ def _pipeline_xargs_compactable_class(command: str, sample: str, text: str) -> s
     token_variants.extend(_command_token_segments(command))
     for tokens in token_variants:
         for index, token in enumerate(tokens[:-1]):
-            if token not in {"|", "|&"}:
+            if token not in {"|", "|&"} or getattr(token, "was_quoted", False):
                 continue
             upstream = tokens[:index]
             if not _tokens_start_exact_output_producer(upstream):
@@ -5285,7 +5534,10 @@ def _contains_file_read_error_for_tokens(tokens: list[str], text: str) -> bool:
         if skip_next:
             skip_next = False
             continue
-        if token in SHELL_SEPARATORS or token in {"<", ">", ">>", "2>", "2>>"}:
+        if _is_unquoted_shell_separator(token) or (
+            token in {"<", ">", ">>", "2>", "2>>"}
+            and not getattr(token, "redirection_operator_was_quoted", False)
+        ):
             continue
         if token.startswith("-"):
             option_name = token.split("=", 1)[0]
@@ -6272,7 +6524,7 @@ def _tokens_start_find_path_list(tokens: list[str]) -> bool:
 def _tokens_pipe_to_file_read(tokens: list[str]) -> bool:
     tokens = _strip_command_wrappers(tokens)
     for index, token in enumerate(tokens[:-1]):
-        if token in {"|", "|&"}:
+        if token in {"|", "|&"} and not getattr(token, "was_quoted", False):
             downstream = _strip_command_wrappers(tokens[index + 1 :])
             upstream = tokens[:index]
             if _tokens_start_compactable_command(upstream):
@@ -6322,7 +6574,7 @@ def _tokens_start_direct_log_stream(tokens: list[str]) -> bool:
 def _tokens_pipe_to_source_search(tokens: list[str]) -> bool:
     tokens = _strip_command_wrappers(tokens)
     for index, token in enumerate(tokens[:-1]):
-        if token in {"|", "|&"}:
+        if token in {"|", "|&"} and not getattr(token, "was_quoted", False):
             downstream = tokens[index + 1 :]
             if _tokens_start_source_search(downstream):
                 upstream = tokens[:index]
@@ -6423,7 +6675,7 @@ def _xargs_payload_tokens(tokens: list[str]) -> list[str]:
     index = 1
     while index < len(tokens):
         token = tokens[index]
-        if token in SHELL_SEPARATORS:
+        if _is_unquoted_shell_separator(token):
             return []
         if token == "--":
             return tokens[index + 1 :]
@@ -6462,28 +6714,32 @@ def _strip_grouping_tokens(tokens: list[str]) -> list[str]:
     return tokens
 
 
+def _strip_leading_redirections(tokens: list[str]) -> list[str]:
+    index = 0
+    while index < len(tokens):
+        redirection = _simple_shell_redirection(tokens, index)
+        if redirection is None:
+            break
+        consumed, _supplies_stdin = redirection
+        if not consumed:
+            return []
+        index += consumed
+    return tokens[index:]
+
+
 def _strip_command_wrappers(tokens: list[str]) -> list[str]:
     tokens = _strip_assignment_tokens(_strip_grouping_tokens(tokens))
     while tokens:
+        tokens = _strip_leading_redirections(tokens)
+        if not tokens:
+            return []
         command = Path(tokens[0]).name
         command_name = Path(command).name
         if command_name == "sudo":
-            tokens = _strip_assignment_tokens(_skip_sudo_options(tokens[1:]))
+            tokens = _skip_sudo_options(tokens[1:])
             continue
         if command_name == "env":
-            tokens = _strip_assignment_tokens(
-                _skip_wrapper_options(
-                    tokens[1:],
-                    value_options={
-                        "-c",
-                        "-s",
-                        "-u",
-                        "--chdir",
-                        "--split-string",
-                        "--unset",
-                    },
-                )
-            )
+            tokens = _strip_env_assignment_tokens(_skip_env_options(tokens[1:]))
             continue
         if command_name in {"time", "gtime", "command"}:
             tokens = _strip_assignment_tokens(
@@ -6497,44 +6753,127 @@ def _strip_command_wrappers(tokens: list[str]) -> list[str]:
     return tokens
 
 
+def _is_valid_sudo_close_from(value: str) -> bool:
+    if re.fullmatch(r"[ \t\n\v\f\r]*[+-]?[0-9]+", value) is None:
+        return False
+    try:
+        parsed = int(value)
+    except ValueError:
+        return False
+    return 3 <= parsed <= 2_147_483_647
+
+
+def _is_valid_sudo_timeout(value: str) -> bool:
+    if not value:
+        return False
+    suffixes = "dhms"
+    suffix_index = 0
+    total = 0
+    index = 0
+    while index < len(value):
+        while index < len(value) and value[index] in " \t\n\v\f\r":
+            index += 1
+        if index >= len(value):
+            return False
+        number_start = index
+        if value[index] in {"+", "-"}:
+            index += 1
+        digits_start = index
+        while index < len(value) and value[index].isascii() and value[index].isdigit():
+            index += 1
+        if index == digits_start:
+            return False
+        number = int(value[number_start:index])
+        if number < 0:
+            return False
+        multiplier = 1
+        if index < len(value):
+            suffix = value[index].lower()
+            while suffix_index < len(suffixes) and suffixes[suffix_index] != suffix:
+                suffix_index += 1
+            if suffix_index == len(suffixes):
+                return False
+            multiplier = (86_400, 3_600, 60, 1)[suffix_index]
+            suffix_index += 1
+            index += 1
+        else:
+            if suffix_index >= len(suffixes):
+                return False
+            suffix_index = len(suffixes)
+        if number > (2_147_483_647 - total) // multiplier:
+            return False
+        total += number * multiplier
+    return True
+
+
+def _is_valid_sudo_option_value(option: str, value: str) -> bool:
+    if option in {"C", "--close-from"}:
+        return _is_valid_sudo_close_from(value)
+    if option in {"T", "--command-timeout"}:
+        return _is_valid_sudo_timeout(value)
+    if option in {"h", "--host"}:
+        return bool(
+            value
+            and not value.startswith("-")
+            and not _is_sudo_environment_assignment(value)
+        )
+    return True
+
+
+def _is_sudo_environment_assignment(token: str) -> bool:
+    return bool(token and token[0] not in {"/", "="} and "=" in token)
+
+
 def _skip_sudo_options(tokens: list[str]) -> list[str]:
-    """Return sudo's executable child after parsing documented option arities."""
+    """Return sudo's child only when its option grammar is unambiguous and valid."""
 
     short_value_options = frozenset(
-        {"a", "C", "c", "D", "d", "g", "h", "p", "R", "r", "t", "T", "u"}
+        {"a", "C", "c", "D", "g", "h", "p", "R", "r", "t", "T", "u"}
     )
-    short_empty_value_options = frozenset({"p"})
-    # Follow upstream's cross-platform grammar rather than this host's sudo --help:
-    # BSD builds expose auth/login classes, and policy plugins may support remote hosts.
-    long_value_options = frozenset(
+    short_value_identities = {
+        "a": "auth-type",
+        "C": "close-from",
+        "c": "login-class",
+        "D": "chdir",
+        "g": "group",
+        "h": "host",
+        "p": "prompt",
+        "R": "chroot",
+        "r": "role",
+        "t": "type",
+        "T": "command-timeout",
+        "u": "user",
+    }
+    short_flags = frozenset({"A", "B", "b", "E", "H", "i", "k", "N", "n", "P", "S", "s"})
+    short_no_child = frozenset({"e", "K", "l", "U", "v", "V"})
+    long_values = frozenset(
         {
             "--auth-type",
-            "--close-from",
-            "--login-class",
             "--chdir",
+            "--chroot",
+            "--close-from",
+            "--command-timeout",
             "--group",
             "--host",
+            "--login-class",
             "--prompt",
-            "--chroot",
             "--role",
             "--type",
-            "--command-timeout",
             "--user",
         }
     )
-    short_no_child_modes = frozenset({"e", "l", "v", "V", "K", "U"})
-    long_no_child_modes = frozenset(
+    long_no_child = frozenset(
         {
             "--edit",
+            "--help",
             "--list",
+            "--other-user",
+            "--remove-timestamp",
             "--validate",
             "--version",
-            "--help",
-            "--remove-timestamp",
-            "--other-user",
         }
     )
-    long_flag_options = frozenset(
+    long_flags = frozenset(
         {
             "--askpass",
             "--background",
@@ -6550,79 +6889,253 @@ def _skip_sudo_options(tokens: list[str]) -> list[str]:
             "--stdin",
         }
     )
-    supported_long_options = long_value_options | long_no_child_modes | long_flag_options
-    empty_value_options = frozenset({"--prompt"})
+    supported_long = long_values | long_no_child | long_flags
+    empty_values = frozenset({"--prompt"})
+    short_flag_identities = {
+        "A": "askpass",
+        "E": "preserve-all",
+        "i": "login",
+        "k": "reset-timestamp",
+        "N": "no-update",
+        "S": "stdin",
+        "s": "shell",
+    }
+    long_flag_identities = {
+        "--askpass": "askpass",
+        "--login": "login",
+        "--no-update": "no-update",
+        "--reset-timestamp": "reset-timestamp",
+        "--shell": "shell",
+        "--stdin": "stdin",
+    }
+    conflicts = (
+        frozenset({"askpass", "stdin"}),
+        frozenset({"login", "preserve-all"}),
+        frozenset({"login", "shell"}),
+        frozenset({"no-update", "reset-timestamp"}),
+    )
+    seen_values: set[str] = set()
+    seen_flags: set[str] = set()
     index = 0
+
+    def record_flag(identity: str | None) -> bool:
+        if identity is None:
+            return True
+        seen_flags.add(identity)
+        return not any(conflict <= seen_flags for conflict in conflicts)
+
     while index < len(tokens):
         token = tokens[index]
-        if token in SHELL_SEPARATORS:
+        if _is_unquoted_shell_separator(token):
             return []
+        redirection = _simple_shell_redirection(tokens, index)
+        if redirection is not None:
+            consumed, _supplies_stdin = redirection
+            if not consumed:
+                return []
+            index += consumed
+            continue
         if token == "--":
-            return tokens[index + 1 :]
+            operand = _shell_operand_after_redirections(tokens, index + 1)
+            return tokens[operand[0] :] if operand is not None else []
         if not token.startswith("-") or token == "-":
+            if _is_sudo_environment_assignment(token):
+                index += 1
+                continue
             break
         index += 1
         if token.startswith("--"):
             option_name = token.split("=", 1)[0]
-            if option_name in supported_long_options:
-                normalized_option = option_name
+            if option_name in supported_long:
+                normalized = option_name
             else:
-                prefix_matches = tuple(
-                    candidate
-                    for candidate in supported_long_options
-                    if candidate.startswith(option_name)
+                matches = tuple(
+                    option for option in supported_long if option.startswith(option_name)
                 )
-                if len(prefix_matches) != 1:
+                if len(matches) != 1:
                     return []
-                normalized_option = prefix_matches[0]
-            if normalized_option in long_no_child_modes:
+                normalized = matches[0]
+            if normalized in long_no_child:
                 return []
-            if normalized_option in long_value_options:
-                if "=" in token:
-                    if (
-                        not token.partition("=")[2]
-                        and normalized_option not in empty_value_options
-                    ):
-                        return []
-                elif index < len(tokens):
-                    if (
-                        tokens[index] in SHELL_SEPARATORS
-                        and normalized_option not in empty_value_options
-                    ):
-                        return []
-                    if (
-                        not tokens[index]
-                        and normalized_option not in empty_value_options
-                    ):
-                        return []
-                    index += 1
-                else:
+            if normalized in long_values:
+                identity = normalized.removeprefix("--")
+                if identity in seen_values:
                     return []
-            elif "=" in token and normalized_option != "--preserve-env":
+                seen_values.add(identity)
+                if "=" in token:
+                    value = token.partition("=")[2]
+                    if not value and normalized not in empty_values:
+                        return []
+                else:
+                    operand = _shell_operand_after_redirections(tokens, index)
+                    if operand is None:
+                        return []
+                    index = operand[0] + 1
+                    value = tokens[operand[0]]
+                    if not value and normalized not in empty_values:
+                        return []
+                if not _is_valid_sudo_option_value(normalized, value):
+                    return []
+                continue
+            if normalized == "--preserve-env" and "=" in token:
+                if "=" in token.partition("=")[2]:
+                    return []
+                continue
+            if "=" in token or not record_flag(long_flag_identities.get(normalized)):
+                return []
+            if normalized == "--preserve-env" and not record_flag("preserve-all"):
                 return []
             continue
         for option_index, option in enumerate(token[1:]):
-            if option in short_no_child_modes:
+            if option in short_no_child:
                 return []
-            # Some sudo builds use -h for help and others for a required host.
-            # Either interpretation makes exposing a later token as a child unsafe.
-            if option == "h":
-                return []
-            if option not in short_value_options:
+            if option in short_flags:
+                if not record_flag(short_flag_identities.get(option)):
+                    return []
                 continue
-            has_attached_operand = option_index < len(token) - 2
-            if not has_attached_operand:
-                if index >= len(tokens):
+            if option not in short_value_options:
+                return []
+            identity = short_value_identities[option]
+            if identity in seen_values:
+                return []
+            seen_values.add(identity)
+            if option_index < len(token) - 2:
+                value = token[option_index + 2 :]
+            else:
+                operand = _shell_operand_after_redirections(tokens, index)
+                if operand is None:
                     return []
-                if (
-                    tokens[index] in SHELL_SEPARATORS
-                    and option not in short_empty_value_options
-                ):
+                index = operand[0] + 1
+                value = tokens[operand[0]]
+                if not value and option != "p":
                     return []
-                if not tokens[index] and option not in short_empty_value_options:
-                    return []
-                index += 1
+            if not _is_valid_sudo_option_value(option, value):
+                return []
             break
+    return tokens[index:]
+
+
+def _safe_env_split_tokens(value: str) -> list[str]:
+    """Parse env split-string argv without treating its contents as outer shell syntax."""
+
+    split_tokens = _shell_tokens(value)
+    if not split_tokens:
+        return []
+    for index, token in enumerate(split_tokens):
+        if _is_unquoted_shell_separator(token):
+            return []
+        if _simple_shell_redirection(split_tokens, index) is not None:
+            return []
+    return split_tokens
+
+
+def _skip_env_options(tokens: list[str]) -> list[str]:
+    value_options = {
+        "-C",
+        "-a",
+        "-f",
+        "-u",
+        "--argv0",
+        "--chdir",
+        "--file",
+        "--unset",
+    }
+    flag_options = {
+        "-0",
+        "-i",
+        "-v",
+        "--block-signal",
+        "--debug",
+        "--default-signal",
+        "--ignore-environment",
+        "--ignore-signal",
+        "--list-signal-handling",
+        "--null",
+    }
+    no_child_options = {"-h", "-V", "--help", "--version"}
+    short_value_options = {"C", "a", "f", "u"}
+    short_flags = {"0", "i", "v"}
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if _is_unquoted_shell_separator(token):
+            return []
+        redirection = _simple_shell_redirection(tokens, index)
+        if redirection is not None:
+            consumed, _supplies_stdin = redirection
+            if not consumed:
+                return []
+            index += consumed
+            continue
+        if token == "-":
+            index += 1
+            continue
+        if token == "--":
+            return tokens[index + 1 :]
+        if token in no_child_options:
+            return []
+        if token.startswith("--split-string="):
+            value = token.partition("=")[2]
+            if not value:
+                return tokens[index + 1 :]
+            split_tokens = _safe_env_split_tokens(value)
+            return split_tokens + tokens[index + 1 :] if split_tokens else []
+        if token == "--split-string" or token == "-S":
+            operand = _shell_operand_after_redirections(tokens, index + 1)
+            if operand is None:
+                return []
+            value_index, _supplies_stdin = operand
+            value = tokens[value_index]
+            split_tokens = _safe_env_split_tokens(value)
+            return split_tokens + tokens[value_index + 1 :] if split_tokens else []
+        if token.startswith("-S") and not token.startswith("--"):
+            value = token[2:]
+            split_tokens = _safe_env_split_tokens(value)
+            return split_tokens + tokens[index + 1 :] if split_tokens else []
+        if token.startswith("--"):
+            option_name, separator, attached = token.partition("=")
+            if option_name in value_options:
+                if separator:
+                    if not attached and option_name != "--argv0":
+                        return []
+                    index += 1
+                    continue
+                operand = _shell_operand_after_redirections(tokens, index + 1)
+                if operand is None:
+                    return []
+                value_index = operand[0]
+                if not tokens[value_index] and option_name != "--argv0":
+                    return []
+                index = value_index + 1
+                continue
+            if option_name in flag_options:
+                index += 1
+                continue
+            return []
+        if token.startswith("-"):
+            options = token[1:]
+            option_index = 0
+            while option_index < len(options):
+                option = options[option_index]
+                if option in short_flags:
+                    option_index += 1
+                    continue
+                if option not in short_value_options:
+                    return []
+                if option_index + 1 < len(options):
+                    option_index = len(options)
+                    continue
+                operand = _shell_operand_after_redirections(tokens, index + 1)
+                if operand is None:
+                    return []
+                value_index = operand[0]
+                if not tokens[value_index] and option != "a":
+                    return []
+                index = value_index
+                option_index = len(options)
+            index += 1
+            continue
+        break
     return tokens[index:]
 
 
@@ -6630,7 +7143,7 @@ def _skip_wrapper_options(tokens: list[str], *, value_options: set[str]) -> list
     index = 0
     while index < len(tokens):
         token = tokens[index]
-        if token in SHELL_SEPARATORS:
+        if _is_unquoted_shell_separator(token):
             return []
         if not token.startswith("-"):
             break
@@ -6663,9 +7176,32 @@ def _shell_c_argument(tokens: list[str]) -> str | None:
     return None
 
 
-def _strip_assignment_tokens(tokens: list[str]) -> list[str]:
+def _strip_env_assignment_tokens(tokens: list[str]) -> list[str]:
+    """Strip argv assignments accepted by env, whose names need not be shell identifiers."""
+
     index = 0
-    while index < len(tokens) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[index]):
+    while index < len(tokens):
+        token = tokens[index]
+        if _is_unquoted_shell_separator(token) or "=" not in token:
+            break
+        index += 1
+    return tokens[index:]
+
+
+def _strip_assignment_tokens(
+    tokens: list[str],
+    *,
+    allow_quoted: bool = False,
+) -> list[str]:
+    index = 0
+    while (
+        index < len(tokens)
+        and (
+            allow_quoted
+            or not getattr(tokens[index], "assignment_prefix_was_quoted", False)
+        )
+        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[index])
+    ):
         index += 1
     return tokens[index:]
 
@@ -6674,7 +7210,7 @@ def _command_token_segments(command: str) -> list[list[str]]:
     segments: list[list[str]] = []
     current: list[str] = []
     for token in _shell_tokens(command):
-        if token in {"&&", "||", ";", "&"}:
+        if token in {"&&", "||", ";", "&"} and not getattr(token, "was_quoted", False):
             if current:
                 segments.append(current)
                 current = []
@@ -6689,7 +7225,7 @@ def _command_execution_segments(command: str) -> list[list[str]]:
     segments: list[list[str]] = []
     current: list[str] = []
     for token in _shell_tokens(command):
-        if token in SHELL_SEPARATORS:
+        if _is_unquoted_shell_separator(token):
             if current:
                 segments.append(current)
                 current = []
@@ -6730,7 +7266,7 @@ def _git_subcommand_tokens(tokens: list[str]) -> list[str]:
     index = 1
     while index < len(tokens):
         token = tokens[index]
-        if token in SHELL_SEPARATORS:
+        if _is_unquoted_shell_separator(token):
             return []
         if token == "--":
             return tokens[index + 1 :]
@@ -6765,7 +7301,7 @@ def _skip_option_tokens(
     index = 0
     while index < len(tokens):
         token = tokens[index]
-        if token in SHELL_SEPARATORS:
+        if _is_unquoted_shell_separator(token):
             return []
         if not token.startswith("-"):
             break
@@ -6797,46 +7333,107 @@ def _split_shell_punctuation_token(token: str) -> list[str]:
     return separators
 
 
-def _merge_shell_redirection_tokens(tokens: list[str]) -> list[str]:
+def _is_unquoted_shell_separator(token: str) -> bool:
+    return token in SHELL_SEPARATORS and not getattr(token, "was_quoted", False)
+
+
+def _merge_shell_redirection_tokens(
+    tokens: list[str],
+    *,
+    numeric_boundary_marker: str,
+) -> list[str]:
+    """Rejoin fd prefixes and duplication split by punctuation-aware shlex."""
+
     merged: list[str] = []
     index = 0
     while index < len(tokens):
+        token = tokens[index]
+        clean_token = token.replace(numeric_boundary_marker, "")
+        numeric_was_separated = numeric_boundary_marker in token
         if (
-            index + 2 < len(tokens)
-            and tokens[index] in {">", ">>"}
-            and tokens[index + 1] == "&"
-            and tokens[index + 2] not in SHELL_SEPARATORS
-            and not re.fullmatch(r"(?:\d+|-)", tokens[index + 2])
-        ):
-            combined_redirect = "&>" if tokens[index] == ">" else "&>>"
-            merged.append(combined_redirect + tokens[index + 2])
-            index += 3
-            continue
-        if (
-            index + 2 < len(tokens)
-            and tokens[index].endswith((">", "<"))
-            and tokens[index + 1] == "&"
-            and re.fullmatch(r"(?:\d+|-)", tokens[index + 2])
-        ):
-            merged.append(tokens[index] + "&" + tokens[index + 2])
-            index += 3
-            continue
-        if (
-            tokens[index] == "&"
+            clean_token.isdigit()
+            and not numeric_was_separated
             and index + 1 < len(tokens)
-            and (tokens[index + 1] == ">" or tokens[index + 1].startswith(">"))
+            and tokens[index + 1] in {">", ">>", ">|", "<", "<>"}
         ):
-            merged.append("&" + tokens[index + 1])
+            merged.append(clean_token + tokens[index + 1])
             index += 2
             continue
-        merged.append(tokens[index])
+        if (
+            clean_token.isdigit()
+            and not numeric_was_separated
+            and index + 2 < len(tokens)
+            and tokens[index + 1] in {">&", "<&"}
+            and not _is_unquoted_shell_separator(tokens[index + 2])
+        ):
+            merged.append(clean_token + tokens[index + 1] + tokens[index + 2])
+            index += 3
+            continue
+        if (
+            token in {">&", "<&"}
+            and index + 1 < len(tokens)
+            and not _is_unquoted_shell_separator(tokens[index + 1])
+        ):
+            target = tokens[index + 1]
+            if token == ">&" and not re.fullmatch(r"(?:\d+|-)", target):
+                merged.append("&>" + target)
+            else:
+                merged.append(token + target)
+            index += 2
+            continue
+        merged.append(token)
         index += 1
     return merged
 
 
+def _mark_quoted_shell_tokens(command: str) -> tuple[str, str, str]:
+    """Mark quoted, escaped, and separated numeric shell syntax."""
+
+    quote_marker = "\0"
+    numeric_boundary_marker = "\x01"
+    marked: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for index, character in enumerate(command):
+        if escaped:
+            if quote is None and character not in "\r\n":
+                slash = marked.pop()
+                marked.extend((quote_marker, slash, character, quote_marker))
+            else:
+                marked.append(character)
+            escaped = False
+            continue
+        if character == "\\" and quote != "'":
+            marked.append(character)
+            escaped = True
+            continue
+        if quote is not None:
+            if character == quote:
+                marked.extend((quote_marker, character))
+                quote = None
+            else:
+                marked.append(character)
+            continue
+        if character in {"'", '"'}:
+            marked.extend((character, quote_marker))
+            quote = character
+            continue
+        if character.isspace():
+            prefix = command[:index]
+            suffix = command[index:].lstrip()
+            if (
+                re.search(r"(?:^|[\s;&|(){}<>])\d+$", prefix)
+                and suffix.startswith(("<", ">"))
+            ):
+                marked.append(numeric_boundary_marker)
+        marked.append(character)
+    return "".join(marked), quote_marker, numeric_boundary_marker
+
+
 def _shell_tokens(command: str) -> list[str]:
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars="();&|{}")
+        marked_command, quote_marker, numeric_boundary_marker = _mark_quoted_shell_tokens(command)
+        lexer = shlex.shlex(marked_command, posix=True, punctuation_chars="();&|{}<>")
         lexer.whitespace_split = True
         tokens: list[str] = []
         for token in lexer:
@@ -6844,7 +7441,37 @@ def _shell_tokens(command: str) -> list[str]:
                 tokens.extend(_split_shell_punctuation_token(token))
             else:
                 tokens.append(token)
-        return _merge_shell_redirection_tokens(tokens)
+        annotated: list[str] = []
+        for token in _merge_shell_redirection_tokens(
+            tokens,
+            numeric_boundary_marker=numeric_boundary_marker,
+        ):
+            operator_positions = [
+                position for position in (token.find("<"), token.find(">")) if position >= 0
+            ]
+            operator_position = min(operator_positions, default=-1)
+            assignment_position = token.find("=")
+            quote_positions = [
+                position
+                for position, character in enumerate(token)
+                if character == quote_marker
+            ]
+            annotated.append(
+                _ShellToken(
+                    token.replace(quote_marker, "").replace(numeric_boundary_marker, ""),
+                    redirection_operator_was_quoted=bool(
+                        operator_position >= 0
+                        and sum(position <= operator_position for position in quote_positions) % 2
+                    ),
+                    assignment_prefix_was_quoted=bool(
+                        assignment_position >= 0
+                        and any(position <= assignment_position for position in quote_positions)
+                    ),
+                    numeric_redirection_was_separated=numeric_boundary_marker in token,
+                    was_quoted=bool(quote_positions),
+                )
+            )
+        return annotated
     except ValueError:
         return command.split()
 
