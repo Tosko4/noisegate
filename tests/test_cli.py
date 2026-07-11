@@ -479,6 +479,87 @@ def test_reduce_json_prefers_existing_args_command_alias_over_top_level_command(
     assert json.loads(proc.stdout) == payload
 
 
+def test_reduce_json_protected_top_level_command_wins_over_stale_args_command() -> None:
+    exact = source_like_payload()
+    payload = {
+        "tool_name": "terminal",
+        "args": {"command": "pytest -q"},
+        "command": "cat src/source_fixture.py",
+        "result": json.dumps({"stdout": exact, "exit_code": 0}),
+        "noisegate": {"max_chars": 200, "max_lines": 20},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == payload
+
+
+def test_reduce_json_uses_nested_or_outer_exit_code_when_ranking_commands() -> None:
+    exact = "\n".join(
+        [
+            "diff --git a/app.py b/app.py",
+            "--- a/app.py",
+            "+++ b/app.py",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new",
+            *[f"+exact diff line {index:03d}" for index in range(180)],
+        ]
+    )
+    nested = {
+        "stdout": exact,
+        "stderr": "cat: missing: No such file or directory",
+    }
+    payloads = (
+        {
+            "tool_name": "terminal",
+            "args": {"command": "pytest -q && cat README"},
+            "command": "cat patches/change.diff missing",
+            "result": json.dumps({**nested, "exit_code": 1}),
+            "noisegate": {"max_chars": 200, "max_lines": 20, "preserve_diffs": False},
+        },
+        {
+            "tool_name": "terminal",
+            "args": {"command": "pytest -q && cat README"},
+            "command": "cat patches/change.diff missing",
+            "exit_code": 1,
+            "result": json.dumps(nested),
+            "noisegate": {"max_chars": 200, "max_lines": 20, "preserve_diffs": False},
+        },
+    )
+
+    for payload in payloads:
+        proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(proc.stdout) == payload
+
+
+def test_reduce_json_decodes_nested_result_for_output_assisted_command_selection() -> None:
+    search_output = "\n".join(
+        f"tests/test_{index}.py::test_function_{index} PASSED" for index in range(180)
+    )
+    nested_results = (
+        json.dumps(search_output),
+        json.dumps({"output": search_output, "exit_code": 0}),
+    )
+
+    for nested_result in nested_results:
+        payload = {
+            "tool_name": "terminal",
+            "args": {"command": "pytest -q"},
+            "command": 'rg "$(printf target)" src',
+            "result": nested_result,
+            "noisegate": {"max_chars": 200, "max_lines": 20},
+        }
+
+        proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(proc.stdout) == payload, nested_result[:80]
+
+
 def test_reduce_json_plain_result_uses_existing_args_command_alias() -> None:
     exact = source_like_payload()
     payload = {
