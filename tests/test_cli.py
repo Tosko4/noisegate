@@ -252,6 +252,38 @@ def test_reduce_json_plain_result_string_prefers_actionable_exit_hint() -> None:
         assert expected_notice in outer["result"]
 
 
+def test_reduce_json_nested_and_direct_results_prefer_actionable_exit_hint() -> None:
+    hint_cases = (
+        ({"status": "failed", "exit_code": 0}, "[noisegate: exit_code=1]"),
+        ({"exit_code": 0, "returncode": 7}, "[noisegate: exit_code=7]"),
+    )
+
+    for exit_hints, expected_notice in hint_cases:
+        nested = {**exit_hints, "output": numbered("nested", 100)}
+        payloads = (
+            {"tool_name": "process", "result": nested, "noisegate": {"max_chars": 120}},
+            {
+                "tool_name": "process",
+                "result": json.dumps(nested),
+                "noisegate": {"max_chars": 120},
+            },
+            {
+                "tool_name": "process",
+                **exit_hints,
+                "output": numbered("direct", 100),
+                "noisegate": {"max_chars": 120},
+            },
+        )
+
+        for payload in payloads:
+            proc = run_cli("reduce-json", input_text=json.dumps(payload))
+
+            assert proc.returncode == 0, proc.stderr
+            output = proc.stdout
+            assert "[noisegate: omitted" in output
+            assert expected_notice in output
+
+
 def test_reduce_json_plain_result_string_with_bool_exit_stays_exact() -> None:
     envelope = {
         "returncode": False,
@@ -1288,6 +1320,42 @@ def test_reduce_json_no_gain_artifact_request_has_no_side_effect(
 
         assert proc.returncode == 0, proc.stderr
         assert proc.stdout == raw
+        assert not artifact_dir.exists()
+
+
+def test_reduce_json_multi_artifact_envelopes_stay_inline_only(tmp_path: Path) -> None:
+    cases = {
+        "multi-field": {
+            "tool_name": "terminal",
+            "command": "make noisy",
+            "stdout": numbered("stdout", 600),
+            "stderr": numbered("stderr", 600),
+            "noisegate": {"max_chars": 500},
+        },
+        "mixed": {
+            "tool_name": "terminal",
+            "command": "make noisy",
+            "stdout": numbered("outer", 600),
+            "result": json.dumps({"stdout": numbered("inner", 600)}),
+            "noisegate": {"max_chars": 500},
+        },
+    }
+
+    for name, payload in cases.items():
+        artifact_dir = tmp_path / name / "artifacts"
+        raw = json.dumps(payload, separators=(",", ":"))
+        proc = run_cli(
+            "reduce-json",
+            "--store-artifact",
+            "--artifact-dir",
+            str(artifact_dir),
+            input_text=raw,
+        )
+
+        assert proc.returncode == 0, proc.stderr
+        assert len(proc.stdout) < len(raw)
+        assert "[noisegate: omitted" in proc.stdout
+        assert "[noisegate artifact:" not in proc.stdout
         assert not artifact_dir.exists()
 
 

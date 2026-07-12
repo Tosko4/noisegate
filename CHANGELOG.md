@@ -21,7 +21,7 @@ All notable changes to Noisegate are documented here. Release notes are generate
 - Preserve source-like exact output for direct terminal file-display commands, V4A patches, and `reduce-json` command aliases even when the content resembles noisy failures.
 - Preserve uv dependency-resolution failures that occur before `uv run pytest` starts instead of routing them through the pytest reducer.
 - Preserve exact file output from attached `fd` / `fdfind` `--exec=cat` and `--exec-batch=cat` forms without protecting non-read consumers or swallowing diagnostics from later compactable commands.
-- Harden `reduce-json` host-adapter handling for mixed direct/envelope terminal payloads, metadata key collisions, command aliases, actionable exit-hint precedence, positional terminal-hook calls, and side-effect-free envelope no-gain decisions.
+- Harden `reduce-json` host-adapter handling for mixed direct/envelope terminal payloads, metadata key collisions, command aliases, actionable exit-hint precedence, positional terminal-hook calls, side-effect-free envelope no-gain decisions, and conservative inline-only handling when one envelope would require multiple raw artifacts.
 
 ## [0.1.2] - 2026-07-07
 

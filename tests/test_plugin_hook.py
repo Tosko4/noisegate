@@ -698,6 +698,52 @@ def test_transform_tool_result_artifact_notice_does_not_duplicate_exit_code(tmp_
     assert "[noisegate artifact: id=ng_" in stdout
 
 
+def test_transform_tool_result_multi_field_artifacts_stay_inline_only(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    raw = json.dumps(
+        {
+            "command": "make noisy",
+            "stdout": numbered("stdout", 600),
+            "stderr": numbered("stderr", 600),
+        }
+    )
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        noisegate_max_chars=500,
+        noisegate_artifacts=True,
+        noisegate_artifact_dir=str(artifact_dir),
+    )
+
+    payload = parse_hook_result(transformed)
+    assert "[noisegate: omitted" in json.dumps(payload)
+    assert "[noisegate artifact:" not in json.dumps(payload)
+    assert not artifact_dir.exists()
+
+
+def test_transform_tool_result_ignores_internal_preview_keyword(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    raw = terminal_result(numbered("line", 1000), command="pytest")
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        noisegate_max_chars=1000,
+        noisegate_artifacts=True,
+        noisegate_artifact_dir=str(artifact_dir),
+        noisegate_defer_artifact_store=True,
+    )
+
+    payload = parse_hook_result(transformed)
+    stdout = payload["stdout"]
+    assert isinstance(stdout, str)
+    assert "[noisegate artifact: id=ng_" in stdout
+    artifact_files = list(artifact_dir.glob("ng_*.txt"))
+    assert len(artifact_files) == 1
+    assert artifact_files[0].stem in stdout
+
+
 def test_transform_tool_result_rebuilds_artifact_notice_after_store_failure(tmp_path: Path) -> None:
     raw = terminal_result(numbered("line", 1000), command="pytest")
     artifact_file = tmp_path / "not-a-dir"

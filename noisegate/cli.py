@@ -6,15 +6,27 @@ import json
 import os
 import shlex
 import sys
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, cast
 
 from ._version import __version__
 from .artifacts import ArtifactError, ArtifactStore
-from .engine import NoisegateOptions, _is_compactable_tool_name, env_diagnostics, reduce_text
+from .engine import (
+    NoisegateOptions,
+    _is_compactable_tool_name,
+    _preview_reduce_text,
+    env_diagnostics,
+    reduce_text,
+)
 from .installer import DEFAULT_PACKAGE_SPEC, InstallHermesError, install_hermes
-from .plugin import _extract_exit_code, _select_command, transform_tool_result
+from .plugin import (
+    _extract_exit_code,
+    _preview_tool_result,
+    _select_command,
+    transform_tool_result,
+)
 from .wrap import DEFAULT_MAX_CAPTURE_BYTES, WrappedCommandInterrupted, run_wrapped_command
 
 
@@ -153,7 +165,19 @@ def cmd_reduce_json(args: argparse.Namespace) -> int:
                 output = raw
                 metadata = preview_metadata
             else:
-                output = _reduce_json_value(parsed, raw, options, metadata_out=metadata)
+                planned_artifacts = _count_planned_artifacts(preview)
+                if planned_artifacts == 1:
+                    output = _reduce_json_value(parsed, raw, options, metadata_out=metadata)
+                elif planned_artifacts > 1:
+                    output = _reduce_json_value(
+                        parsed,
+                        raw,
+                        options.with_mapping({"artifacts": False}),
+                        metadata_out=metadata,
+                    )
+                else:
+                    output = preview
+                    metadata = preview_metadata
         else:
             output = _reduce_json_value(parsed, raw, options, metadata_out=metadata)
     except Exception:
@@ -320,6 +344,29 @@ def cmd_artifacts_verify(args: argparse.Namespace) -> int:
     return 2 if failed else 0
 
 
+def _count_planned_artifacts(serialized: str) -> int:
+    def visit(value: Any) -> int:
+        if isinstance(value, dict):
+            count = 0
+            artifact = value.get("artifact")
+            if isinstance(artifact, dict) and artifact.get("stored") is True:
+                count += 1
+            return count + sum(visit(child) for child in value.values())
+        if isinstance(value, list):
+            return sum(visit(child) for child in value)
+        if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+            try:
+                return visit(json.loads(value))
+            except json.JSONDecodeError:
+                return 0
+        return 0
+
+    try:
+        return visit(json.loads(serialized))
+    except json.JSONDecodeError:
+        return 0
+
+
 def _reduce_json_value(
     parsed: Any,
     raw: str,
@@ -329,8 +376,7 @@ def _reduce_json_value(
     defer_artifact_store: bool = False,
 ) -> str:
     hook_kwargs = _options_to_hook_kwargs(options)
-    if defer_artifact_store:
-        hook_kwargs["noisegate_defer_artifact_store"] = True
+    tool_transform = _preview_tool_result if defer_artifact_store else transform_tool_result
     call_args: dict[str, Any] = _envelope_call_args(parsed) if isinstance(parsed, dict) else {}
     if isinstance(parsed, dict) and "result" in parsed:
         explicit_tool_name = _envelope_tool_name(parsed)
@@ -355,7 +401,7 @@ def _reduce_json_value(
             )
             if selected_command:
                 result_call_args = {**result_call_args, "command": selected_command}
-            transformed = transform_tool_result(
+            transformed = tool_transform(
                 result_input,
                 tool_name=nested_transform_tool_name,
                 args=result_call_args,
@@ -373,14 +419,14 @@ def _reduce_json_value(
                 and not _is_json_text(result_value)
             ):
                 command = selected_command or _envelope_command(call_args)
-                reduced = reduce_text(
+                reducer = _preview_reduce_text if defer_artifact_store else reduce_text
+                reduced = reducer(
                     result_value,
                     command=command,
                     tool_name=tool_name,
                     source="reduce-json",
                     exit_code=result_exit_code,
                     options=options,
-                    defer_artifact_store=defer_artifact_store,
                 )
                 if metadata_out is not None:
                     metadata_out.update(
@@ -398,7 +444,7 @@ def _reduce_json_value(
             )
             if selected_command:
                 result_call_args = {**result_call_args, "command": selected_command}
-            transformed = transform_tool_result(
+            transformed = tool_transform(
                 nested_input,
                 tool_name=nested_transform_tool_name,
                 args=result_call_args,
@@ -426,6 +472,7 @@ def _reduce_json_value(
                     tool_name=tool_name,
                     call_args=call_args,
                     hook_kwargs=hook_kwargs,
+                    tool_transform=tool_transform,
                 )
                 if direct_transformed is not None and len(direct_transformed) < len(raw):
                     return direct_transformed
@@ -442,9 +489,10 @@ def _reduce_json_value(
             tool_name=tool_name,
             call_args=call_args,
             hook_kwargs=hook_kwargs,
+            tool_transform=tool_transform,
         )
     else:
-        transformed = transform_tool_result(
+        transformed = tool_transform(
             raw,
             tool_name=tool_name,
             args=call_args,
@@ -459,6 +507,7 @@ def _transform_direct_payload_preserving_json_result(
     tool_name: str,
     call_args: dict[str, Any],
     hook_kwargs: dict[str, object],
+    tool_transform: Callable[..., str | None],
 ) -> str | None:
     result_value = payload.get("result")
     if isinstance(result_value, str) and _is_json_text(result_value):
@@ -467,7 +516,7 @@ def _transform_direct_payload_preserving_json_result(
         if not _has_direct_text_payload(direct_payload):
             return None
         direct_raw = json.dumps(direct_payload, ensure_ascii=False, separators=(",", ":"))
-        transformed = transform_tool_result(
+        transformed = tool_transform(
             direct_raw,
             tool_name=tool_name,
             args=call_args,
@@ -485,7 +534,7 @@ def _transform_direct_payload_preserving_json_result(
         return json.dumps(transformed_payload, ensure_ascii=False, separators=(",", ":"))
 
     direct_raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    return transform_tool_result(
+    return tool_transform(
         direct_raw,
         tool_name=tool_name,
         args=call_args,

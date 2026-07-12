@@ -349,7 +349,6 @@ def reduce_text(
     source: str | None = None,
     exit_code: int | None = None,
     options: NoisegateOptions | None = None,
-    defer_artifact_store: bool = False,
 ) -> ReducedOutput:
     try:
         return _reduce_text(
@@ -359,7 +358,29 @@ def reduce_text(
             source=source,
             exit_code=exit_code,
             options=options,
-            defer_artifact_store=defer_artifact_store,
+        )
+    except Exception as exc:
+        return _unchanged(text, "error", "generic", reason=f"fail_open:{type(exc).__name__}")
+
+
+def _preview_reduce_text(
+    text: str,
+    *,
+    command: str | None = None,
+    tool_name: str | None = None,
+    source: str | None = None,
+    exit_code: int | None = None,
+    options: NoisegateOptions | None = None,
+) -> ReducedOutput:
+    try:
+        return _reduce_text(
+            text,
+            command=command,
+            tool_name=tool_name,
+            source=source,
+            exit_code=exit_code,
+            options=options,
+            defer_artifact_store=True,
         )
     except Exception as exc:
         return _unchanged(text, "error", "generic", reason=f"fail_open:{type(exc).__name__}")

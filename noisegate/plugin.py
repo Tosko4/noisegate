@@ -67,8 +67,44 @@ def transform_tool_result(
     arguments: Mapping[str, Any] | None = None,
     **kwargs: Any,
 ) -> str | None:
+    return _transform_tool_result(
+        result,
+        tool_name=tool_name,
+        args=args,
+        arguments=arguments,
+        defer_artifact_store=False,
+        **kwargs,
+    )
+
+
+def _preview_tool_result(
+    result: str = "",
+    *,
+    tool_name: str = "",
+    args: Mapping[str, Any] | None = None,
+    arguments: Mapping[str, Any] | None = None,
+    **kwargs: Any,
+) -> str | None:
+    return _transform_tool_result(
+        result,
+        tool_name=tool_name,
+        args=args,
+        arguments=arguments,
+        defer_artifact_store=True,
+        **kwargs,
+    )
+
+
+def _transform_tool_result(
+    result: str,
+    *,
+    tool_name: str,
+    args: Mapping[str, Any] | None,
+    arguments: Mapping[str, Any] | None,
+    defer_artifact_store: bool,
+    **kwargs: Any,
+) -> str | None:
     try:
-        defer_artifact_store = bool(kwargs.pop("noisegate_defer_artifact_store", False))
         override = kwargs.pop("noisegate_exit_code", None)
         exit_code_override = (
             override if isinstance(override, int) and not isinstance(override, bool) else None
@@ -167,6 +203,10 @@ def transform_tool_result(
         if exit_code is None:
             exit_code = exit_code_override
         fields = _candidate_fields(tool_name, payload)
+        if options.artifact_enabled and sum(
+            isinstance(payload.get(field), str) and bool(payload.get(field)) for field in fields
+        ) > 1:
+            options = replace(options, artifact_enabled=False)
         command_text = "\n".join(
             value
             for field in fields
@@ -530,11 +570,15 @@ def _extract_command(payload: Mapping[str, JsonValue], args: Mapping[str, Any]) 
 
 
 def _extract_exit_code(payload: Mapping[str, JsonValue], tool_name: str) -> int | None:
+    numeric_values: list[int] = []
     for key in ("exit", "exit_code", "returncode", "return_code"):
         value = payload.get(key)
         if isinstance(value, bool):
             continue
         if isinstance(value, int):
+            numeric_values.append(value)
+    for value in numeric_values:
+        if value != 0:
             return value
     status = payload.get("status")
     if (
@@ -543,4 +587,4 @@ def _extract_exit_code(payload: Mapping[str, JsonValue], tool_name: str) -> int 
         and status.lower() in {"failed", "failure", "error", "errored"}
     ):
         return 1
-    return None
+    return numeric_values[0] if numeric_values else None
