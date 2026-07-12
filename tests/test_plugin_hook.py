@@ -733,6 +733,7 @@ def test_transform_tool_result_ignores_internal_preview_keyword(tmp_path: Path) 
         noisegate_artifacts=True,
         noisegate_artifact_dir=str(artifact_dir),
         noisegate_defer_artifact_store=True,
+        defer_artifact_store=True,
     )
 
     payload = parse_hook_result(transformed)
@@ -1187,6 +1188,35 @@ def test_transform_terminal_output_accepts_hermes_returncode_kwarg() -> None:
 
     assert isinstance(transformed, str)
     assert "[noisegate: exit_code=7]" in transformed
+
+
+def test_transform_terminal_output_ignores_boolean_exit_hints() -> None:
+    calls = (
+        lambda: transform_terminal_output(
+            command="docker build .",
+            output=numbered("layer", 100),
+            returncode=True,
+            noisegate_max_chars=120,
+        ),
+        lambda: transform_terminal_output(
+            command="docker build .",
+            output=numbered("layer", 100),
+            exit_code=True,
+            noisegate_max_chars=120,
+        ),
+        lambda: transform_terminal_output(
+            "docker build .",
+            numbered("layer", 100),
+            True,
+            noisegate_max_chars=120,
+        ),
+    )
+
+    for call in calls:
+        transformed = call()
+        assert isinstance(transformed, str)
+        assert "[noisegate: omitted" in transformed
+        assert "[noisegate: exit_code=" not in transformed
 
 
 def test_transform_terminal_output_accepts_positional_host_call() -> None:

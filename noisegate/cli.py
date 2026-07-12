@@ -139,7 +139,7 @@ def cmd_reduce_json(args: argparse.Namespace) -> int:
     raw = sys.stdin.read()
     try:
         parsed = json.loads(raw)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError, ValueError):
         sys.stdout.write(raw)
         _maybe_print_metadata(
             args,
@@ -165,7 +165,9 @@ def cmd_reduce_json(args: argparse.Namespace) -> int:
                 output = raw
                 metadata = preview_metadata
             else:
-                planned_artifacts = _count_planned_artifacts(preview)
+                planned_artifacts = _count_planned_artifacts(preview) + _count_artifact_plans(
+                    preview_metadata
+                )
                 if planned_artifacts == 1:
                     output = _reduce_json_value(parsed, raw, options, metadata_out=metadata)
                 elif planned_artifacts > 1:
@@ -344,26 +346,27 @@ def cmd_artifacts_verify(args: argparse.Namespace) -> int:
     return 2 if failed else 0
 
 
-def _count_planned_artifacts(serialized: str) -> int:
-    def visit(value: Any) -> int:
-        if isinstance(value, dict):
-            count = 0
-            artifact = value.get("artifact")
-            if isinstance(artifact, dict) and artifact.get("stored") is True:
-                count += 1
-            return count + sum(visit(child) for child in value.values())
-        if isinstance(value, list):
-            return sum(visit(child) for child in value)
-        if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
-            try:
-                return visit(json.loads(value))
-            except json.JSONDecodeError:
-                return 0
-        return 0
+def _count_artifact_plans(value: Any) -> int:
+    if isinstance(value, dict):
+        count = 0
+        artifact = value.get("artifact")
+        if isinstance(artifact, dict) and artifact.get("stored") is True:
+            count += 1
+        return count + sum(_count_artifact_plans(child) for child in value.values())
+    if isinstance(value, list):
+        return sum(_count_artifact_plans(child) for child in value)
+    if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+        try:
+            return _count_artifact_plans(json.loads(value))
+        except (json.JSONDecodeError, RecursionError, ValueError):
+            return 0
+    return 0
 
+
+def _count_planned_artifacts(serialized: str) -> int:
     try:
-        return visit(json.loads(serialized))
-    except json.JSONDecodeError:
+        return _count_artifact_plans(json.loads(serialized))
+    except (json.JSONDecodeError, RecursionError, ValueError):
         return 0
 
 

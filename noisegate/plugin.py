@@ -67,6 +67,7 @@ def transform_tool_result(
     arguments: Mapping[str, Any] | None = None,
     **kwargs: Any,
 ) -> str | None:
+    kwargs.pop("defer_artifact_store", None)
     return _transform_tool_result(
         result,
         tool_name=tool_name,
@@ -370,12 +371,19 @@ def transform_terminal_output(
         # the returned string afterwards, but raw artifact storage would persist
         # pre-redaction output. Keep artifacts disabled for this early hook.
         options = replace(options, artifact_enabled=False)
+        selected_exit_code = (
+            returncode
+            if isinstance(returncode, int) and not isinstance(returncode, bool)
+            else exit_code
+            if isinstance(exit_code, int) and not isinstance(exit_code, bool)
+            else None
+        )
         reduced = reduce_text(
             output,
             command=command,
             tool_name="terminal",
             source="terminal_output",
-            exit_code=returncode if returncode is not None else exit_code,
+            exit_code=selected_exit_code,
             options=options,
         )
         return reduced.text if reduced.changed else None

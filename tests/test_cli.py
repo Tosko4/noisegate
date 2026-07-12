@@ -938,6 +938,19 @@ def test_reduce_json_bad_input_fails_open() -> None:
     assert proc.stdout == raw
 
 
+def test_reduce_json_pathological_json_fails_open() -> None:
+    cases = (
+        "[" * 2000 + "]" * 2000,
+        "1" * 5000,
+    )
+
+    for raw in cases:
+        proc = run_cli("reduce-json", input_text=raw)
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == raw
+
+
 def test_reduce_json_metadata_reports_bad_input_reason() -> None:
     raw = "{not json"
 
@@ -1454,6 +1467,58 @@ def test_install_hermes_cli_reports_missing_hermes_on_path(tmp_path: Path) -> No
 
     assert proc.returncode == 2
     assert "Hermes executable not found on PATH: hermes" in proc.stderr
+
+
+def test_reduce_json_plain_result_artifact_id_resolves(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    raw_result = numbered("plain", 200)
+    payload = {
+        "tool_name": "terminal",
+        "command": "pytest",
+        "returncode": 1,
+        "result": raw_result,
+        "noisegate": {"max_chars": 300},
+    }
+
+    proc = run_cli(
+        "reduce-json",
+        "--store-artifact",
+        "--artifact-dir",
+        str(artifact_dir),
+        input_text=json.dumps(payload),
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    output = json.loads(proc.stdout)["result"]
+    artifact_files = list(artifact_dir.glob("ng_*.txt"))
+    assert len(artifact_files) == 1
+    assert artifact_files[0].stem in output
+    assert artifact_files[0].read_text(encoding="utf-8") == raw_result
+
+
+def test_reduce_json_plain_result_store_failure_delivers_no_id(tmp_path: Path) -> None:
+    artifact_file = tmp_path / "not-a-dir"
+    artifact_file.write_text("x", encoding="utf-8")
+    payload = {
+        "tool_name": "terminal",
+        "command": "pytest",
+        "returncode": 1,
+        "result": numbered("plain", 200),
+        "noisegate": {"max_chars": 300},
+    }
+
+    proc = run_cli(
+        "reduce-json",
+        "--store-artifact",
+        "--artifact-dir",
+        str(artifact_file),
+        input_text=json.dumps(payload),
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    output = json.loads(proc.stdout)["result"]
+    assert "id=ng_" not in output
+    assert "reason=artifact_error" in output
 
 
 def test_cat_cli_reads_artifact(tmp_path: Path) -> None:
