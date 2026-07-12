@@ -231,6 +231,27 @@ def test_reduce_json_plain_result_string_with_numeric_exit_is_terminal_like() ->
     assert "line 100" in outer["result"]
 
 
+def test_reduce_json_plain_result_string_prefers_actionable_exit_hint() -> None:
+    cases = (
+        ({"status": "failed", "exit_code": 0}, "[noisegate: exit_code=1]"),
+        ({"exit_code": 0, "returncode": 7}, "[noisegate: exit_code=7]"),
+    )
+
+    for exit_hints, expected_notice in cases:
+        envelope = {
+            **exit_hints,
+            "result": numbered("line", 100),
+            "noisegate": {"max_chars": 120},
+        }
+
+        proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+        assert proc.returncode == 0, proc.stderr
+        outer = json.loads(proc.stdout)
+        assert "[noisegate: omitted" in outer["result"]
+        assert expected_notice in outer["result"]
+
+
 def test_reduce_json_plain_result_string_with_bool_exit_stays_exact() -> None:
     envelope = {
         "returncode": False,
@@ -1235,6 +1256,39 @@ def test_reduce_json_preserves_valid_json_envelope_when_inner_rewrite_has_no_gai
 
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout) == payload
+
+
+def test_reduce_json_no_gain_artifact_request_has_no_side_effect(
+    tmp_path: Path,
+) -> None:
+    cases = {
+        "plain": {"returncode": 0, "result": "A" * 4001, "context": ""},
+        "nested": {
+            "tool_name": "terminal",
+            "result": json.dumps({"stdout": "A" * 4010}),
+        },
+        "mixed": {
+            "tool_name": "terminal",
+            "command": "pytest",
+            "stdout": "B" * 4010,
+            "result": json.dumps({"stdout": "A" * 4010}),
+        },
+    }
+
+    for name, payload in cases.items():
+        artifact_dir = tmp_path / name / "artifacts"
+        raw = json.dumps(payload, separators=(",", ":"))
+        proc = run_cli(
+            "reduce-json",
+            "--store-artifact",
+            "--artifact-dir",
+            str(artifact_dir),
+            input_text=raw,
+        )
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == raw
+        assert not artifact_dir.exists()
 
 
 def test_reduce_json_returns_raw_envelope_when_disabled() -> None:

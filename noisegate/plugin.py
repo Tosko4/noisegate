@@ -68,6 +68,7 @@ def transform_tool_result(
     **kwargs: Any,
 ) -> str | None:
     try:
+        defer_artifact_store = bool(kwargs.pop("noisegate_defer_artifact_store", False))
         override = kwargs.pop("noisegate_exit_code", None)
         exit_code_override = (
             override if isinstance(override, int) and not isinstance(override, bool) else None
@@ -144,7 +145,7 @@ def transform_tool_result(
             candidate = json.dumps(text, ensure_ascii=False)
             if len(candidate) >= len(result):
                 return None
-            if options.artifact_enabled:
+            if options.artifact_enabled and not defer_artifact_store:
                 artifact = metadata.get("artifact")
                 if isinstance(artifact, dict) and artifact.get("stored") is True:
                     metadata["artifact"] = _store_artifact(parsed, options)
@@ -242,7 +243,7 @@ def transform_tool_result(
         if len(candidate) >= len(result):
             return None
 
-        if options.artifact_enabled:
+        if options.artifact_enabled and not defer_artifact_store:
             for field, value in original_values.items():
                 metadata = field_metadata.get(field)
                 reduced_text = reduced_values.get(field)

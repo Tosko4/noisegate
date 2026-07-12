@@ -138,10 +138,24 @@ def cmd_reduce_json(args: argparse.Namespace) -> int:
     options = _options_from_args(args)
     if isinstance(parsed, dict) and isinstance(parsed.get("noisegate"), dict):
         options = options.with_mapping(parsed["noisegate"])
-
     metadata: dict[str, Any] = {}
     try:
-        output = _reduce_json_value(parsed, raw, options, metadata_out=metadata)
+        if options.artifact_enabled:
+            preview_metadata: dict[str, Any] = {}
+            preview = _reduce_json_value(
+                parsed,
+                raw,
+                options,
+                metadata_out=preview_metadata,
+                defer_artifact_store=True,
+            )
+            if preview == raw:
+                output = raw
+                metadata = preview_metadata
+            else:
+                output = _reduce_json_value(parsed, raw, options, metadata_out=metadata)
+        else:
+            output = _reduce_json_value(parsed, raw, options, metadata_out=metadata)
     except Exception:
         output = raw
     sys.stdout.write(output)
@@ -312,8 +326,11 @@ def _reduce_json_value(
     options: NoisegateOptions,
     *,
     metadata_out: dict[str, Any] | None = None,
+    defer_artifact_store: bool = False,
 ) -> str:
     hook_kwargs = _options_to_hook_kwargs(options)
+    if defer_artifact_store:
+        hook_kwargs["noisegate_defer_artifact_store"] = True
     call_args: dict[str, Any] = _envelope_call_args(parsed) if isinstance(parsed, dict) else {}
     if isinstance(parsed, dict) and "result" in parsed:
         explicit_tool_name = _envelope_tool_name(parsed)
@@ -363,6 +380,7 @@ def _reduce_json_value(
                     source="reduce-json",
                     exit_code=result_exit_code,
                     options=options,
+                    defer_artifact_store=defer_artifact_store,
                 )
                 if metadata_out is not None:
                     metadata_out.update(
@@ -632,10 +650,23 @@ def _result_exit_code(
     nested = _result_mapping(result_value)
     if nested is not None:
         nested_tool_name = _envelope_tool_name(nested) or tool_name
-        exit_code = _extract_exit_code(nested, nested_tool_name)
+        exit_code = _preferred_exit_code(nested, nested_tool_name)
         if exit_code is not None:
             return exit_code
-    return _extract_exit_code(envelope, tool_name)
+    return _preferred_exit_code(envelope, tool_name)
+
+
+def _preferred_exit_code(payload: dict[Any, Any], tool_name: str) -> int | None:
+    keys = _envelope_exit_hint_keys(payload)
+    if not keys:
+        return None
+    key = keys[0]
+    if key == "status":
+        return 1
+    value = payload.get(key)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return _extract_exit_code(payload, tool_name)
 
 
 def _looks_terminal_result_payload(
