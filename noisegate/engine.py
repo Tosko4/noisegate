@@ -574,6 +574,8 @@ def classify_command(command: str | None, text: str, *, exit_code: int | None = 
             return substitution_class
     if any(_is_apt_command(variant) for variant in command_variants):
         return "apt"
+    if any(_is_uv_pytest_resolution_failure(variant, text_l) for variant in command_variants):
+        return "python_package"
     if any(_is_python_package_command(variant) for variant in command_variants):
         return "python_package"
     if (
@@ -917,6 +919,7 @@ PACKAGE_HIGH_SIGNAL_PRIORITY_PATTERNS = tuple(
     for group in (
         (
             r"resolutionimpossible",
+            r"no solution found|unsatisfiable|failed to resolve dependencies",
             r"because .*conflicts? with",
             r"no matching distribution found",
             r"unable to locate package",
@@ -1200,9 +1203,11 @@ def _line_budgeted_important_excerpt(
             for index in ranked_priority + fallback_priority
             if _failure_detail_rank(lines[index]) == best_rank
         ][:3]
-        has_concrete_exception = any(
+        has_concrete_failure = any(
             re.search(
-                r"\b[a-z0-9_]+error\b(?::|$)|^\s*(?:error|exception):\s*(?!.*\b(?:generic|transient|noise)\b)",
+                r"\b[a-z0-9_]+error\b(?::|$)|"
+                r"^\s*(?:error|exception):\s*(?!.*\b(?:generic|transient|noise)\b)|"
+                r"no solution found|unsatisfiable|failed to resolve dependencies",
                 lines[index],
                 re.IGNORECASE,
             )
@@ -1213,7 +1218,7 @@ def _line_budgeted_important_excerpt(
             re.search(failed_test_id_pattern, lines[index], re.IGNORECASE)
             for index in concrete_tight_priority
         )
-        if has_concrete_exception and (has_failed_test_id or len(best_ranked_priority) == 1):
+        if has_concrete_failure and (has_failed_test_id or best_ranked_priority):
             tight_indices = sorted(
                 concrete_tight_priority if has_failed_test_id else best_ranked_priority
             )
@@ -1234,6 +1239,14 @@ def _line_budgeted_important_excerpt(
                     and _line_count(contiguous_candidate) + 1 <= options.max_lines
                 ):
                     return contiguous_candidate
+            for index in tight_indices:
+                line = lines[index]
+                if (
+                    _fits_budget(line, options)
+                    and len(line) + exit_notice_reserve <= options.max_chars
+                    and options.max_lines >= 2
+                ):
+                    return line
     if len(multi_anchor_priority) > 1:
         for context in range(max_context, -1, -1):
             keep: set[int] = set()
@@ -2374,6 +2387,34 @@ def _is_pytest_command(command: str) -> bool:
         if python_module is not None and python_module[0] in {"pytest", "py.test"}:
             return True
     return False
+
+
+def _is_uv_pytest_resolution_failure(command: str, text: str) -> bool:
+    uv_pytest = False
+    for tokens in _command_segments_after_wrappers(command):
+        if not tokens or Path(tokens[0]).name != "uv":
+            continue
+        payload = _command_runner_payload(tokens)
+        if payload is not None and _is_pytest_command(shlex.join(payload)):
+            uv_pytest = True
+            break
+    if not uv_pytest:
+        return False
+    if re.search(
+        r"(?im)^={2,}.*(?:failures|errors|short test summary)|"
+        r"^(?:FAILED|ERROR)\s+\S+|^\S+::.*\b(?:PASSED|FAILED|ERROR)\b|"
+        r"^\s*\d+\s+(?:passed|failed|errors?)\b",
+        text,
+    ):
+        return False
+    return bool(
+        re.search(
+            r"^\s*(?:(?:\u00d7|error:)\s+)?(?:no solution found when resolving "
+            r"(?:tool )?dependencies|failed to resolve dependencies)\b",
+            text,
+            re.IGNORECASE | re.MULTILINE,
+        )
+    )
 
 
 def _command_substitutions(command: str) -> list[tuple[str, str]]:
@@ -5088,6 +5129,8 @@ def _compactable_class_for_tokens(
             return substitution_class
     if any(_is_apt_command(variant) for variant in command_variants):
         return "apt"
+    if any(_is_uv_pytest_resolution_failure(variant, text) for variant in command_variants):
+        return "python_package"
     if any(_is_python_package_command(variant) for variant in command_variants):
         return "python_package"
     if (
@@ -6395,6 +6438,8 @@ def _tokens_start_file_read(tokens: list[str]) -> bool:
     if not tokens:
         return False
     token_name = Path(tokens[0]).name
+    if token_name in {"fd", "fdfind"}:
+        return _fd_attached_exec_reads_files(tokens)
     if token_name == "git":
         return _looks_like_git_show_file_read_tokens(tokens)
     if token_name == "sed":
@@ -6402,6 +6447,20 @@ def _tokens_start_file_read(tokens: list[str]) -> bool:
     if token_name in {"jq", "yq"}:
         return _looks_like_jq_file_read_tokens(tokens)
     return token_name in SOURCE_READ_COMMANDS
+
+
+def _fd_attached_exec_reads_files(tokens: list[str]) -> bool:
+    consumers = []
+    for token in tokens[1:]:
+        if token == "--":
+            break
+        if token in {"-x", "-X", "--exec", "--exec-batch"}:
+            return False
+        option, separator, consumer = token.partition("=")
+        if option not in {"--exec", "--exec-batch"} or not separator:
+            continue
+        consumers.append(consumer)
+    return len(consumers) == 1 and consumers[0] in {"cat", "/bin/cat", "/usr/bin/cat"}
 
 
 def _looks_like_jq_file_read_tokens(tokens: list[str]) -> bool:

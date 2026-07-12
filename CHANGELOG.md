@@ -19,6 +19,8 @@ All notable changes to Noisegate are documented here. Release notes are generate
 - The Hermes config helper now avoids rewriting an already-correct plugin config while still removing stale `noisegate` entries from `plugins.disabled`.
 - Pytest compaction now prefers assertion/traceback detail over progress lines when tight budgets force a single failure excerpt.
 - Preserve source-like exact output for direct terminal file-display commands, V4A patches, and `reduce-json` command aliases even when the content resembles noisy failures.
+- Preserve uv dependency-resolution failures that occur before `uv run pytest` starts instead of routing them through the pytest reducer.
+- Preserve exact file output from attached `fd` / `fdfind` `--exec=cat` and `--exec-batch=cat` forms without protecting non-read consumers.
 
 ## [0.1.2] - 2026-07-07
 

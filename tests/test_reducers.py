@@ -747,6 +747,48 @@ def test_source_like_terminal_file_display_commands_are_protected() -> None:
         assert result.metadata["reducer"] == "protected_file_read"
 
 
+@pytest.mark.parametrize(
+    ("command", "exact_read"),
+    (
+        ("fd -e py --exec=cat", True),
+        ("fdfind -e py --exec-batch=cat", True),
+        ("fd --exec='cat'", True),
+        ("fd '--exec=cat'", True),
+        ("fd --exec=/bin/cat", True),
+        ("fdfind --exec-batch=/usr/bin/cat", True),
+        ("fd --exec=cat -- .", True),
+        ("fd --exec=/tmp/cat", False),
+        ("fd --exec=//host/share/cat", False),
+        ("fd -e py --exec=pytest", False),
+        ("fd -x echo --exec=cat", False),
+        ("fd --exec echo --exec-batch=cat", False),
+        ("fdfind -X printf --exec=cat", False),
+        ("fd -- . --exec=cat", False),
+    ),
+)
+def test_fd_attached_exec_consumers_preserve_only_exact_file_reads(
+    command: str,
+    exact_read: bool,
+) -> None:
+    raw = source_like_python()
+
+    result = reduce_text(
+        raw,
+        command=command,
+        tool_name="terminal",
+        options=options(max_chars=220, max_lines=20),
+    )
+
+    if exact_read:
+        assert result.changed is False, command
+        assert result.text == raw
+        assert result.metadata["command_class"] == "file_read"
+    else:
+        assert result.changed is True
+        assert result.text != raw
+        assert result.metadata["command_class"] != "file_read"
+
+
 def test_shell_substitution_file_display_commands_are_not_file_read() -> None:
     raw = source_like_python()
 
@@ -1081,6 +1123,162 @@ def test_pytest_reducer_preserves_failure_context() -> None:
     assert "FAILED tests/test_artifacts.py::test_writes_config" in result.text
     assert "1 failed, 82 passed" in result.text
     assert "[noisegate: omitted" in result.text
+
+
+def test_uv_pytest_resolution_failure_uses_python_package_reducer() -> None:
+    resolver_detail = (
+        "  ╰─▶ Because no version of private-lib matches >=2 and your project depends "
+        "on private-lib>=2, the requirements are unsatisfiable."
+    )
+    resolver_output = "\n".join(
+        [
+            *[f"checking candidate {index:03d}" for index in range(60)],
+            "  × No solution found when resolving dependencies:",  # noqa: RUF001
+            resolver_detail,
+            *[f"backtracking candidate {index:03d}" for index in range(60)],
+        ]
+    )
+
+    for command in (
+        "uv run --with private-lib pytest -q",
+        "bash -lc 'uv run --with private-lib pytest -q'",
+        "cd repo && uv run --with private-lib pytest -q",
+        "bash -lc 'cd repo && uv run --with private-lib pytest -q'",
+    ):
+        result = reduce_text(
+            resolver_output,
+            command=command,
+            exit_code=1,
+            options=options(
+                max_chars=280,
+                max_lines=6,
+                head_lines=1,
+                tail_lines=1,
+                important_context_lines=1,
+            ),
+        )
+
+        assert result.changed is True, command
+        assert result.metadata["command_class"] == "python_package", command
+        assert result.metadata["reducer"] == "python_package", command
+        assert "No solution found when resolving dependencies" in result.text, command
+
+    ordinary_pytest = "\n".join(
+        [
+            "=================================== FAILURES ===================================",
+            "FAILED tests/test_many.py::test_signal",
+            "E       AssertionError: boom",
+            *[f"pytest noise {index}" for index in range(40)],
+        ]
+    )
+    ordinary_result = reduce_text(
+        ordinary_pytest,
+        command="uv run --with private-lib pytest -q",
+        exit_code=1,
+        options=options(max_chars=280, max_lines=6),
+    )
+
+    assert ordinary_result.metadata["command_class"] == "pytest"
+    assert ordinary_result.metadata["reducer"] == "pytest"
+    assert "AssertionError: boom" in ordinary_result.text
+
+
+def test_uv_pytest_resolution_failure_beats_generic_failed_noise_at_tiny_budget() -> None:
+    raw = "\n".join(
+        [
+            *[f"checking candidate {index:03d}" for index in range(30)],
+            "DEBUG fetch failed for optional metadata cache; retrying",
+            *[f"retry noise {index:03d}" for index in range(15)],
+            "  × No solution found when resolving dependencies:",  # noqa: RUF001
+            "  ╰─▶ requirements are unsatisfiable.",
+            *[f"backtracking candidate {index:03d}" for index in range(30)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="uv run pytest -q",
+        exit_code=1,
+        options=options(
+            max_chars=110,
+            max_lines=3,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.metadata["command_class"] == "python_package"
+    assert "No solution found when resolving dependencies" in result.text
+    assert "[noisegate: exit_code=1]" in result.text
+
+
+def test_uv_pytest_literal_resolver_text_does_not_mask_real_test_failure() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup noise {index:03d}" for index in range(50)],
+            "application log: No solution found when resolving dependencies",
+            *[f"middle noise {index:03d}" for index in range(30)],
+            "=================================== FAILURES ===================================",
+            "E       TypeError: actual production regression",
+            "FAILED src/pkg/test_real.py::test_real_bug - TypeError: actual production regression",
+            *[f"teardown noise {index:03d}" for index in range(50)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="uv run pytest -q",
+        exit_code=1,
+        options=options(
+            max_chars=280,
+            max_lines=6,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.metadata["command_class"] == "pytest"
+    assert "TypeError: actual production regression" in result.text
+    assert "FAILED src/pkg/test_real.py::test_real_bug" in result.text
+
+    passing_output = "\n".join(
+        [
+            *[f"setup noise {index:03d}" for index in range(50)],
+            "  × No solution found when resolving dependencies:",  # noqa: RUF001
+            *[f"captured noise {index:03d}" for index in range(50)],
+            "1 passed in 0.03s",
+        ]
+    )
+    passing_result = reduce_text(
+        passing_output,
+        command="uv run pytest -q",
+        exit_code=0,
+        options=options(max_chars=180, max_lines=5, head_lines=1, tail_lines=1),
+    )
+
+    assert passing_result.metadata["command_class"] == "pytest"
+    assert "1 passed in 0.03s" in passing_result.text
+
+    collection_output = "\n".join(
+        [
+            *[f"setup noise {index:03d}" for index in range(30)],
+            "  × No solution found when resolving dependencies:",  # noqa: RUF001
+            *[f"middle noise {index:03d}" for index in range(20)],
+            "ERROR pkg/feature/test_collect.py - RuntimeError: actual collection regression",
+            *[f"teardown noise {index:03d}" for index in range(30)],
+        ]
+    )
+    collection_result = reduce_text(
+        collection_output,
+        command="uv run pytest -q",
+        exit_code=1,
+        options=options(max_chars=110, max_lines=3, head_lines=1, tail_lines=1),
+    )
+
+    assert collection_result.metadata["command_class"] == "pytest"
+    assert "RuntimeError: actual collection regression" in collection_result.text
 
 
 def test_pytest_reducer_keeps_exception_and_failed_node_under_tight_budget() -> None:
