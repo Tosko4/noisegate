@@ -790,7 +790,10 @@ def test_fd_attached_exec_consumers_preserve_only_exact_file_reads(
 
 
 def test_fd_attached_exec_does_not_swallow_later_compactable_output() -> None:
-    raw = source_like_python() + "\n" + "\n".join(
+    source = "\n".join(
+        ["# exact source output", *[f"def exact_{index}(): return {index}" for index in range(80)]]
+    )
+    raw = source + "\n" + "\n".join(
         [
             *[f"uv resolver chatter {index:03d}" for index in range(50)],
             "  × No solution found when resolving dependencies:",  # noqa: RUF001
@@ -801,6 +804,8 @@ def test_fd_attached_exec_does_not_swallow_later_compactable_output() -> None:
 
     for command in (
         "fd --exec=cat && uv run pytest -q",
+        "fd --exec=cat && cd repo && uv run pytest -q",
+        "fd --exec=cat && export MODE=test && uv run pytest -q",
         "fdfind --exec-batch=cat; uv run pytest -q",
         "uv run fd --exec=cat && uv run pytest -q",
         "sh -c 'fd --exec=cat' && uv run pytest -q",
@@ -855,6 +860,22 @@ def test_fd_attached_exec_does_not_swallow_later_compactable_output() -> None:
         ("fd --exec=cat && exit 1 >/dev/null && uv run pytest -q", 1),
         ("fd --exec=cat && ! true >/dev/null && uv run pytest -q", 1),
         ("fd --exec=cat && test -f definitely-missing && uv run pytest -q", 1),
+        (
+            "fd --exec=cat && cd /definitely/missing 2>/dev/null && uv run pytest -q",
+            1,
+        ),
+        (
+            "fd --exec=cat && export 1BAD=value 2>/dev/null && uv run pytest -q",
+            1,
+        ),
+        (
+            "fd --exec=cat && export MODE=test 2>/dev/null && uv run pytest -q",
+            1,
+        ),
+        ("fd --exec=cat && env cd repo && uv run pytest -q", 127),
+        ("fd --exec=cat && ./cd repo && uv run pytest -q", 1),
+        ("fd --exec=cat && source ./setup.sh && uv run pytest -q", 1),
+        ("fd --exec=cat && . ./setup.sh && uv run pytest -q", 1),
         ("fd --exec=cat & false && uv run pytest -q", 1),
         ("fd --exec=cat && uv run pytest -q 2>/dev/null", 1),
         ("fd --exec=cat && { uv run pytest -q; } 2>/dev/null", 1),
@@ -870,6 +891,54 @@ def test_fd_attached_exec_does_not_swallow_later_compactable_output() -> None:
 
         assert result.changed is False, command
         assert result.text == exact_fixture, command
+        assert result.metadata["command_class"] == "file_read", command
+        assert result.metadata["reducer"] == "protected_file_read", command
+
+    for command, setup_error in (
+        (
+            "fd --exec=cat && source /definitely/missing && uv run pytest -q",
+            "bash: line 1: /definitely/missing: No such file or directory",
+        ),
+        (
+            "fd --exec=cat && . /definitely/missing && uv run pytest -q",
+            "bash: line 1: /definitely/missing: No such file or directory",
+        ),
+        (
+            "fd --exec=cat && . /definitely/missing && uv run pytest -q",
+            "/bin/sh: 1: .: cannot open /definitely/missing: No such file",
+        ),
+        (
+            "fd --exec=cat && popd && uv run pytest -q",
+            "bash: line 1: popd: directory stack empty",
+        ),
+        (
+            "fd --exec=cat && cd one two && uv run pytest -q",
+            "bash: line 1: cd: too many arguments",
+        ),
+        (
+            "fd --exec=cat && export SHELLOPTS=value && uv run pytest -q",
+            "bash: line 1: SHELLOPTS: readonly variable",
+        ),
+        (
+            "fd --exec=cat && export SHELLOPTS=value && uv run pytest -q",
+            "-bash: SHELLOPTS: readonly variable",
+        ),
+        (
+            "fd --exec=cat && export PPID=1 && uv run pytest -q",
+            "ash: PPID: readonly variable",
+        ),
+    ):
+        setup_failure_output = exact_fixture + "\n" + setup_error
+        result = reduce_text(
+            setup_failure_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=options(max_chars=220, max_lines=7, head_lines=1, tail_lines=1),
+        )
+
+        assert result.changed is False, command
+        assert result.text == setup_failure_output, command
         assert result.metadata["command_class"] == "file_read", command
         assert result.metadata["reducer"] == "protected_file_read", command
 

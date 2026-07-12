@@ -4568,6 +4568,44 @@ def _known_command_statuses(tokens: list[str]) -> set[bool]:
     return {not status for status in statuses} if inverted else statuses
 
 
+def _setup_status_for_fd_reachability(
+    tokens: list[str],
+    effective_tokens: list[str],
+    text: str,
+) -> set[bool] | None:
+    direct = _tokens_without_simple_redirections(_strip_grouping_tokens(tokens))
+    normalized = _tokens_without_simple_redirections(_strip_command_wrappers(direct))
+    if not _is_setup_segment(normalized):
+        return None
+    if direct and Path(direct[0]).name == "env" and direct != normalized:
+        return {True, False}
+    command_name = normalized[0]
+    if command_name == "true":
+        return {True}
+    if command_name == "cd":
+        if len(normalized) != 2:
+            return {True, False}
+    elif command_name == "export":
+        assignments = normalized[1:]
+        if not assignments or not all(
+            re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:=.*)?", token)
+            for token in assignments
+        ):
+            return {True, False}
+    else:
+        return {True, False}
+    _stdout_visible, stderr_visible = _redirected_stream_visibility(effective_tokens)
+    if not stderr_visible:
+        return {True, False}
+    if re.search(
+        r"(?im)^(?:[^\s:]+/)?-?(?:[a-z]+)?sh:(?:(?: line)? \d+:)?|"
+        r"^.*:\s*(?:line \d+:\s*)?(?:cd|pushd|popd|source|export|pwd):",
+        text,
+    ) or _contains_file_read_error(text):
+        return {False}
+    return {True}
+
+
 def _shell_list_statuses(command: str) -> set[bool]:
     statuses: set[bool] = set()
     for separator, tokens in _background_segments(command):
@@ -4647,7 +4685,12 @@ def _fd_later_compactable_output_ran(
         if not runs:
             continue
         reachable.append((index, tokens))
-        command_statuses = _known_command_statuses(tokens)
+        effective_tokens = _segment_tokens_with_enclosing_group_redirects(segments, index)
+        command_statuses = _setup_status_for_fd_reachability(
+            tokens,
+            effective_tokens,
+            text,
+        ) or _known_command_statuses(tokens)
         if normalized and normalized[0] in {"exit", "return"}:
             if tokens[0] != "(":
                 break
@@ -5493,7 +5536,7 @@ def _compactable_output_dominates_for_tokens(
 
 def _is_setup_segment(tokens: list[str]) -> bool:
     setup_commands = {".", "cd", "export", "popd", "pushd", "pwd", "set", "source", "true"}
-    return bool(tokens and Path(tokens[0]).name in setup_commands)
+    return bool(tokens and (tokens[0] == "." or Path(tokens[0]).name in setup_commands))
 
 
 def _text_has_exact_output_for_tokens(tokens: list[str], text: str) -> bool:
