@@ -51,7 +51,7 @@ Noisegate gives you two surfaces:
 It knows how to reduce common noisy outputs:
 
 - `pytest` and `unittest`
-- `apt` / `apt-get`, `pip`, and `uv` package-install/update logs
+- `apt` / `apt-get`, `pip`, and `uv` package-install/update logs, including resolver failures before a `uv run` command starts
 - `npm`, `pnpm`, and `yarn`
 - `git status` and `git log`
 - Docker build-style logs and explicit `docker logs` / `docker compose logs` output
@@ -59,7 +59,7 @@ It knows how to reduce common noisy outputs:
 
 And it refuses to touch things that should stay exact:
 
-- file reads
+- file reads, including `fd` / `fdfind` execution forms that directly display matching files when no later noisy command owns the captured output
 - patches and diffs
 - source/code search output from `rg`, `grep`, `ag`, and `ack`
 - skill documents
