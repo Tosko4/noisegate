@@ -217,7 +217,7 @@ def test_reduce_json_rewrites_plain_result_string() -> None:
 
 def test_reduce_json_plain_result_string_with_numeric_exit_is_terminal_like() -> None:
     envelope = {
-        "returncode": 1,
+        "returncode": 7,
         "result": numbered("line", 100),
         "noisegate": {"max_chars": 120},
     }
@@ -226,6 +226,7 @@ def test_reduce_json_plain_result_string_with_numeric_exit_is_terminal_like() ->
     assert proc.returncode == 0, proc.stderr
     outer = json.loads(proc.stdout)
     assert "[noisegate: omitted" in outer["result"]
+    assert "[noisegate: exit_code=7]" in outer["result"]
     assert "line 001" in outer["result"]
     assert "line 100" in outer["result"]
 
