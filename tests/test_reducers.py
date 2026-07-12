@@ -789,6 +789,91 @@ def test_fd_attached_exec_consumers_preserve_only_exact_file_reads(
         assert result.metadata["command_class"] != "file_read"
 
 
+def test_fd_attached_exec_does_not_swallow_later_compactable_output() -> None:
+    raw = source_like_python() + "\n" + "\n".join(
+        [
+            *[f"uv resolver chatter {index:03d}" for index in range(50)],
+            "  × No solution found when resolving dependencies:",  # noqa: RUF001
+            "  ╰─▶ requirements are unsatisfiable.",
+            *[f"backtracking {index:03d}" for index in range(50)],
+        ]
+    )
+
+    for command in (
+        "fd --exec=cat && uv run pytest -q",
+        "fdfind --exec-batch=cat; uv run pytest -q",
+        "uv run fd --exec=cat && uv run pytest -q",
+        "sh -c 'fd --exec=cat' && uv run pytest -q",
+        "sh -c 'cd . && fd --exec=cat' && uv run pytest -q",
+        "uv run sh -c 'cd . && uv run sh -c \"fd --exec=cat\"' && uv run pytest -q",
+        "sh -c 'fd --exec=cat; exit 1' || uv run pytest -q",
+        "uv run sh -c 'uv run sh -c \"fd --exec=cat\"' && uv run pytest -q",
+        "fd --exec=cat && false || true && uv run pytest -q",
+        "fd --exec=cat && (exit 0) && uv run pytest -q",
+        "fd --exec=cat && (exit 0; false) && uv run pytest -q",
+        "fd --exec=cat && uv run pytest -q >/dev/null",
+    ):
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=options(
+                max_chars=260,
+                max_lines=8,
+                head_lines=1,
+                tail_lines=1,
+                important_context_lines=0,
+            ),
+        )
+
+        assert result.changed is True, command
+        assert result.metadata["command_class"] == "python_package", command
+        assert result.metadata["reducer"] == "python_package", command
+        assert "No solution found when resolving dependencies" in result.text, command
+        assert "[noisegate: exit_code=1]" in result.text, command
+
+    exact_fixture = "\n".join(
+        [
+            "UV_FAILURE_FIXTURE = '''",
+            "  × No solution found when resolving dependencies:",  # noqa: RUF001
+            "  ╰─▶ requirements are unsatisfiable.",
+            "'''",
+            *[f"def exact_{index}(): return {index}" for index in range(80)],
+        ]
+    )
+    for command, exit_code in (
+        ("fd --exec=cat && false && uv run pytest -q", 1),
+        ("fd --exec=cat && { false; } && uv run pytest -q", 1),
+        ("fd --exec=cat && command false && uv run pytest -q", 1),
+        ("fd --exec=cat && exit 1 && uv run pytest -q", 1),
+        ("fd --exec=cat && exit 1 || uv run pytest -q", 1),
+        ("fd --exec=cat && (exit 1) && uv run pytest -q", 1),
+        ("fd --exec=cat && (exit 1; true) && uv run pytest -q", 1),
+        ("fd --exec=cat && ! true && uv run pytest -q", 1),
+        ("fd --exec=cat && false >/dev/null && uv run pytest -q", 1),
+        ("fd --exec=cat && exit 1 >/dev/null && uv run pytest -q", 1),
+        ("fd --exec=cat && ! true >/dev/null && uv run pytest -q", 1),
+        ("fd --exec=cat && test -f definitely-missing && uv run pytest -q", 1),
+        ("fd --exec=cat & false && uv run pytest -q", 1),
+        ("fd --exec=cat && uv run pytest -q 2>/dev/null", 1),
+        ("fd --exec=cat && { uv run pytest -q; } 2>/dev/null", 1),
+        ("fd --exec=cat && uv run pytest -q >/dev/null", 0),
+    ):
+        result = reduce_text(
+            exact_fixture,
+            command=command,
+            tool_name="terminal",
+            exit_code=exit_code,
+            options=options(max_chars=220, max_lines=7, head_lines=1, tail_lines=1),
+        )
+
+        assert result.changed is False, command
+        assert result.text == exact_fixture, command
+        assert result.metadata["command_class"] == "file_read", command
+        assert result.metadata["reducer"] == "protected_file_read", command
+
+
 def test_shell_substitution_file_display_commands_are_not_file_read() -> None:
     raw = source_like_python()
 

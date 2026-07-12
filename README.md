@@ -59,7 +59,7 @@ It knows how to reduce common noisy outputs:
 
 And it refuses to touch things that should stay exact:
 
-- file reads, including `fd` / `fdfind` execution forms that directly display matching files
+- file reads, including `fd` / `fdfind` execution forms that directly display matching files when no later noisy command owns the captured output
 - patches and diffs
 - source/code search output from `rg`, `grep`, `ag`, and `ack`
 - skill documents

@@ -2955,12 +2955,25 @@ def _looks_like_file_read_command(
                             continue
                         if prior_compactable_output or prior_compactable_signal:
                             continue
+                    raw_later_segments = segments[index + 1 :]
                     later_segments = [
                         (later_separator, segment)
-                        for later_separator, segment in segments[index + 1 :]
+                        for later_separator, segment in raw_later_segments
                         if segment and not _is_setup_segment(segment)
                     ]
-                    if later_segments:
+                    if raw_later_segments:
+                        if _shell_starts_fd_attached_file_read(
+                            shell_command
+                        ) and _fd_later_compactable_output_ran(
+                            raw_later_segments,
+                            sample,
+                            text,
+                            exit_code,
+                            initial_statuses=_shell_fd_owner_statuses(shell_command),
+                        ):
+                            return False
+                        if not later_segments:
+                            return True
                         if (
                             exit_code == 0
                             and later_segments[0][0] == "||"
@@ -3062,11 +3075,21 @@ def _looks_like_file_read_command(
                 text,
             ):
                 continue
+        raw_later_segments = segments[index + 1 :]
         later_segments = [
             (later_separator, segment)
-            for later_separator, segment in segments[index + 1 :]
+            for later_separator, segment in raw_later_segments
             if segment and not _is_setup_segment(segment)
         ]
+        if raw_later_segments and _tokens_start_fd_attached_file_read(
+            tokens
+        ) and _fd_later_compactable_output_ran(
+            raw_later_segments,
+            sample,
+            text,
+            exit_code,
+        ):
+            return False
         if (
             later_segments
             and any(later_separator == "||" for later_separator, _ in later_segments)
@@ -4502,6 +4525,153 @@ def _later_compactable_output_ran(
         if command_class is not None and _compactable_segment_can_contribute_output(
             effective_tokens,
             text,
+        ):
+            return True
+    return False
+
+
+def _tokens_without_simple_redirections(tokens: list[str]) -> list[str]:
+    normalized: list[str] = []
+    index = 0
+    while index < len(tokens):
+        redirect = _simple_shell_redirection(tokens, index)
+        if redirect is not None:
+            consumed, _supplies_stdin = redirect
+            index += consumed
+            continue
+        normalized.append(tokens[index])
+        index += 1
+    return normalized
+
+
+def _known_command_statuses(tokens: list[str]) -> set[bool]:
+    normalized = _tokens_without_simple_redirections(
+        _strip_command_wrappers(_strip_grouping_tokens(tokens))
+    )
+    inverted = False
+    while normalized and normalized[0] == "!":
+        inverted = not inverted
+        normalized = normalized[1:]
+    if normalized == ["true"] or normalized == [":"]:
+        statuses = {True}
+    elif normalized == ["false"]:
+        statuses = {False}
+    elif normalized and normalized[0] in {"exit", "return"}:
+        if len(normalized) == 1:
+            statuses = {True}
+        elif len(normalized) == 2 and normalized[1].isdigit():
+            statuses = {int(normalized[1]) == 0}
+        else:
+            statuses = {True, False}
+    else:
+        statuses = {True, False}
+    return {not status for status in statuses} if inverted else statuses
+
+
+def _shell_list_statuses(command: str) -> set[bool]:
+    statuses: set[bool] = set()
+    for separator, tokens in _background_segments(command):
+        if not tokens:
+            continue
+        command_statuses = _known_command_statuses(tokens)
+        if separator in {None, ";", "&"}:
+            runs = True
+            statuses = command_statuses
+        elif separator == "&&":
+            runs = True in statuses
+            statuses = ({False} if False in statuses else set()) | (
+                command_statuses if runs else set()
+            )
+        elif separator == "||":
+            runs = False in statuses
+            statuses = ({True} if True in statuses else set()) | (
+                command_statuses if runs else set()
+            )
+        else:
+            return {True, False}
+    return statuses or {True, False}
+
+
+def _shell_fd_owner_statuses(command: str) -> set[bool]:
+    statuses = _shell_list_statuses(command)
+    semantic_segments = [
+        tokens
+        for _separator, tokens in _background_segments(command)
+        if tokens and not _is_setup_segment(tokens)
+    ]
+    if (
+        statuses == {True, False}
+        and len(semantic_segments) == 1
+        and _tokens_start_fd_attached_file_read(semantic_segments[0])
+    ):
+        return {True}
+    return statuses
+
+
+def _fd_later_compactable_output_ran(
+    segments: list[tuple[str | None, list[str]]],
+    sample: str,
+    text: str,
+    exit_code: int | None,
+    *,
+    initial_statuses: set[bool] | None = None,
+) -> bool:
+    if exit_code in {None, 0}:
+        return False
+
+    statuses = set(initial_statuses or {True})
+    reachable: list[tuple[int, list[str]]] = []
+    terminated_subshell_depth = 0
+    for index, (separator, tokens) in enumerate(segments):
+        if not tokens:
+            continue
+        if terminated_subshell_depth:
+            terminated_subshell_depth = max(
+                0,
+                terminated_subshell_depth + tokens.count("(") - tokens.count(")"),
+            )
+            continue
+        normalized = _strip_command_wrappers(_strip_grouping_tokens(tokens))
+        if not normalized:
+            continue
+        if separator in {None, ";"}:
+            runs = True
+        elif separator == "&&":
+            runs = statuses == {True}
+        elif separator == "||":
+            runs = statuses == {False}
+        elif separator == "&":
+            runs = True
+        else:
+            return False
+        if not runs:
+            continue
+        reachable.append((index, tokens))
+        command_statuses = _known_command_statuses(tokens)
+        if normalized and normalized[0] in {"exit", "return"}:
+            if tokens[0] != "(":
+                break
+            terminated_subshell_depth = max(0, tokens.count("(") - tokens.count(")"))
+        if separator in {None, ";", "&"}:
+            statuses = command_statuses
+        elif separator == "&&":
+            statuses = ({False} if False in statuses else set()) | command_statuses
+        elif separator == "||":
+            statuses = ({True} if True in statuses else set()) | command_statuses
+
+    for index, tokens in reachable:
+        command_class = _compactable_output_class_for_tokens(tokens, sample, text)
+        if command_class is None:
+            continue
+        effective_tokens = _segment_tokens_with_enclosing_group_redirects(segments, index)
+        stdout_visible, stderr_visible = _redirected_stream_visibility(effective_tokens)
+        command = shlex.join(tokens)
+        if _is_uv_pytest_resolution_failure(command, text):
+            if stderr_visible:
+                return True
+            continue
+        if stdout_visible or (
+            stderr_visible and _contains_redirected_compactable_stderr(text)
         ):
             return True
     return False
@@ -6461,6 +6631,44 @@ def _fd_attached_exec_reads_files(tokens: list[str]) -> bool:
             continue
         consumers.append(consumer)
     return len(consumers) == 1 and consumers[0] in {"cat", "/bin/cat", "/usr/bin/cat"}
+
+
+def _tokens_start_fd_attached_file_read(tokens: list[str]) -> bool:
+    stripped = _strip_command_wrappers(tokens)
+    seen: set[tuple[str, ...]] = set()
+    while stripped and tuple(stripped) not in seen:
+        seen.add(tuple(stripped))
+        payload = _command_runner_payload(stripped)
+        if payload is not None:
+            stripped = _strip_command_wrappers(payload)
+            continue
+        if stripped and Path(stripped[0]).name in {"bash", "sh", "zsh"}:
+            shell_command = _shell_c_argument(stripped[1:])
+            if shell_command is not None:
+                shell_payload = next(
+                    (
+                        segment
+                        for _separator, segment in _background_segments(shell_command)
+                        if segment and not _is_setup_segment(segment)
+                    ),
+                    [],
+                )
+                stripped = _strip_command_wrappers(shell_payload)
+                continue
+        break
+    return bool(
+        stripped
+        and Path(stripped[0]).name in {"fd", "fdfind"}
+        and _fd_attached_exec_reads_files(stripped)
+    )
+
+
+def _shell_starts_fd_attached_file_read(command: str) -> bool:
+    for _separator, tokens in _background_segments(command):
+        if not tokens or _is_setup_segment(tokens):
+            continue
+        return _tokens_start_fd_attached_file_read(tokens)
+    return False
 
 
 def _looks_like_jq_file_read_tokens(tokens: list[str]) -> bool:
