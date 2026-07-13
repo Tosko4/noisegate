@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import noisegate.plugin as plugin
+from noisegate import engine
 from noisegate.plugin import register, transform_terminal_output, transform_tool_result
 
 Hook = Callable[..., str | None]
@@ -608,6 +609,74 @@ def test_noisy_generic_json_string_field_can_be_compacted() -> None:
     assert payload["noisegate"]["fields"]["logs"]["original_lines"] == 100
 
 
+def test_terminal_json_field_remaps_colliding_upstream_line_marker() -> None:
+    raw_lines = [
+        "head-" + ("h" * 80),
+        "line-1-" + ("x" * 80),
+        "line-2-" + ("x" * 80),
+        "line-3-" + ("x" * 80),
+        "[noisegate: omitted 8 lines]",
+        "line-5-" + ("x" * 80),
+        "line-6-" + ("x" * 80),
+        "line-7-" + ("x" * 80),
+        "line-8-" + ("x" * 80),
+        "tail-" + ("t" * 80),
+    ]
+    raw = terminal_result("\n".join(raw_lines), command="make noisy")
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        noisegate_max_chars=10_000,
+        noisegate_max_lines=3,
+        noisegate_head_lines=1,
+        noisegate_tail_lines=1,
+    )
+
+    payload = parse_hook_result(transformed)
+    stdout = payload["stdout"]
+    assert isinstance(stdout, str)
+    assert stdout.splitlines() == [
+        raw_lines[0],
+        "[noisegate: omitted 15 lines]",
+        raw_lines[-1],
+    ]
+    assert engine._represented_line_coverage(stdout) == 17
+
+
+def test_terminal_json_artifact_rewrite_fails_open_with_upstream_marker(
+    tmp_path: Path,
+) -> None:
+    raw_lines = [
+        "head-" + ("h" * 80),
+        "line-1-" + ("x" * 80),
+        "line-2-" + ("x" * 80),
+        "line-3-" + ("x" * 80),
+        "[noisegate: omitted 8 lines]",
+        "line-5-" + ("x" * 80),
+        "line-6-" + ("x" * 80),
+        "line-7-" + ("x" * 80),
+        "line-8-" + ("x" * 80),
+        "tail-" + ("t" * 80),
+    ]
+    artifact_dir = tmp_path / "artifacts"
+    raw = terminal_result("\n".join(raw_lines), command="make noisy", exit_code=1)
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        noisegate_max_chars=220,
+        noisegate_max_lines=3,
+        noisegate_head_lines=1,
+        noisegate_tail_lines=1,
+        noisegate_artifacts=True,
+        noisegate_artifact_dir=str(artifact_dir),
+    )
+
+    assert transformed is None
+    assert not artifact_dir.exists()
+
+
 def test_transform_tool_result_skips_json_rewrite_when_metadata_would_grow_result() -> None:
     raw = json.dumps({"stdout": "A" * 4010})
 
@@ -660,6 +729,256 @@ def test_transform_tool_result_does_not_store_top_level_string_artifact_on_no_ga
 
     assert transformed is None
     assert store_calls == []
+
+
+def test_preview_top_level_json_string_reports_structured_artifact_plan(
+    monkeypatch,
+) -> None:
+    text = "\n".join(
+        [
+            "head",
+            "[noisegate: omitted 8 lines]",
+            *[f"middle-{index}-" + ("x" * 80) for index in range(30)],
+            "tail",
+        ]
+    )
+    plans: list[plugin._ArtifactPreviewPlan] = []
+
+    def unexpected_store(_text: str, _options) -> dict[str, object]:
+        raise AssertionError("preview must not store")
+
+    monkeypatch.setattr(plugin, "_store_artifact", unexpected_store)
+
+    transformed = plugin._preview_tool_result(
+        json.dumps(text),
+        tool_name="terminal",
+        args={"command": "pytest -q"},
+        noisegate_exit_code=1,
+        noisegate_max_chars=1000,
+        noisegate_max_lines=5,
+        noisegate_artifacts=True,
+        artifact_plans_out=plans,
+    )
+
+    assert isinstance(transformed, str)
+    compacted = json.loads(transformed)
+    assert len(plans) == 1
+    assert plans[0].original_text == text
+    assert plans[0].artifact_id in compacted
+    assert plans[0].recovery_notice in compacted.splitlines()
+    assert plans[0].owner_path == ()
+    assert compacted.splitlines().count("[noisegate: exit_code=1]") == 1
+
+
+def test_store_artifact_preview_plan_removes_new_file_when_read_verification_fails(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    original = numbered("raw terminal output", 100)
+    options = engine.NoisegateOptions(
+        artifact_enabled=True,
+        artifact_dir=artifact_dir,
+    )
+    plan = plugin._artifact_preview_plan(
+        original,
+        {"artifact": engine._plan_artifact(original, options)},
+        artifact_dir=options.artifact_dir,
+    )
+    assert plan is not None
+
+    def fail_read(_store: plugin.ArtifactStore, _artifact_id: str) -> str:
+        raise plugin.ArtifactError("verification failed")
+
+    monkeypatch.setattr(plugin.ArtifactStore, "read", fail_read)
+
+    assert plugin._store_artifact_preview_plan(plan, options) is False
+    assert not (artifact_dir / f"{plan.artifact_id}.txt").exists()
+    assert not artifact_dir.exists() or list(artifact_dir.iterdir()) == []
+
+
+def test_store_artifact_preview_plan_preserves_preexisting_file_on_read_failure(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    original = numbered("raw terminal output", 100)
+    options = engine.NoisegateOptions(
+        artifact_enabled=True,
+        artifact_dir=artifact_dir,
+    )
+    stored = plugin.ArtifactStore(artifact_dir).store(original)
+    plan = plugin._artifact_preview_plan(
+        original,
+        {"artifact": {"stored": True, **stored.to_metadata()}},
+        artifact_dir=artifact_dir,
+    )
+    assert plan is not None
+    target = artifact_dir / f"{plan.artifact_id}.txt"
+
+    def fail_read(_store: plugin.ArtifactStore, _artifact_id: str) -> str:
+        raise plugin.ArtifactError("verification failed")
+
+    monkeypatch.setattr(plugin.ArtifactStore, "read", fail_read)
+
+    assert plugin._store_artifact_preview_plan(plan, options) is False
+    assert target.read_text(encoding="utf-8") == original
+    assert list(artifact_dir.glob(".ng_*.tmp")) == []
+
+
+def test_store_artifact_preview_plan_rolls_back_when_store_raises_after_publication(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    original = numbered("raw terminal output", 100)
+    options = engine.NoisegateOptions(
+        artifact_enabled=True,
+        artifact_dir=artifact_dir,
+    )
+    plan = plugin._artifact_preview_plan(
+        original,
+        {"artifact": engine._plan_artifact(original, options)},
+        artifact_dir=artifact_dir,
+    )
+    assert plan is not None
+    real_store = plugin._store_artifact
+
+    def store_then_raise(text: str, current_options: engine.NoisegateOptions):
+        real_store(text, current_options)
+        raise RuntimeError("post-write metadata failure")
+
+    monkeypatch.setattr(plugin, "_store_artifact", store_then_raise)
+
+    assert plugin._store_artifact_preview_plan(plan, options) is False
+    assert not (artifact_dir / f"{plan.artifact_id}.txt").exists()
+    assert not list(artifact_dir.glob(".ng_*.tmp"))
+
+
+def test_store_artifact_preview_plan_accepts_store_with_nested_receipt_capture(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    original = numbered("raw terminal output", 100)
+    options = engine.NoisegateOptions(
+        artifact_enabled=True,
+        artifact_dir=artifact_dir,
+    )
+    plan = plugin._artifact_preview_plan(
+        original,
+        {"artifact": engine._plan_artifact(original, options)},
+        artifact_dir=artifact_dir,
+    )
+    assert plan is not None
+    real_store = plugin._store_artifact
+
+    def nested_capture_store(text: str, current_options: engine.NoisegateOptions):
+        with plugin._capture_artifact_write_receipts():
+            return real_store(text, current_options)
+
+    monkeypatch.setattr(plugin, "_store_artifact", nested_capture_store)
+
+    accepted = plugin._store_artifact_preview_plan(plan, options)
+
+    assert accepted is True
+    assert plugin.ArtifactStore(artifact_dir).read(plan.artifact_id) == original
+
+
+def test_store_artifact_preview_plan_ignores_unrelated_created_receipt(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    original = numbered("planned terminal output", 100)
+    concurrent = numbered("distinct concurrent output", 100)
+    options = engine.NoisegateOptions(
+        artifact_enabled=True,
+        artifact_dir=artifact_dir,
+    )
+    planned_artifact = plugin.ArtifactStore(artifact_dir).store(original)
+    plan = plugin._artifact_preview_plan(
+        original,
+        {"artifact": {"stored": True, **planned_artifact.to_metadata()}},
+        artifact_dir=artifact_dir,
+    )
+    assert plan is not None
+    real_store = plugin._store_artifact
+
+    def store_plan_then_concurrent(
+        text: str,
+        current_options: engine.NoisegateOptions,
+    ) -> dict[str, object]:
+        planned_metadata = real_store(text, current_options)
+        real_store(concurrent, current_options)
+        return planned_metadata
+
+    monkeypatch.setattr(plugin, "_store_artifact", store_plan_then_concurrent)
+
+    accepted = plugin._store_artifact_preview_plan(plan, options)
+
+    store = plugin.ArtifactStore(artifact_dir)
+    concurrent_id = engine._plan_artifact(concurrent, options)["id"]
+    assert isinstance(concurrent_id, str)
+    assert store.read(plan.artifact_id) == original
+    assert store.read(concurrent_id) == concurrent
+    assert accepted is True
+
+
+def test_preview_metadata_does_not_accept_artifact_id_substring_as_recovery_notice() -> None:
+    original = numbered("raw terminal output", 100)
+    options = engine.NoisegateOptions(
+        artifact_enabled=True,
+        artifact_dir=Path("a"),
+    )
+    metadata = {"artifact": engine._plan_artifact(original, options)}
+    artifact = metadata["artifact"]
+    assert isinstance(artifact, dict)
+    artifact_id = artifact["id"]
+    assert isinstance(artifact_id, str)
+
+    plugin._mark_artifact_notice_dropped_if_missing(
+        metadata,
+        f"incidental metadata id={artifact_id}",
+        artifact_dir=options.artifact_dir,
+    )
+
+    assert metadata["artifact"] == {
+        "stored": False,
+        "reason": "recovery_notice_dropped",
+        "size_bytes": len(original.encode()),
+    }
+
+
+def test_top_level_json_string_rejects_whitespace_only_gain_after_artifact_fallback(
+    tmp_path: Path,
+) -> None:
+    text = "\n".join(
+        [
+            "head",
+            "[noisegate: omitted 8 lines]",
+            "x" * 80,
+            "y" * 80,
+            "tail",
+        ]
+    )
+    raw = " " + json.dumps(text) + " "
+    artifact_dir = tmp_path / "artifacts"
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        noisegate_exit_code=1,
+        noisegate_max_chars=10_000,
+        noisegate_max_lines=4,
+        noisegate_head_lines=1,
+        noisegate_tail_lines=1,
+        noisegate_artifacts=True,
+        noisegate_artifact_dir=str(artifact_dir),
+    )
+
+    assert transformed is None
+    assert not artifact_dir.exists()
 
 
 def test_transform_tool_result_does_not_write_artifact_when_json_candidate_is_dropped(

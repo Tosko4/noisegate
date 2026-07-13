@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import signal
@@ -7,6 +8,10 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+import noisegate.cli as cli
+import noisegate.plugin as plugin
+from noisegate.artifacts import ArtifactStore
 
 
 def numbered(prefix: str, count: int) -> str:
@@ -698,6 +703,208 @@ def test_reduce_json_preserves_nested_json_when_outer_envelope_would_grow() -> N
     assert proc.stdout == raw
 
 
+def test_reduce_json_nested_json_string_rejects_whitespace_only_artifact_gain(
+    tmp_path: Path,
+) -> None:
+    text = "\n".join(
+        [
+            "head",
+            "[noisegate: omitted 8 lines]",
+            "x" * 80,
+            "y" * 80,
+            "tail",
+        ]
+    )
+    payload = {
+        "tool_name": "terminal",
+        "status": "failed",
+        "result": " " + json.dumps(text) + " ",
+        "noisegate": {
+            "max_chars": 10_000,
+            "max_lines": 4,
+            "head_lines": 1,
+            "tail_lines": 1,
+        },
+    }
+    raw = json.dumps(payload)
+    artifact_dir = tmp_path / "artifacts"
+
+    proc = run_cli(
+        "reduce-json",
+        "--store-artifact",
+        "--artifact-dir",
+        str(artifact_dir),
+        input_text=raw,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == raw
+    assert not artifact_dir.exists()
+
+
+def test_reduce_json_nested_json_string_stores_planned_artifact_before_delivery(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    text = "\n".join(
+        [
+            "head",
+            "[noisegate: omitted 8 lines]",
+            *[f"middle-{index}-" + ("x" * 80) for index in range(30)],
+            "tail",
+        ]
+    )
+    raw = json.dumps(
+        {
+            "tool_name": "terminal",
+            "command": "pytest -q",
+            "status": "failed",
+            "result": json.dumps(text),
+        }
+    )
+    artifact_dir = tmp_path / "artifacts"
+    store_calls: list[str] = []
+    real_store = plugin._store_artifact
+
+    def tracking_store(raw_text: str, options):
+        store_calls.append(raw_text)
+        return real_store(raw_text, options)
+
+    monkeypatch.setattr(plugin, "_store_artifact", tracking_store)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(raw))
+
+    return_code = cli.main(
+        [
+            "reduce-json",
+            "--store-artifact",
+            "--artifact-dir",
+            str(artifact_dir),
+            "--max-chars",
+            "1000",
+            "--max-lines",
+            "5",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    nested_result = json.loads(json.loads(output)["result"])
+    artifact_files = list(artifact_dir.glob("ng_*.txt"))
+    assert return_code == 0
+    assert store_calls == [text]
+    assert len(artifact_files) == 1
+    assert artifact_files[0].stem in nested_result
+    assert nested_result.splitlines().count("[noisegate: exit_code=1]") == 1
+    assert ArtifactStore(artifact_dir).read(artifact_files[0].stem) == text
+
+
+def test_reduce_json_rejects_unresolvable_successful_artifact_store(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    text = "\n".join(
+        [
+            "head",
+            "[noisegate: omitted 8 lines]",
+            *[f"middle-{index}-" + ("x" * 80) for index in range(30)],
+            "tail",
+        ]
+    )
+    raw = json.dumps(
+        {
+            "tool_name": "terminal",
+            "command": "pytest -q",
+            "status": "failed",
+            "result": json.dumps(text),
+        }
+    )
+    artifact_dir = tmp_path / "artifacts"
+    store_calls: list[str] = []
+
+    def fake_store(raw_text: str, options):
+        store_calls.append(raw_text)
+        return plugin._plan_artifact(raw_text, options)
+
+    monkeypatch.setattr(plugin, "_store_artifact", fake_store)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(raw))
+
+    return_code = cli.main(
+        [
+            "reduce-json",
+            "--store-artifact",
+            "--artifact-dir",
+            str(artifact_dir),
+            "--max-chars",
+            "1000",
+            "--max-lines",
+            "5",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert return_code == 0
+    assert store_calls == [text]
+    assert output == raw
+    assert "id=ng_" not in output
+    assert not artifact_dir.exists()
+
+
+def test_reduce_json_nested_json_string_plan_mismatch_fails_open(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    text = "\n".join(
+        [
+            "head",
+            "[noisegate: omitted 8 lines]",
+            *[f"middle-{index}-" + ("x" * 80) for index in range(30)],
+            "tail",
+        ]
+    )
+    raw = json.dumps(
+        {
+            "tool_name": "terminal",
+            "command": "pytest -q",
+            "status": "failed",
+            "result": json.dumps(text),
+        }
+    )
+    artifact_dir = tmp_path / "artifacts"
+    real_plan = plugin._plan_artifact
+
+    def mismatched_plan(raw_text: str, options):
+        planned = real_plan(raw_text, options)
+        return {**planned, "id": "ng_" + ("0" * 24)}
+
+    def unexpected_store(_text: str, _options) -> dict[str, object]:
+        raise AssertionError("a mismatched preview plan must not be stored")
+
+    monkeypatch.setattr(plugin, "_plan_artifact", mismatched_plan)
+    monkeypatch.setattr(plugin, "_store_artifact", unexpected_store)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(raw))
+
+    return_code = cli.main(
+        [
+            "reduce-json",
+            "--store-artifact",
+            "--artifact-dir",
+            str(artifact_dir),
+            "--max-chars",
+            "1000",
+            "--max-lines",
+            "5",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert return_code == 0
+    assert output == raw
+    assert "id=ng_" not in output
+    assert not artifact_dir.exists()
+
+
 def test_reduce_json_preserves_nested_json_string_when_compacting_generic_top_level() -> None:
     nested = {"items": [f"value {index:03d}" for index in range(100)]}
     payload = {
@@ -1364,6 +1571,245 @@ def test_reduce_json_no_gain_metadata_does_not_claim_artifact(
     assert not artifact_dir.exists()
 
 
+def test_reduce_json_preview_does_not_export_plan_when_plain_result_notice_drops() -> None:
+    result = "\n".join(["ValueError: boom", *["x" * 40 for _ in range(30)]])
+    payload = {
+        "tool_name": "terminal",
+        "command": "pytest",
+        "result": result,
+    }
+    raw = json.dumps(payload)
+    options = cli.NoisegateOptions(
+        max_chars=139,
+        max_lines=3,
+        artifact_enabled=True,
+        artifact_dir=Path("a"),
+    )
+    plans: list[plugin._ArtifactPreviewPlan] = []
+
+    output = cli._reduce_json_value(
+        payload,
+        raw,
+        options,
+        defer_artifact_store=True,
+        artifact_plans_out=plans,
+    )
+
+    assert output != raw
+    assert "ng_" not in output
+    assert plans == []
+
+
+def test_reduce_json_preview_plans_bind_notices_to_exact_accepted_owners() -> None:
+    artifact_dir = Path("a")
+    options = cli.NoisegateOptions(
+        max_chars=500,
+        artifact_enabled=True,
+        artifact_dir=artifact_dir,
+    )
+    cases = {
+        "plain": (
+            {
+                "tool_name": "terminal",
+                "command": "pytest",
+                "returncode": 1,
+                "result": numbered("plain", 200),
+            },
+            [(("result", False),)],
+        ),
+        "nested": (
+            {
+                "tool_name": "terminal",
+                "command": "pytest",
+                "returncode": 1,
+                "result": json.dumps({"stdout": numbered("inner", 200)}),
+            },
+            [(("result", True), ("stdout", False))],
+        ),
+        "direct": (
+            {
+                "tool_name": "terminal",
+                "command": "make noisy",
+                "stdout": numbered("direct", 600),
+                "noisegate": {
+                    "artifact": {"stored": True, "id": "ng_metadata_collision"}
+                },
+                "_noisegate": {"prior": "metadata"},
+            },
+            [(("stdout", False),)],
+        ),
+        "mixed": (
+            {
+                "tool_name": "terminal",
+                "command": "make noisy",
+                "stdout": numbered("outer", 600),
+                "result": json.dumps({"stdout": numbered("inner", 600)}),
+            },
+            [
+                (("result", True), ("stdout", False)),
+                (("stdout", False),),
+            ],
+        ),
+    }
+    previews: dict[str, tuple[str, list[plugin._ArtifactPreviewPlan]]] = {}
+
+    for name, (payload, expected_owners) in cases.items():
+        raw = json.dumps(payload, separators=(",", ":"))
+        plans: list[plugin._ArtifactPreviewPlan] = []
+        preview = cli._reduce_json_value(
+            payload,
+            raw,
+            options,
+            defer_artifact_store=True,
+            artifact_plans_out=plans,
+        )
+
+        assert preview != raw, name
+        assert [
+            tuple((step.field, step.parse_json) for step in plan.owner_path)
+            for plan in plans
+        ] == expected_owners
+        assert all(
+            plugin._artifact_preview_plan_matches_serialized_output(plan, preview)
+            for plan in plans
+        )
+        previews[name] = (preview, plans)
+
+    plain_preview, plain_plans = previews["plain"]
+    plain_payload = json.loads(plain_preview)
+    plain_payload["result"] = plain_payload["result"].replace(
+        plain_plans[0].recovery_notice,
+        "",
+    )
+    plain_payload["metadata_collision"] = {
+        "stored": True,
+        "id": plain_plans[0].artifact_id,
+        "notice": plain_plans[0].recovery_notice,
+    }
+    assert not plugin._artifact_preview_plan_matches_serialized_output(
+        plain_plans[0],
+        json.dumps(plain_payload),
+    )
+
+    nested_preview, nested_plans = previews["nested"]
+    nested_payload = json.loads(nested_preview)
+    nested_result = json.loads(nested_payload["result"])
+    nested_result["stdout"] = nested_result["stdout"].replace(
+        nested_plans[0].recovery_notice,
+        "",
+    )
+    nested_payload["result"] = json.dumps(nested_result)
+    nested_payload["stdout"] = nested_plans[0].recovery_notice
+    assert not plugin._artifact_preview_plan_matches_serialized_output(
+        nested_plans[0],
+        json.dumps(nested_payload),
+    )
+
+    direct_preview, direct_plans = previews["direct"]
+    direct_payload = json.loads(direct_preview)
+    direct_payload["stdout"] = direct_payload["stdout"].replace(
+        direct_plans[0].recovery_notice,
+        "",
+    )
+    direct_payload["noisegate"]["notice"] = direct_plans[0].recovery_notice
+    assert not plugin._artifact_preview_plan_matches_serialized_output(
+        direct_plans[0],
+        json.dumps(direct_payload),
+    )
+
+    mixed_preview, mixed_plans = previews["mixed"]
+    mixed_payload = json.loads(mixed_preview)
+    mixed_result = json.loads(mixed_payload["result"])
+    mixed_result["stdout"] = mixed_result["stdout"].replace(
+        mixed_plans[0].recovery_notice,
+        "",
+    )
+    mixed_payload["result"] = json.dumps(mixed_result)
+    mixed_payload["stderr"] = mixed_plans[0].recovery_notice
+    mixed_tampered = json.dumps(mixed_payload)
+    assert not plugin._artifact_preview_plan_matches_serialized_output(
+        mixed_plans[0],
+        mixed_tampered,
+    )
+    assert plugin._artifact_preview_plan_matches_serialized_output(
+        mixed_plans[1],
+        mixed_tampered,
+    )
+
+
+def test_reduce_json_command_revalidates_plan_owner_before_store(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    original = numbered("plain", 200)
+    raw = json.dumps({"tool_name": "terminal", "result": original})
+    options = cli.NoisegateOptions(
+        artifact_enabled=True,
+        artifact_dir=artifact_dir,
+    )
+    plan = plugin._artifact_preview_plan(
+        original,
+        {"artifact": plugin._plan_artifact(original, options)},
+        artifact_dir=artifact_dir,
+        owner_path=(plugin._ArtifactNoticeOwnerStep("result"),),
+    )
+    assert plan is not None
+    preview = json.dumps(
+        {
+            "result": "inline result without recovery",
+            "metadata_collision": {
+                "stored": True,
+                "id": plan.artifact_id,
+                "notice": plan.recovery_notice,
+            },
+        }
+    )
+    inline_fallback = json.dumps({"result": "artifact-disabled inline result"})
+    reduce_calls: list[bool] = []
+
+    def fake_reduce(
+        _parsed,
+        _raw: str,
+        current_options: cli.NoisegateOptions,
+        *,
+        metadata_out=None,
+        defer_artifact_store: bool = False,
+        artifact_plans_out=None,
+    ) -> str:
+        reduce_calls.append(current_options.artifact_enabled)
+        if defer_artifact_store:
+            assert artifact_plans_out is not None
+            artifact_plans_out.append(plan)
+            return preview
+        return inline_fallback
+
+    def unexpected_store(
+        _plan: plugin._ArtifactPreviewPlan,
+        _options: cli.NoisegateOptions,
+    ) -> bool:
+        raise AssertionError("mismatched owner must be rejected before store")
+
+    monkeypatch.setattr(cli, "_reduce_json_value", fake_reduce)
+    monkeypatch.setattr(cli, "_store_artifact_preview_plan", unexpected_store)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(raw))
+
+    return_code = cli.main(
+        [
+            "reduce-json",
+            "--store-artifact",
+            "--artifact-dir",
+            str(artifact_dir),
+        ]
+    )
+
+    assert return_code == 0
+    assert capsys.readouterr().out == inline_fallback
+    assert reduce_calls == [True, False]
+    assert not artifact_dir.exists()
+
+
 def test_reduce_json_multi_artifact_envelopes_stay_inline_only(tmp_path: Path) -> None:
     cases = {
         "multi-field": {
@@ -1524,7 +1970,40 @@ def test_reduce_json_plain_result_artifact_id_resolves(tmp_path: Path) -> None:
     assert artifact_files[0].read_text(encoding="utf-8") == raw_result
 
 
-def test_reduce_json_plain_result_store_failure_delivers_no_id(tmp_path: Path) -> None:
+def test_reduce_json_direct_field_artifact_preserves_noisegate_collision(
+    tmp_path: Path,
+) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    stdout = numbered("direct", 600)
+    payload = {
+        "tool_name": "terminal",
+        "command": "make noisy",
+        "stdout": stdout,
+        "noisegate": {"prior": "metadata"},
+        "_noisegate": {"prior": "fallback"},
+    }
+
+    proc = run_cli(
+        "reduce-json",
+        "--store-artifact",
+        "--artifact-dir",
+        str(artifact_dir),
+        "--max-chars",
+        "500",
+        input_text=json.dumps(payload),
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    output = json.loads(proc.stdout)
+    artifact = output["__noisegate"]["fields"]["stdout"]["artifact"]
+    artifact_id = artifact["id"]
+    assert output["noisegate"] == {"prior": "metadata"}
+    assert output["_noisegate"] == {"prior": "fallback"}
+    assert artifact_id in output["stdout"]
+    assert ArtifactStore(artifact_dir).read(artifact_id) == stdout
+
+
+def test_reduce_json_plain_result_store_failure_fails_open_without_id(tmp_path: Path) -> None:
     artifact_file = tmp_path / "not-a-dir"
     artifact_file.write_text("x", encoding="utf-8")
     payload = {
@@ -1534,19 +2013,56 @@ def test_reduce_json_plain_result_store_failure_delivers_no_id(tmp_path: Path) -
         "result": numbered("plain", 200),
         "noisegate": {"max_chars": 300},
     }
+    raw = json.dumps(payload)
 
     proc = run_cli(
         "reduce-json",
         "--store-artifact",
         "--artifact-dir",
         str(artifact_file),
-        input_text=json.dumps(payload),
+        input_text=raw,
     )
 
     assert proc.returncode == 0, proc.stderr
-    output = json.loads(proc.stdout)["result"]
+    assert proc.stdout == raw
+    assert "id=ng_" not in proc.stdout
+
+
+def test_reduce_json_post_write_read_failure_has_no_file_or_delivered_id(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    payload = {
+        "tool_name": "terminal",
+        "command": "pytest",
+        "returncode": 1,
+        "result": numbered("plain", 200),
+        "noisegate": {"max_chars": 300},
+    }
+    raw = json.dumps(payload)
+
+    def fail_read(_store: plugin.ArtifactStore, _artifact_id: str) -> str:
+        raise plugin.ArtifactError("verification failed")
+
+    monkeypatch.setattr(plugin.ArtifactStore, "read", fail_read)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(raw))
+
+    return_code = cli.main(
+        [
+            "reduce-json",
+            "--store-artifact",
+            "--artifact-dir",
+            str(artifact_dir),
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert return_code == 0
+    assert output == raw
     assert "id=ng_" not in output
-    assert "reason=artifact_error" in output
+    assert not list(artifact_dir.glob("*"))
 
 
 def test_cat_cli_reads_artifact(tmp_path: Path) -> None:

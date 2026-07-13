@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import noisegate.plugin as plugin
+from noisegate import engine
 from noisegate.plugin import transform_terminal_output, transform_tool_result
 
 LCM_REF = "20260708T120000Z-tool-call-abc123.json"
@@ -755,7 +756,7 @@ def test_lcm_recovery_notice_impossible_fit_fails_open() -> None:
     assert transformed is None
 
 
-def test_lcm_recovery_shortening_fails_open_with_upstream_omission_evidence() -> None:
+def test_lcm_recovery_shortening_fails_open_when_diagnostic_and_exit_cannot_fit() -> None:
     results: dict[str, str | None] = {}
     for unit in ("lines", "chars"):
         notice = f"[noisegate: omitted 5 {unit}]"
@@ -815,6 +816,42 @@ def test_existing_omission_notices_remain_exact_when_lcm_excerpt_fits() -> None:
         assert "externalized_ref=foo" in transformed.splitlines()
         assert "ValueError: boom" in transformed.splitlines()
         assert "[noisegate: omitted 8 lines]" in transformed.splitlines()
+
+
+def test_lcm_excerpt_preserves_duplicate_upstream_marker_coverage() -> None:
+    raw = "\n".join(
+        [
+            "externalized_ref=foo",
+            "[noisegate: omitted 4 lines]",
+            *[f"middle-{index}-" + ("x" * 40) for index in range(4)],
+            "[noisegate: omitted 4 lines]",
+            "ValueError: boom",
+            *[f"tail-{index}-" + ("y" * 40) for index in range(4)],
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="pytest -q",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=10_000,
+        noisegate_max_lines=7,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_important_context_lines=0,
+        noisegate_max_important_lines=4,
+    )
+
+    assert isinstance(transformed, str)
+    body = "\n".join(
+        line
+        for line in transformed.splitlines()
+        if line != "[noisegate: exit_code=1]"
+    )
+    assert transformed.splitlines().count("externalized_ref=foo") == 1
+    assert "ValueError: boom" in transformed.splitlines()
+    assert "[noisegate: exit_code=1]" in transformed.splitlines()
+    assert engine._represented_line_coverage(body) == engine._represented_line_coverage(raw)
 
 
 def test_gc_externalized_placeholder_is_preserved_exactly() -> None:

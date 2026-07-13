@@ -6,7 +6,9 @@ import os
 import re
 import stat
 import tempfile
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -48,6 +50,35 @@ class StoredArtifact:
 
 
 @dataclass(frozen=True, slots=True)
+class _ArtifactWriteReceipt:
+    artifact: StoredArtifact
+    created: bool
+    device: int
+    inode: int
+
+
+_ArtifactWriteReceiptCollector = list[_ArtifactWriteReceipt]
+
+
+_CAPTURED_ARTIFACT_WRITE_RECEIPTS: ContextVar[
+    tuple[_ArtifactWriteReceiptCollector, ...]
+] = (
+    ContextVar("noisegate_artifact_write_receipts", default=())
+)
+
+
+@contextmanager
+def _capture_artifact_write_receipts() -> Iterator[list[_ArtifactWriteReceipt]]:
+    receipts: list[_ArtifactWriteReceipt] = []
+    active_collectors = _CAPTURED_ARTIFACT_WRITE_RECEIPTS.get()
+    token = _CAPTURED_ARTIFACT_WRITE_RECEIPTS.set((*active_collectors, receipts))
+    try:
+        yield receipts
+    finally:
+        _CAPTURED_ARTIFACT_WRITE_RECEIPTS.reset(token)
+
+
+@dataclass(frozen=True, slots=True)
 class ArtifactInfo:
     artifact_id: str
     sha256: str
@@ -86,6 +117,17 @@ class ArtifactStore:
         return cls(default_artifact_dir(), size_cap=cap)
 
     def store(self, text: str) -> StoredArtifact:
+        artifact, receipt = self._store_with_receipt(text)
+        seen_collectors: set[int] = set()
+        for collector in _CAPTURED_ARTIFACT_WRITE_RECEIPTS.get():
+            collector_identity = id(collector)
+            if collector_identity in seen_collectors:
+                continue
+            seen_collectors.add(collector_identity)
+            collector.append(receipt)
+        return artifact
+
+    def _store_with_receipt(self, text: str) -> tuple[StoredArtifact, _ArtifactWriteReceipt]:
         data = text.encode("utf-8")
         if len(data) > self.size_cap:
             raise ArtifactTooLarge(len(data), self.size_cap)
@@ -110,9 +152,17 @@ class ArtifactStore:
                 raise ArtifactSecurityError(
                     "artifact id collision with different content"
                 ) from None
-            return StoredArtifact(artifact_id, digest, len(data))
+            artifact = StoredArtifact(artifact_id, digest, len(data))
+            return artifact, _ArtifactWriteReceipt(
+                artifact=artifact,
+                created=False,
+                device=stat_result.st_dev,
+                inode=stat_result.st_ino,
+            )
 
         temp_path: Path | None = None
+        publication_stat: os.stat_result | None = None
+        created = False
         try:
             fd, raw_temp_path = tempfile.mkstemp(
                 prefix=f".{artifact_id}.",
@@ -122,14 +172,17 @@ class ArtifactStore:
             temp_path = Path(raw_temp_path)
             with os.fdopen(fd, "wb") as handle:
                 handle.write(data)
+                publication_stat = os.fstat(handle.fileno())
             os.chmod(temp_path, 0o600)
             os.link(temp_path, path)
+            created = True
         except FileExistsError:
             existing = self.read(artifact_id)
             if hashlib.sha256(existing.encode("utf-8")).hexdigest() != digest:
                 raise ArtifactSecurityError(
                     "artifact id collision with different content"
                 ) from None
+            publication_stat = path.lstat()
         except OSError as exc:
             if exc.errno == errno.ELOOP:
                 raise ArtifactSecurityError("artifact path resolves through a symlink") from exc
@@ -138,7 +191,33 @@ class ArtifactStore:
             if temp_path is not None:
                 with suppress(FileNotFoundError):
                     temp_path.unlink()
-        return StoredArtifact(artifact_id, digest, len(data))
+        if publication_stat is None:
+            raise ArtifactSecurityError("artifact publication identity unavailable")
+        artifact = StoredArtifact(artifact_id, digest, len(data))
+        return artifact, _ArtifactWriteReceipt(
+            artifact=artifact,
+            created=created,
+            device=publication_stat.st_dev,
+            inode=publication_stat.st_ino,
+        )
+
+    def _remove_created_artifact(self, receipt: _ArtifactWriteReceipt) -> bool:
+        if not receipt.created:
+            return False
+        try:
+            root = self._ensure_root()
+            path = self._path_for(receipt.artifact.artifact_id, root=root)
+            stat_result = path.lstat()
+            if (
+                not stat.S_ISREG(stat_result.st_mode)
+                or stat_result.st_dev != receipt.device
+                or stat_result.st_ino != receipt.inode
+            ):
+                return False
+            path.unlink()
+        except (ArtifactError, FileNotFoundError, OSError):
+            return False
+        return True
 
     def read(self, artifact_id: str) -> str:
         return self._read_bytes(artifact_id).decode("utf-8")

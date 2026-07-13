@@ -91,6 +91,296 @@ def test_generic_long_output_uses_deterministic_head_tail() -> None:
     assert result.metadata["omitted_chars"] > 0
 
 
+def test_generic_head_tail_remaps_colliding_upstream_line_omission_by_coverage() -> None:
+    raw = "\n".join(
+        [
+            "head",
+            "line-1",
+            "line-2",
+            "line-3",
+            "[noisegate: omitted 8 lines]",
+            "line-5",
+            "line-6",
+            "line-7",
+            "line-8",
+            "tail",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="make noisy",
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=1,
+            tail_lines=1,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.text == "head\n[noisegate: omitted 15 lines]\ntail"
+    assert engine._represented_line_coverage(result.text) == 17
+
+
+def test_generic_head_tail_aggregates_duplicate_upstream_line_omissions() -> None:
+    raw = "\n".join(
+        [
+            "head",
+            "[noisegate: omitted 4 lines]",
+            "line-2",
+            "line-3",
+            "line-4",
+            "line-5",
+            "[noisegate: omitted 4 lines]",
+            "tail",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="make noisy",
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=1,
+            tail_lines=1,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.text == "head\n[noisegate: omitted 12 lines]\ntail"
+    assert engine._represented_line_coverage(result.text) == 14
+
+
+def test_line_coverage_remap_keeps_fittable_ranked_failure() -> None:
+    raw = "\n".join(
+        [
+            "FAILED tests/t.py::test_x - AssertionError: nope",
+            *["[noisegate: omitted 8 lines]"] * 3,
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        options=NoisegateOptions(
+            max_chars=80,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.text == "\n".join(
+        [
+            "FAILED tests/t.py::test_x - AssertionError: nope",
+            "[noisegate: omitted 24 lines]",
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "command_class"),
+    [
+        ("pytest -q", "pytest"),
+        ("npm test", "node"),
+        ("docker build .", "docker_build"),
+        ("make noisy", "generic"),
+    ],
+)
+def test_line_coverage_remap_keeps_best_ranked_fittable_diagnostic(
+    command: str,
+    command_class: str,
+) -> None:
+    raw = "\n".join(
+        [
+            "[noisegate: omitted 8 lines]",
+            "ValueError: actionable boom",
+            *[f"middle-{index}-" + ("x" * 80) for index in range(5)],
+            "ERROR: generic transient noise",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command=command,
+        exit_code=1,
+        options=NoisegateOptions(
+            max_chars=120,
+            max_lines=4,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=0,
+            max_important_lines=1,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.metadata["command_class"] == command_class
+    assert result.text == "\n".join(
+        [
+            "[noisegate: omitted 8 lines]",
+            "ValueError: actionable boom",
+            "[noisegate: omitted 6 lines]",
+            "[noisegate: exit_code=1]",
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_chars", "max_lines"),
+    [(140, 50), (10_000, 5)],
+    ids=("char_budget", "line_budget"),
+)
+def test_line_coverage_remap_keeps_lcm_ref_with_best_ranked_diagnostic(
+    max_chars: int,
+    max_lines: int,
+) -> None:
+    raw = "\n".join(
+        [
+            "externalized_ref=foo",
+            "[noisegate: omitted 8 lines]",
+            "ValueError: actionable boom",
+            *[f"middle-{index}-" + ("x" * 80) for index in range(5)],
+            "ERROR: generic transient noise",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=NoisegateOptions(
+            max_chars=max_chars,
+            max_lines=max_lines,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=0,
+            max_important_lines=1,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.text == "\n".join(
+        [
+            "externalized_ref=foo",
+            "[noisegate: omitted 8 lines]",
+            "ValueError: actionable boom",
+            "[noisegate: omitted 6 lines]",
+            "[noisegate: exit_code=1]",
+        ]
+    )
+
+
+def test_line_coverage_remap_keeps_reducer_specific_anchor_with_lcm_ref() -> None:
+    raw = "\n".join(
+        [
+            "externalized_ref=foo",
+            " M important.py",
+            "[noisegate: omitted 1 lines]",
+            "xxxx",
+            "[noisegate: omitted 2 lines]",
+            "yyyy",
+            "[noisegate: omitted 20 lines]",
+            "zzzz",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="git status --short",
+        exit_code=1,
+        options=NoisegateOptions(
+            max_chars=91,
+            max_lines=4,
+            max_important_lines=2,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.text == "\n".join(
+        [
+            "externalized_ref=foo",
+            " M important.py",
+            "[noisegate: omitted 26 lines]",
+            "[noisegate: exit_code=1]",
+        ]
+    )
+    assert len(result.text) == 91
+    body = "\n".join(result.text.splitlines()[:-1])
+    assert engine._represented_line_coverage(body) == engine._represented_line_coverage(raw)
+
+
+def test_generated_char_marker_cannot_impersonate_upstream_marker() -> None:
+    raw = "HEAD-a\n[noisegate: omitted 32 chars]\nb-TAIL"
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        options=options(
+            max_chars=42,
+            max_lines=50,
+            head_lines=50,
+            tail_lines=50,
+        ),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+
+
+def test_duplicate_upstream_char_markers_fail_open_when_they_cannot_fit() -> None:
+    notice = "[noisegate: omitted 32 chars]"
+    raw = "\n".join(
+        [
+            "head-" + ("h" * 40),
+            notice,
+            "middle-1-" + ("x" * 40),
+            "middle-2-" + ("x" * 40),
+            notice,
+            "tail-" + ("t" * 40),
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="make noisy",
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=1,
+            tail_lines=1,
+        ),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.text.splitlines().count(notice) == 2
+
+
+def test_final_budget_fails_open_when_upstream_char_marker_cannot_fit() -> None:
+    raw = "HEAD-a\n[noisegate: omitted 32 chars]\nb-TAIL"
+
+    rewrite = engine._enforce_final_budget(
+        raw,
+        options(
+            max_chars=42,
+            max_lines=50,
+            head_lines=50,
+            tail_lines=50,
+        ),
+        preserve_patterns=engine.CRITICAL_PATTERNS,
+    )
+
+    assert rewrite is None
+
+
 def test_named_non_noisy_tools_are_protected_by_default() -> None:
     raw = numbered("useful context", 100)
 
@@ -2309,7 +2599,7 @@ def test_recovery_notices_fail_open_when_important_line_cannot_fit() -> None:
 
 
 @pytest.mark.parametrize("unit", ["lines", "chars"])
-def test_recovery_shortening_fails_open_with_upstream_omission_evidence(
+def test_recovery_shortening_fails_open_when_diagnostic_and_exit_cannot_fit(
     unit: str,
 ) -> None:
     notice = f"[noisegate: omitted 123 {unit}]"
@@ -2337,6 +2627,43 @@ def test_recovery_shortening_fails_open_with_upstream_omission_evidence(
 
     assert result.changed is False
     assert result.text == raw
+
+
+def test_failed_output_remaps_upstream_line_coverage_and_keeps_exit_notice() -> None:
+    raw = "\n".join(
+        [
+            "pre-0-" + ("x" * 30),
+            "pre-1-" + ("x" * 30),
+            "[noisegate: omitted 8 lines]",
+            "middle-0-" + ("x" * 30),
+            "middle-1-" + ("x" * 30),
+            "ValueError: boom",
+            *[f"tail-{index}-" + ("x" * 30) for index in range(4)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            max_lines=6,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=0,
+        ),
+    )
+
+    body = "\n".join(
+        line
+        for line in result.text.splitlines()
+        if line != "[noisegate: exit_code=1]"
+    )
+    assert result.changed is True
+    assert "ValueError: boom" in result.text.splitlines()
+    assert "[noisegate: exit_code=1]" in result.text.splitlines()
+    assert engine._represented_line_coverage(body) == engine._represented_line_coverage(raw)
 
 
 def test_upstream_omission_evidence_may_compact_when_exit_notice_already_fits() -> None:
@@ -2395,6 +2722,28 @@ def test_artifact_enabled_failure_line_that_cannot_fit_fails_open() -> None:
     assert result.changed is False
     assert result.text == raw
     assert result.metadata["reason"] == "reducer_no_output"
+
+
+def test_artifact_path_does_not_turn_char_marker_collision_into_a_gain(tmp_path) -> None:
+    raw = "HEAD-a\n[noisegate: omitted 32 chars]\nb-TAIL"
+    artifact_dir = tmp_path / "artifacts"
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        options=options(
+            max_chars=42,
+            max_lines=50,
+            head_lines=50,
+            tail_lines=50,
+            artifact_enabled=True,
+            artifact_dir=artifact_dir,
+        ),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert not artifact_dir.exists()
 
 
 def test_important_line_reducer_tight_line_cap_preserves_middle_failure() -> None:

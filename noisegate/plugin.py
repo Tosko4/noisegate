@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shlex
+import stat
 from collections.abc import Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
 from ._version import __version__
+from .artifacts import ArtifactError, ArtifactStore, _capture_artifact_write_receipts
 from .engine import (
     JsonValue,
     NoisegateOptions,
@@ -16,9 +20,11 @@ from .engine import (
     _compactable_command_output_class,
     _drop_artifact_if_notice_cannot_fit,
     _exact_command_output_class,
+    _fits_budget,
     _is_compactable_tool_name,
     _plan_artifact,
     _preserve_patterns_for_output,
+    _recovery_notices,
     _store_artifact,
     classify_command,
     reduce_text,
@@ -50,6 +56,22 @@ GENERIC_TEXT_FIELDS = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _ArtifactNoticeOwnerStep:
+    field: str
+    parse_json: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _ArtifactPreviewPlan:
+    original_text: str
+    artifact_id: str
+    sha256: str
+    size_bytes: int
+    recovery_notice: str = ""
+    owner_path: tuple[_ArtifactNoticeOwnerStep, ...] = ()
+
+
 class HookRegistrar(Protocol):
     def register_hook(self, name: str, callback: HookCallback) -> None: ...
 
@@ -74,6 +96,7 @@ def transform_tool_result(
         args=args,
         arguments=arguments,
         defer_artifact_store=False,
+        artifact_plans_out=None,
         **kwargs,
     )
 
@@ -84,6 +107,7 @@ def _preview_tool_result(
     tool_name: str = "",
     args: Mapping[str, Any] | None = None,
     arguments: Mapping[str, Any] | None = None,
+    artifact_plans_out: list[_ArtifactPreviewPlan] | None = None,
     **kwargs: Any,
 ) -> str | None:
     return _transform_tool_result(
@@ -92,6 +116,7 @@ def _preview_tool_result(
         args=args,
         arguments=arguments,
         defer_artifact_store=True,
+        artifact_plans_out=artifact_plans_out,
         **kwargs,
     )
 
@@ -103,6 +128,7 @@ def _transform_tool_result(
     args: Mapping[str, Any] | None,
     arguments: Mapping[str, Any] | None,
     defer_artifact_store: bool,
+    artifact_plans_out: list[_ArtifactPreviewPlan] | None,
     **kwargs: Any,
 ) -> str | None:
     try:
@@ -166,19 +192,34 @@ def _transform_tool_result(
             )
             if options.artifact_enabled:
                 metadata["artifact"] = _plan_artifact(parsed, options)
+                notice_metadata = dict(metadata)
+                notice_metadata["exit_code"] = None
                 _drop_artifact_if_notice_cannot_fit(
-                    metadata,
+                    notice_metadata,
                     options,
                     artifact_dir=options.artifact_dir,
                 )
+                metadata["artifact"] = notice_metadata["artifact"]
                 text = _append_recovery_notices(
                     text,
-                    metadata,
+                    notice_metadata,
                     artifact_dir=options.artifact_dir,
                     options=options,
                     preserve_patterns=preserve_patterns,
+                    fail_open_text=parsed,
                 )
-                _mark_artifact_notice_dropped_if_missing(metadata, text)
+                _mark_artifact_notice_dropped_if_missing(
+                    metadata,
+                    text,
+                    artifact_dir=options.artifact_dir,
+                )
+            if not _valid_transformed_text(
+                original=parsed,
+                transformed=text,
+                metadata=metadata,
+                options=options,
+            ):
+                return None
             candidate = json.dumps(text, ensure_ascii=False)
             if len(candidate) >= len(result):
                 return None
@@ -186,15 +227,41 @@ def _transform_tool_result(
                 artifact = metadata.get("artifact")
                 if isinstance(artifact, dict) and artifact.get("stored") is True:
                     metadata["artifact"] = _store_artifact(parsed, options)
+                    notice_metadata = dict(metadata)
+                    notice_metadata["exit_code"] = None
                     text = _append_recovery_notices(
                         reduced.text,
-                        metadata,
+                        notice_metadata,
                         artifact_dir=options.artifact_dir,
                         options=options,
                         preserve_patterns=preserve_patterns,
+                        fail_open_text=parsed,
                     )
+                    if not _valid_transformed_text(
+                        original=parsed,
+                        transformed=text,
+                        metadata=metadata,
+                        options=options,
+                    ):
+                        return None
                     candidate = json.dumps(text, ensure_ascii=False)
-            return candidate if len(candidate) < len(result) else None
+            if len(candidate) >= len(result):
+                return None
+            if defer_artifact_store and artifact_plans_out is not None:
+                plan = _artifact_preview_plan(
+                    parsed,
+                    metadata,
+                    artifact_dir=options.artifact_dir,
+                )
+                artifact = metadata.get("artifact")
+                if isinstance(artifact, dict) and artifact.get("stored") is True:
+                    if plan is None or not _artifact_preview_plan_matches_serialized_output(
+                        plan,
+                        candidate,
+                    ):
+                        return None
+                    artifact_plans_out.append(plan)
+            return candidate
 
         if not isinstance(parsed, dict):
             return None
@@ -224,6 +291,7 @@ def _transform_tool_result(
         field_metadata: dict[str, JsonValue] = {}
         original_values: dict[str, str] = {}
         reduced_values: dict[str, str] = {}
+        preview_plans_by_field: dict[str, _ArtifactPreviewPlan] = {}
         preserve_patterns_by_field: dict[str, tuple[re.Pattern[str], ...] | None] = {}
         reduce_options = replace(options, artifact_enabled=False)
 
@@ -259,15 +327,33 @@ def _transform_tool_result(
                         artifact_dir=options.artifact_dir,
                         options=options,
                         preserve_patterns=preserve_patterns,
+                        fail_open_text=value,
                     )
-                    _mark_artifact_notice_dropped_if_missing(metadata, text)
-                    if len(text) >= len(value):
-                        continue
+                    _mark_artifact_notice_dropped_if_missing(
+                        metadata,
+                        text,
+                        artifact_dir=options.artifact_dir,
+                    )
+                if not _valid_transformed_text(
+                    original=value,
+                    transformed=text,
+                    metadata=metadata,
+                    options=options,
+                ):
+                    continue
                 payload[field] = text
                 field_metadata[field] = metadata
                 original_values[field] = value
                 reduced_values[field] = reduced.text
                 preserve_patterns_by_field[field] = preserve_patterns
+                plan = _artifact_preview_plan(
+                    value,
+                    metadata,
+                    artifact_dir=options.artifact_dir,
+                    owner_path=(_ArtifactNoticeOwnerStep(field),),
+                )
+                if plan is not None:
+                    preview_plans_by_field[field] = plan
 
         if not field_metadata:
             return None
@@ -294,15 +380,38 @@ def _transform_tool_result(
                         metadata["artifact"] = _store_artifact(value, options)
                     notice_metadata = dict(metadata)
                     notice_metadata["exit_code"] = None
-                    payload[field] = _append_recovery_notices(
+                    text = _append_recovery_notices(
                         reduced_text,
                         notice_metadata,
                         artifact_dir=options.artifact_dir,
                         options=options,
                         preserve_patterns=preserve_patterns_by_field.get(field),
+                        fail_open_text=value,
                     )
+                    if not _valid_transformed_text(
+                        original=value,
+                        transformed=text,
+                        metadata=metadata,
+                        options=options,
+                    ):
+                        return None
+                    payload[field] = text
             candidate = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        return candidate if len(candidate) < len(result) else None
+        if len(candidate) >= len(result):
+            return None
+        if defer_artifact_store and artifact_plans_out is not None:
+            for field, metadata in field_metadata.items():
+                artifact = metadata.get("artifact") if isinstance(metadata, dict) else None
+                if not isinstance(artifact, dict) or artifact.get("stored") is not True:
+                    continue
+                plan = preview_plans_by_field.get(field)
+                if plan is None or not _artifact_preview_plan_matches_serialized_output(
+                    plan,
+                    candidate,
+                ):
+                    return None
+                artifact_plans_out.append(plan)
+        return candidate
     except Exception:
         return None
 
@@ -310,18 +419,240 @@ def _transform_tool_result(
 def _mark_artifact_notice_dropped_if_missing(
     metadata: dict[str, JsonValue],
     text: str,
+    *,
+    artifact_dir: Path | None,
 ) -> None:
     artifact = metadata.get("artifact")
     if not isinstance(artifact, dict) or artifact.get("stored") is not True:
         return
-    artifact_id = artifact.get("id")
-    if isinstance(artifact_id, str) and artifact_id in text:
+    notice = _artifact_recovery_notice(metadata, artifact_dir=artifact_dir)
+    if notice is not None and notice in text.splitlines():
         return
     metadata["artifact"] = {
         "stored": False,
         "reason": "recovery_notice_dropped",
         "size_bytes": artifact.get("size_bytes"),
     }
+
+
+def _artifact_preview_plan(
+    original_text: str,
+    metadata: Mapping[str, JsonValue],
+    *,
+    artifact_dir: Path | None = None,
+    owner_path: tuple[_ArtifactNoticeOwnerStep, ...] = (),
+) -> _ArtifactPreviewPlan | None:
+    artifact = metadata.get("artifact")
+    if not isinstance(artifact, dict) or artifact.get("stored") is not True:
+        return None
+    artifact_id = artifact.get("id")
+    sha256 = artifact.get("sha256")
+    size_bytes = artifact.get("size_bytes")
+    data = original_text.encode("utf-8")
+    digest = hashlib.sha256(data).hexdigest()
+    recovery_notice = _artifact_recovery_notice(metadata, artifact_dir=artifact_dir)
+    if (
+        not isinstance(artifact_id, str)
+        or artifact_id != f"ng_{digest[:24]}"
+        or sha256 != digest
+        or not isinstance(size_bytes, int)
+        or isinstance(size_bytes, bool)
+        or size_bytes != len(data)
+        or recovery_notice is None
+    ):
+        return None
+    return _ArtifactPreviewPlan(
+        original_text=original_text,
+        artifact_id=artifact_id,
+        sha256=digest,
+        size_bytes=size_bytes,
+        recovery_notice=recovery_notice,
+        owner_path=owner_path,
+    )
+
+
+def _artifact_recovery_notice(
+    metadata: Mapping[str, JsonValue],
+    *,
+    artifact_dir: Path | None,
+) -> str | None:
+    notices = [
+        notice
+        for notice in _recovery_notices(dict(metadata), artifact_dir=artifact_dir)
+        if notice.startswith("[noisegate artifact:")
+    ]
+    return notices[0] if len(notices) == 1 else None
+
+
+def _artifact_preview_plan_notice_present_in_text(
+    plan: _ArtifactPreviewPlan,
+    text: str,
+) -> bool:
+    return bool(plan.recovery_notice) and plan.recovery_notice in text.splitlines()
+
+
+def _artifact_preview_plan_with_owner_prefix(
+    plan: _ArtifactPreviewPlan,
+    prefix: tuple[_ArtifactNoticeOwnerStep, ...],
+) -> _ArtifactPreviewPlan:
+    return replace(plan, owner_path=(*prefix, *plan.owner_path))
+
+
+def _artifact_preview_plan_matches_serialized_output(
+    plan: _ArtifactPreviewPlan,
+    output: str,
+) -> bool:
+    try:
+        owner: Any = json.loads(output)
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        return False
+    for step in plan.owner_path:
+        if not isinstance(owner, dict) or step.field not in owner:
+            return False
+        owner = owner[step.field]
+        if step.parse_json:
+            if not isinstance(owner, str):
+                return False
+            try:
+                owner = json.loads(owner)
+            except (json.JSONDecodeError, RecursionError, ValueError):
+                return False
+    return isinstance(owner, str) and _artifact_preview_plan_notice_present_in_text(plan, owner)
+
+
+def _store_artifact_preview_plan(
+    plan: _ArtifactPreviewPlan,
+    options: NoisegateOptions,
+) -> bool:
+    planned = _artifact_preview_plan(
+        plan.original_text,
+        {
+            "artifact": {
+                "stored": True,
+                "id": plan.artifact_id,
+                "sha256": plan.sha256,
+                "size_bytes": plan.size_bytes,
+            }
+        },
+        artifact_dir=options.artifact_dir,
+        owner_path=plan.owner_path,
+    )
+    if planned != plan:
+        return False
+
+    store = ArtifactStore(
+        options.artifact_dir,
+        size_cap=options.artifact_size_cap,
+    )
+    try:
+        try:
+            root_stat = store.root.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISDIR(root_stat.st_mode):
+                return False
+            root = store._ensure_root()
+            target = store._path_for(plan.artifact_id, root=root)
+            try:
+                target_stat = target.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                if not stat.S_ISREG(target_stat.st_mode):
+                    return False
+    except (ArtifactError, OSError):
+        return False
+
+    receipt = None
+    cleanup_receipt = None
+    verified = False
+    try:
+        with _capture_artifact_write_receipts() as receipts:
+            try:
+                stored = _store_artifact(plan.original_text, options)
+            finally:
+                matching_receipts = []
+                matching_receipt_keys: set[tuple[str, bool, int, int]] = set()
+                for candidate in receipts:
+                    artifact = candidate.artifact
+                    if (
+                        artifact.artifact_id != plan.artifact_id
+                        or artifact.sha256 != plan.sha256
+                        or artifact.size_bytes != plan.size_bytes
+                    ):
+                        continue
+                    key = (
+                        artifact.artifact_id,
+                        candidate.created,
+                        candidate.device,
+                        candidate.inode,
+                    )
+                    if key in matching_receipt_keys:
+                        continue
+                    matching_receipt_keys.add(key)
+                    matching_receipts.append(candidate)
+                if len(matching_receipts) == 1:
+                    receipt = matching_receipts[0]
+                created_receipts = [
+                    candidate for candidate in matching_receipts if candidate.created
+                ]
+                if len(created_receipts) == 1:
+                    cleanup_receipt = created_receipts[0]
+        if (
+            stored.get("stored") is not True
+            or receipt is None
+            or stored.get("id") != plan.artifact_id
+            or stored.get("sha256") != plan.sha256
+            or stored.get("size_bytes") != plan.size_bytes
+        ):
+            return False
+        root = store._ensure_root()
+        target = store._path_for(plan.artifact_id, root=root)
+        final_stat = target.lstat()
+        if (
+            not stat.S_ISREG(final_stat.st_mode)
+            or final_stat.st_dev != receipt.device
+            or final_stat.st_ino != receipt.inode
+        ):
+            return False
+        resolved = store.read(plan.artifact_id)
+        if resolved != plan.original_text:
+            return False
+        verified = True
+        return True
+    except Exception:
+        return False
+    finally:
+        if not verified and cleanup_receipt is not None:
+            store._remove_created_artifact(cleanup_receipt)
+
+
+def _valid_transformed_text(
+    *,
+    original: str,
+    transformed: str,
+    metadata: dict[str, JsonValue],
+    options: NoisegateOptions,
+) -> bool:
+    if len(transformed) >= len(original) or not _fits_budget(transformed, options):
+        return False
+
+    required_notices: list[str] = []
+    exit_code = metadata.get("exit_code")
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0:
+        required_notices.append(f"[noisegate: exit_code={exit_code}]")
+
+    artifact = metadata.get("artifact")
+    if isinstance(artifact, dict) and artifact.get("stored") is True:
+        required_notices.extend(
+            notice
+            for notice in _recovery_notices(metadata, artifact_dir=options.artifact_dir)
+            if notice.startswith("[noisegate artifact:")
+        )
+
+    transformed_lines = transformed.splitlines()
+    return all(notice in transformed_lines for notice in required_notices)
 
 
 def _metadata_key(payload: Mapping[str, JsonValue]) -> str:
