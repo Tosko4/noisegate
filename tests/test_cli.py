@@ -1336,6 +1336,33 @@ def test_reduce_json_no_gain_artifact_request_has_no_side_effect(
         assert not artifact_dir.exists()
 
 
+def test_reduce_json_no_gain_metadata_does_not_claim_artifact(
+    tmp_path: Path,
+) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    payload = {"returncode": 0, "result": "A" * 4001, "context": ""}
+    raw = json.dumps(payload, separators=(",", ":"))
+
+    proc = run_cli(
+        "reduce-json",
+        "--metadata",
+        "--store-artifact",
+        "--artifact-dir",
+        str(artifact_dir),
+        input_text=raw,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == raw
+    metadata = json.loads(proc.stderr)
+    assert metadata["artifact"] == {
+        "stored": False,
+        "reason": "outer_no_gain",
+        "size_bytes": 4001,
+    }
+    assert not artifact_dir.exists()
+
+
 def test_reduce_json_multi_artifact_envelopes_stay_inline_only(tmp_path: Path) -> None:
     cases = {
         "multi-field": {

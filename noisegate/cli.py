@@ -164,6 +164,7 @@ def cmd_reduce_json(args: argparse.Namespace) -> int:
             if preview == raw:
                 output = raw
                 metadata = preview_metadata
+                _discard_preview_artifact_plans(metadata)
             else:
                 planned_artifacts = _count_planned_artifacts(preview) + _count_artifact_plans(
                     preview_metadata
@@ -344,6 +345,25 @@ def cmd_artifacts_verify(args: argparse.Namespace) -> int:
         status = "ok" if check.ok else "error"
         print(f"{check.artifact_id} {status} reason={check.reason}")
     return 2 if failed else 0
+
+
+def _discard_preview_artifact_plans(value: Any) -> None:
+    if isinstance(value, dict):
+        artifact = value.get("artifact")
+        if isinstance(artifact, dict) and artifact.get("stored") is True:
+            replacement: dict[str, Any] = {
+                "stored": False,
+                "reason": "outer_no_gain",
+            }
+            size_bytes = artifact.get("size_bytes")
+            if isinstance(size_bytes, int) and not isinstance(size_bytes, bool):
+                replacement["size_bytes"] = size_bytes
+            value["artifact"] = replacement
+        for child in value.values():
+            _discard_preview_artifact_plans(child)
+    elif isinstance(value, list):
+        for child in value:
+            _discard_preview_artifact_plans(child)
 
 
 def _count_artifact_plans(value: Any) -> int:
