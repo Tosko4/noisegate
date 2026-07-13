@@ -47,12 +47,14 @@ build-backend = "hatchling.build"
 packages = ["noisegate"]
 
 [tool.hatch.build.targets.wheel.force-include]
+"docs/product-contract.md" = "docs/product-contract.md"
 "noisegate/plugin.yaml" = "noisegate/plugin.yaml"
 "noisegate/py.typed" = "noisegate/py.typed"
 
 [tool.hatch.build.targets.sdist]
 include = [
   "/assets",
+  "/docs",
   "/CHANGELOG.md",
   "/CONTRIBUTORS.md",
   "/LICENSE",

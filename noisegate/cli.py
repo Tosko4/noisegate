@@ -6,15 +6,27 @@ import json
 import os
 import shlex
 import sys
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from ._version import __version__
 from .artifacts import ArtifactError, ArtifactStore
-from .engine import NoisegateOptions, _is_compactable_tool_name, env_diagnostics, reduce_text
+from .engine import (
+    NoisegateOptions,
+    _is_compactable_tool_name,
+    _preview_reduce_text,
+    env_diagnostics,
+    reduce_text,
+)
 from .installer import DEFAULT_PACKAGE_SPEC, InstallHermesError, install_hermes
-from .plugin import transform_tool_result
+from .plugin import (
+    _extract_exit_code,
+    _preview_tool_result,
+    _select_command,
+    transform_tool_result,
+)
 from .wrap import DEFAULT_MAX_CAPTURE_BYTES, WrappedCommandInterrupted, run_wrapped_command
 
 
@@ -127,7 +139,7 @@ def cmd_reduce_json(args: argparse.Namespace) -> int:
     raw = sys.stdin.read()
     try:
         parsed = json.loads(raw)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError, ValueError):
         sys.stdout.write(raw)
         _maybe_print_metadata(
             args,
@@ -138,10 +150,39 @@ def cmd_reduce_json(args: argparse.Namespace) -> int:
     options = _options_from_args(args)
     if isinstance(parsed, dict) and isinstance(parsed.get("noisegate"), dict):
         options = options.with_mapping(parsed["noisegate"])
-
     metadata: dict[str, Any] = {}
     try:
-        output = _reduce_json_value(parsed, raw, options, metadata_out=metadata)
+        if options.artifact_enabled:
+            preview_metadata: dict[str, Any] = {}
+            preview = _reduce_json_value(
+                parsed,
+                raw,
+                options,
+                metadata_out=preview_metadata,
+                defer_artifact_store=True,
+            )
+            if preview == raw:
+                output = raw
+                metadata = preview_metadata
+                _discard_preview_artifact_plans(metadata)
+            else:
+                planned_artifacts = _count_planned_artifacts(preview) + _count_artifact_plans(
+                    preview_metadata
+                )
+                if planned_artifacts == 1:
+                    output = _reduce_json_value(parsed, raw, options, metadata_out=metadata)
+                elif planned_artifacts > 1:
+                    output = _reduce_json_value(
+                        parsed,
+                        raw,
+                        options.with_mapping({"artifacts": False}),
+                        metadata_out=metadata,
+                    )
+                else:
+                    output = preview
+                    metadata = preview_metadata
+        else:
+            output = _reduce_json_value(parsed, raw, options, metadata_out=metadata)
     except Exception:
         output = raw
     sys.stdout.write(output)
@@ -306,104 +347,510 @@ def cmd_artifacts_verify(args: argparse.Namespace) -> int:
     return 2 if failed else 0
 
 
+def _discard_preview_artifact_plans(value: Any) -> None:
+    if isinstance(value, dict):
+        artifact = value.get("artifact")
+        if isinstance(artifact, dict) and artifact.get("stored") is True:
+            replacement: dict[str, Any] = {
+                "stored": False,
+                "reason": "outer_no_gain",
+            }
+            size_bytes = artifact.get("size_bytes")
+            if isinstance(size_bytes, int) and not isinstance(size_bytes, bool):
+                replacement["size_bytes"] = size_bytes
+            value["artifact"] = replacement
+        for child in value.values():
+            _discard_preview_artifact_plans(child)
+    elif isinstance(value, list):
+        for child in value:
+            _discard_preview_artifact_plans(child)
+
+
+def _count_artifact_plans(value: Any) -> int:
+    if isinstance(value, dict):
+        count = 0
+        artifact = value.get("artifact")
+        if isinstance(artifact, dict) and artifact.get("stored") is True:
+            count += 1
+        return count + sum(_count_artifact_plans(child) for child in value.values())
+    if isinstance(value, list):
+        return sum(_count_artifact_plans(child) for child in value)
+    if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+        try:
+            return _count_artifact_plans(json.loads(value))
+        except (json.JSONDecodeError, RecursionError, ValueError):
+            return 0
+    return 0
+
+
+def _count_planned_artifacts(serialized: str) -> int:
+    try:
+        return _count_artifact_plans(json.loads(serialized))
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        return 0
+
+
 def _reduce_json_value(
     parsed: Any,
     raw: str,
     options: NoisegateOptions,
     *,
     metadata_out: dict[str, Any] | None = None,
+    defer_artifact_store: bool = False,
 ) -> str:
     hook_kwargs = _options_to_hook_kwargs(options)
-    if isinstance(parsed, dict) and isinstance(parsed.get("result"), str):
-        tool_name = str(
-            parsed.get("tool_name")
-            or parsed.get("toolName")
-            or parsed.get("tool")
-            or ""
-        )
-        call_args = _combined_call_args(parsed.get("args"), parsed.get("arguments"))
-        top_level_command = _extract_command_arg(parsed)
-        if not _has_command_arg(call_args) and top_level_command:
-            call_args = {**call_args, "command": top_level_command}
-        result_text = parsed["result"]
-        transformed = transform_tool_result(
-            result_text,
-            tool_name=tool_name,
-            args=call_args,
-            **hook_kwargs,
-        )
-        if (
-            transformed is None
-            and _is_compactable_tool_name(tool_name)
-            and not _is_json_text(result_text)
-        ):
-            command = _extract_command_arg(call_args)
-            reduced = reduce_text(
-                result_text,
-                command=command,
-                tool_name=tool_name,
-                source="reduce-json",
-                options=options,
+    tool_transform = _preview_tool_result if defer_artifact_store else transform_tool_result
+    call_args: dict[str, Any] = _envelope_call_args(parsed) if isinstance(parsed, dict) else {}
+    if isinstance(parsed, dict) and "result" in parsed:
+        explicit_tool_name = _envelope_tool_name(parsed)
+        if explicit_tool_name and not _is_compactable_tool_name(explicit_tool_name):
+            return raw
+        tool_name = _payload_tool_name(parsed, call_args)
+        result_value = parsed["result"]
+        nested_tool_name = _embedded_result_tool_name(result_value)
+        nested_transform_tool_name = "" if nested_tool_name else tool_name
+        transformed: str | None = None
+        injected_exit_keys: tuple[str, ...] = ()
+        replace_with_json_value = False
+
+        if isinstance(result_value, str):
+            result_input, injected_exit_keys = _result_transform_input(result_value, parsed)
+            result_call_args = _result_call_args(result_value) or call_args
+            result_exit_code = _result_exit_code(result_value, parsed, tool_name)
+            selected_command = _select_command(
+                result_value,
+                *_result_command_sources(result_value, parsed),
+                exit_code=result_exit_code,
             )
-            if metadata_out is not None:
-                metadata_out.update(_debug_metadata(reduced.metadata, result_text, reduced.text))
-            transformed = reduced.text if reduced.changed else None
+            if selected_command:
+                result_call_args = {**result_call_args, "command": selected_command}
+            transformed = tool_transform(
+                result_input,
+                tool_name=nested_transform_tool_name,
+                args=result_call_args,
+                noisegate_exit_code=result_exit_code,
+                **cast(Any, hook_kwargs),
+            )
+            if transformed is not None and injected_exit_keys:
+                transformed = _remove_injected_exit_hints_from_json_text(
+                    transformed,
+                    injected_exit_keys,
+                )
+            if (
+                transformed is None
+                and _is_compactable_tool_name(tool_name)
+                and not _is_json_text(result_value)
+            ):
+                command = selected_command or _envelope_command(call_args)
+                reducer = _preview_reduce_text if defer_artifact_store else reduce_text
+                reduced = reducer(
+                    result_value,
+                    command=command,
+                    tool_name=tool_name,
+                    source="reduce-json",
+                    exit_code=result_exit_code,
+                    options=options,
+                )
+                if metadata_out is not None:
+                    metadata_out.update(
+                        _debug_metadata(reduced.metadata, result_value, reduced.text)
+                    )
+                transformed = reduced.text if reduced.changed else None
+        elif isinstance(result_value, dict):
+            nested_input, injected_exit_keys = _result_transform_input(result_value, parsed)
+            result_call_args = _result_call_args(result_value) or call_args
+            result_exit_code = _result_exit_code(result_value, parsed, tool_name)
+            selected_command = _select_command(
+                nested_input,
+                *_result_command_sources(result_value, parsed),
+                exit_code=result_exit_code,
+            )
+            if selected_command:
+                result_call_args = {**result_call_args, "command": selected_command}
+            transformed = tool_transform(
+                nested_input,
+                tool_name=nested_transform_tool_name,
+                args=result_call_args,
+                noisegate_exit_code=result_exit_code,
+                **cast(Any, hook_kwargs),
+            )
+            replace_with_json_value = True
+
         if transformed is not None:
             parsed = dict(parsed)
-            parsed["result"] = transformed
-            return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
-        return raw
+            if replace_with_json_value:
+                try:
+                    transformed_value = json.loads(transformed)
+                except json.JSONDecodeError:
+                    return raw
+                if isinstance(transformed_value, dict):
+                    _remove_injected_exit_hints(transformed_value, injected_exit_keys)
+                parsed["result"] = transformed_value
+            else:
+                parsed["result"] = transformed
+            candidate = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+            if _has_direct_text_payload(parsed):
+                direct_transformed = _transform_direct_payload_preserving_json_result(
+                    parsed,
+                    tool_name=tool_name,
+                    call_args=call_args,
+                    hook_kwargs=hook_kwargs,
+                    tool_transform=tool_transform,
+                )
+                if direct_transformed is not None and len(direct_transformed) < len(raw):
+                    return direct_transformed
+            return candidate if len(candidate) < len(raw) else raw
+        if not _has_direct_text_payload(parsed):
+            return raw
 
     tool_name = ""
-    call_args: dict[Any, Any] = {}
     if isinstance(parsed, dict):
-        tool_name = str(
-            parsed.get("tool_name")
-            or parsed.get("toolName")
-            or parsed.get("tool")
-            or ""
+        tool_name = _payload_tool_name(parsed, call_args)
+    if isinstance(parsed, dict):
+        transformed = _transform_direct_payload_preserving_json_result(
+            parsed,
+            tool_name=tool_name,
+            call_args=call_args,
+            hook_kwargs=hook_kwargs,
+            tool_transform=tool_transform,
         )
-        call_args = _combined_call_args(parsed.get("args"), parsed.get("arguments"))
-        top_level_command = _extract_command_arg(parsed)
-        if not _has_command_arg(call_args) and top_level_command:
-            call_args = {**call_args, "command": top_level_command}
-        if not tool_name and _looks_terminal_payload(parsed):
-            tool_name = "terminal"
-    transformed = transform_tool_result(raw, tool_name=tool_name, args=call_args, **hook_kwargs)
-    return transformed if transformed is not None else raw
+    else:
+        transformed = tool_transform(
+            raw,
+            tool_name=tool_name,
+            args=call_args,
+            **cast(Any, hook_kwargs),
+        )
+    return transformed if transformed is not None and len(transformed) < len(raw) else raw
 
 
-def _looks_terminal_payload(payload: dict[Any, Any]) -> bool:
-    return any(key in payload for key in ("stdout", "stderr", "output")) and any(
-        key in payload for key in ("command", "exit", "exit_code", "status")
+def _transform_direct_payload_preserving_json_result(
+    payload: dict[str, Any],
+    *,
+    tool_name: str,
+    call_args: dict[str, Any],
+    hook_kwargs: dict[str, object],
+    tool_transform: Callable[..., str | None],
+) -> str | None:
+    result_value = payload.get("result")
+    if isinstance(result_value, str) and _is_json_text(result_value):
+        direct_payload = dict(payload)
+        direct_payload.pop("result", None)
+        if not _has_direct_text_payload(direct_payload):
+            return None
+        direct_raw = json.dumps(direct_payload, ensure_ascii=False, separators=(",", ":"))
+        transformed = tool_transform(
+            direct_raw,
+            tool_name=tool_name,
+            args=call_args,
+            **cast(Any, hook_kwargs),
+        )
+        if transformed is None:
+            return None
+        try:
+            transformed_payload = json.loads(transformed)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(transformed_payload, dict):
+            return None
+        transformed_payload["result"] = result_value
+        return json.dumps(transformed_payload, ensure_ascii=False, separators=(",", ":"))
+
+    direct_raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return tool_transform(
+        direct_raw,
+        tool_name=tool_name,
+        args=call_args,
+        **cast(Any, hook_kwargs),
     )
 
 
-def _has_command_arg(args: dict[Any, Any]) -> bool:
-    return bool(_extract_command_arg(args))
+def _envelope_tool_name(payload: dict[Any, Any]) -> str:
+    return str(
+        payload.get("tool_name")
+        or payload.get("toolName")
+        or payload.get("tool")
+        or ""
+    )
 
 
-def _combined_call_args(args: object, arguments: object) -> dict[Any, Any]:
-    combined: dict[Any, Any] = {}
-    args_map = args if isinstance(args, dict) else {}
-    arguments_map = arguments if isinstance(arguments, dict) else {}
-    combined.update(arguments_map)
-    combined.update(args_map)
-    command = _extract_command_arg(args_map) or _extract_command_arg(arguments_map)
-    if command:
-        combined["command"] = command
-    return combined
+def _payload_tool_name(
+    payload: dict[Any, Any],
+    call_args: dict[str, Any] | None = None,
+) -> str:
+    tool_name = _envelope_tool_name(payload)
+    if not tool_name and (
+        _looks_terminal_payload(payload, call_args)
+        or _looks_terminal_result_payload(payload, call_args)
+    ):
+        return "terminal"
+    return tool_name
 
 
-def _extract_command_arg(args: dict[Any, Any]) -> str:
+_EXIT_HINT_KEYS = ("exit", "exit_code", "returncode", "return_code", "status")
+
+
+def _envelope_exit_hint_keys(envelope: dict[Any, Any]) -> tuple[str, ...]:
+    numeric_keys = []
+    for key in ("exit", "exit_code", "returncode", "return_code"):
+        value = envelope.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            numeric_keys.append(key)
+    nonzero_numeric_keys = tuple(key for key in numeric_keys if envelope.get(key) != 0)
+    if nonzero_numeric_keys:
+        return nonzero_numeric_keys
+    status = envelope.get("status")
+    if (
+        isinstance(status, str)
+        and status.lower() in {"failed", "failure", "error", "errored"}
+    ):
+        return ("status",)
+    return tuple(numeric_keys)
+
+
+def _result_transform_input(
+    result_value: Any,
+    envelope: dict[Any, Any],
+) -> tuple[str, tuple[str, ...]]:
+    if isinstance(result_value, dict):
+        payload = dict(result_value)
+    elif isinstance(result_value, str):
+        try:
+            nested = json.loads(result_value)
+        except json.JSONDecodeError:
+            return result_value, ()
+        if not isinstance(nested, dict):
+            return result_value, ()
+        payload = dict(nested)
+    else:
+        return json.dumps(result_value, ensure_ascii=False, separators=(",", ":")), ()
+
+    if any(key in payload for key in _EXIT_HINT_KEYS):
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")), ()
+
+    injected_keys = []
+    for key in _envelope_exit_hint_keys(envelope):
+        payload[key] = envelope[key]
+        injected_keys.append(key)
+    return (
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        tuple(injected_keys),
+    )
+
+
+def _remove_injected_exit_hints_from_json_text(text: str, injected_keys: tuple[str, ...]) -> str:
+    if not injected_keys:
+        return text
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+    if not isinstance(payload, dict):
+        return text
+    _remove_injected_exit_hints(payload, injected_keys)
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _remove_injected_exit_hints(payload: dict[Any, Any], injected_keys: tuple[str, ...]) -> None:
+    for key in injected_keys:
+        payload.pop(key, None)
+
+
+def _embedded_result_tool_name(result_value: Any) -> str:
+    if isinstance(result_value, dict):
+        return _envelope_tool_name(result_value)
+    if isinstance(result_value, str):
+        try:
+            nested = json.loads(result_value)
+        except json.JSONDecodeError:
+            return ""
+        if isinstance(nested, dict):
+            return _envelope_tool_name(nested)
+    return ""
+
+
+def _result_call_args(result_value: Any) -> dict[str, Any]:
+    if isinstance(result_value, dict):
+        return _envelope_call_args(result_value)
+    if isinstance(result_value, str):
+        try:
+            nested = json.loads(result_value)
+        except json.JSONDecodeError:
+            return {}
+        if isinstance(nested, dict):
+            return _envelope_call_args(nested)
+    return {}
+
+
+def _result_mapping(result_value: Any) -> dict[Any, Any] | None:
+    if isinstance(result_value, dict):
+        return result_value
+    if isinstance(result_value, str):
+        try:
+            nested = json.loads(result_value)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(nested, dict):
+            return nested
+    return None
+
+
+def _result_command_sources(
+    result_value: Any,
+    envelope: dict[Any, Any],
+) -> tuple[dict[Any, Any], ...]:
+    sources: list[dict[Any, Any]] = []
+    nested = _result_mapping(result_value)
+    for payload in (nested, envelope):
+        if not isinstance(payload, dict):
+            continue
+        for key in ("args", "arguments"):
+            candidate = payload.get(key)
+            if isinstance(candidate, dict):
+                sources.append(candidate)
+        sources.append(payload)
+    return tuple(sources)
+
+
+def _result_exit_code(
+    result_value: Any,
+    envelope: dict[Any, Any],
+    tool_name: str,
+) -> int | None:
+    nested = _result_mapping(result_value)
+    if nested is not None:
+        nested_tool_name = _envelope_tool_name(nested) or tool_name
+        exit_code = _preferred_exit_code(nested, nested_tool_name)
+        if exit_code is not None:
+            return exit_code
+    return _preferred_exit_code(envelope, tool_name)
+
+
+def _preferred_exit_code(payload: dict[Any, Any], tool_name: str) -> int | None:
+    keys = _envelope_exit_hint_keys(payload)
+    if not keys:
+        return None
+    key = keys[0]
+    if key == "status":
+        return 1
+    value = payload.get(key)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return _extract_exit_code(payload, tool_name)
+
+
+def _looks_terminal_result_payload(
+    payload: dict[Any, Any],
+    call_args: dict[str, Any] | None = None,
+) -> bool:
+    result = payload.get("result")
+    has_command = _has_command_hint(payload) or _has_command_hint(call_args or {})
+    if isinstance(result, dict):
+        embedded_tool_name = _envelope_tool_name(result)
+        if embedded_tool_name and not _is_compactable_tool_name(embedded_tool_name):
+            return False
+        return _has_direct_text_payload(result) and (
+            has_command
+            or _has_exit_hint(payload)
+            or _has_command_hint(result)
+            or _has_exit_hint(result)
+        )
+    if isinstance(result, str):
+        if (has_command or _has_exit_hint(payload)) and not _is_json_text(result):
+            return True
+        try:
+            nested = json.loads(result)
+        except json.JSONDecodeError:
+            return False
+        return isinstance(nested, dict) and _has_direct_text_payload(nested) and (
+            not (
+                (embedded_tool_name := _envelope_tool_name(nested))
+                and not _is_compactable_tool_name(embedded_tool_name)
+            )
+        ) and (
+            has_command or _has_exit_hint(payload) or _has_exit_hint(nested)
+        )
+    return False
+
+
+def _has_command_hint(payload: dict[Any, Any]) -> bool:
     for key in ("command", "cmd", "shell_command", "code"):
-        value = args.get(key)
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    return _usable_argv(payload.get("argv"))
+
+
+def _usable_argv(argv: object) -> bool:
+    return (
+        isinstance(argv, list)
+        and bool(argv)
+        and all(isinstance(item, str) for item in argv)
+        and bool(argv[0].strip())
+    )
+
+
+def _has_exit_hint(payload: dict[Any, Any]) -> bool:
+    for key in ("exit", "exit_code", "returncode", "return_code"):
+        value = payload.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return True
+    return False
+
+
+def _envelope_call_args(payload: dict[Any, Any]) -> dict[str, Any]:
+    call_args: dict[str, Any] = {}
+    for key in ("args", "arguments"):
+        candidate = payload.get(key)
+        if isinstance(candidate, dict):
+            _merge_call_arg_hints(call_args, candidate)
+    _merge_call_arg_hints(call_args, payload)
+    return call_args
+
+
+def _merge_call_arg_hints(target: dict[str, Any], source: dict[Any, Any]) -> None:
+    if _has_command_hint(target):
+        return
+    for key in ("command", "cmd", "shell_command", "code"):
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            target[key] = value
+    argv = source.get("argv")
+    if _usable_argv(argv):
+        target["argv"] = argv
+
+
+def _envelope_command(values: dict[str, Any]) -> str:
+    for key in ("command", "cmd", "shell_command", "code"):
+        value = values.get(key)
         if isinstance(value, str) and value.strip():
             return value
-    argv = args.get("argv")
-    if isinstance(argv, list) and argv and all(isinstance(item, str) for item in argv):
-        return shlex.join(argv)
+    argv = values.get("argv")
+    if _usable_argv(argv):
+        return shlex.join(cast(list[str], argv))
     return ""
+
+
+def _has_direct_text_payload(payload: dict[Any, Any]) -> bool:
+    return any(
+        isinstance(payload.get(key), str)
+        for key in ("stdout", "stderr", "output", "logs", "text", "content", "message")
+    )
+
+
+def _looks_terminal_payload(
+    payload: dict[Any, Any],
+    call_args: dict[str, Any] | None = None,
+) -> bool:
+    return any(key in payload for key in ("stdout", "stderr", "output")) and (
+        _has_command_hint(payload)
+        or _has_command_hint(call_args or {})
+        or _has_exit_hint(payload)
+    )
 
 
 def _is_json_text(value: str) -> bool:

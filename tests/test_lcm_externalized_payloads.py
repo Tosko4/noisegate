@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -226,6 +227,63 @@ def test_lcm_line_budget_tries_shorter_lower_ranked_failure_summary() -> None:
     assert TOOL_PLACEHOLDER in transformed
     assert "FAILED tests/test_lcm.py::test_externalized_recovery" in transformed
     assert "E       AssertionError" not in transformed
+
+
+def test_important_line_trimming_keeps_shorter_lcm_failure_fallback() -> None:
+    raw = "\n".join(
+        [
+            TOOL_PLACEHOLDER,
+            *[
+                "E       AssertionError: " + ("x" * 260) + str(index)
+                for index in range(8)
+            ],
+            "FAILED tests/test_lcm.py::test_externalized_recovery",
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="pytest -q",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=340,
+        noisegate_max_lines=200,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_max_important_lines=3,
+        noisegate_important_context_lines=0,
+    )
+
+    assert isinstance(transformed, str)
+    assert TOOL_PLACEHOLDER in transformed
+    assert "FAILED tests/test_lcm.py::test_externalized_recovery" in transformed
+
+
+def test_important_line_trimming_keeps_fitting_rank_zero_signal() -> None:
+    raw = "\n".join(
+        [
+            "externalized_ref=ref-a",
+            "ValueError: " + ("x" * 260),
+            "TypeError: short concrete cause",
+            "3 failed",
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="pytest -q",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=140,
+        noisegate_max_lines=200,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_max_important_lines=2,
+        noisegate_important_context_lines=0,
+    )
+
+    assert isinstance(transformed, str)
+    assert "externalized_ref=ref-a" in transformed.splitlines()
+    assert "TypeError: short concrete cause" in transformed.splitlines()
+    assert "3 failed" not in transformed.splitlines()
 
 
 def test_lcm_char_budget_keeps_docker_preservation_anchor() -> None:
@@ -475,6 +533,288 @@ def test_multiple_lcm_refs_are_all_preserved_or_compaction_fails_open() -> None:
     )
 
     assert transformed is None or all(ref in transformed for ref in refs)
+
+
+def test_recovery_notice_keeps_all_lcm_refs_or_fails_open() -> None:
+    refs = [
+        "[Externalized tool output: tool_call_id=call_"
+        f"{index}; chars=120000; bytes=120321; ref=20260708T120000Z-tool-call-{index}.json]"
+        for index in range(3)
+    ]
+    raw = "\n".join(
+        [
+            refs[0],
+            numbered("mid1", 12),
+            refs[1],
+            numbered("mid2", 12),
+            refs[2],
+            numbered("tail", 12),
+            "ValueError: BOOM",
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="pytest -q",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=440,
+        noisegate_max_lines=20,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_important_context_lines=0,
+    )
+
+    assert transformed is None or all(ref in transformed for ref in refs)
+
+
+def test_recovery_notice_keeps_repeated_and_distinct_lcm_refs_or_fails_open() -> None:
+    refs = ("externalized_ref=repeat", "externalized_ref=distinct")
+    raw = "\n".join(
+        [
+            refs[0],
+            numbered("first", 8),
+            refs[1],
+            numbered("second", 8),
+            refs[0],
+            numbered("tail", 8),
+            "ValueError: boom",
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="pytest -q",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=180,
+        noisegate_max_lines=10,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_important_context_lines=0,
+    )
+
+    assert transformed is None or (
+        transformed.splitlines().count(refs[0]) == 2
+        and transformed.splitlines().count(refs[1]) == 1
+    )
+
+
+def test_prefix_related_lcm_refs_are_compared_exactly() -> None:
+    refs = ("externalized_ref=foobar", "externalized_ref=foo")
+    raw = "\n".join(
+        [
+            refs[0],
+            numbered("noise", 18),
+            refs[1],
+            numbered("tail", 3),
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="pytest -q",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=53,
+        noisegate_max_lines=20,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_important_context_lines=0,
+    )
+
+    assert transformed is None or all(ref in transformed.splitlines() for ref in refs)
+
+
+def test_lcm_char_budget_never_drops_tail_without_marker() -> None:
+    raw = "\n".join(
+        [
+            "externalized_ref=ref-a",
+            "ValueError: boom",
+            *[f"filler-{index}-" + ("x" * 40) for index in range(20)],
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="pytest -q",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=39,
+        noisegate_max_lines=50,
+        noisegate_head_lines=21,
+        noisegate_tail_lines=0,
+        noisegate_important_context_lines=0,
+    )
+
+    assert transformed is None or "[noisegate: omitted" in transformed
+
+
+def test_lcm_line_budget_never_drops_tail_without_marker() -> None:
+    raw = "\n".join(
+        [
+            "externalized_ref=ref-a",
+            "ValueError: boom",
+            *[f"filler-{index}-" + ("x" * 40) for index in range(20)],
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="pytest -q",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=10_000,
+        noisegate_max_lines=3,
+        noisegate_head_lines=21,
+        noisegate_tail_lines=0,
+        noisegate_important_context_lines=30,
+    )
+
+    assert transformed is None or "[noisegate: omitted" in transformed
+
+
+def test_lcm_selected_excerpt_marks_an_omitted_tail() -> None:
+    raw = "\n".join(
+        [
+            "externalized_ref=ref-a",
+            "ValueError: boom",
+            *[f"filler-{index}" for index in range(20)],
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="pytest -q",
+        output=raw,
+        exit_code=0,
+        noisegate_max_chars=10_000,
+        noisegate_max_lines=5,
+        noisegate_head_lines=2,
+        noisegate_tail_lines=0,
+        noisegate_important_context_lines=0,
+    )
+
+    assert isinstance(transformed, str)
+    assert "externalized_ref=ref-a" in transformed.splitlines()
+    assert "ValueError: boom" in transformed.splitlines()
+    assert "[noisegate: omitted 20 lines]" in transformed.splitlines()
+
+
+def test_lcm_recovery_shortening_accounts_for_every_omitted_source_range() -> None:
+    raw_lines = [
+        "externalized_ref=foo",
+        "noise-" + ("x" * 60),
+        "ValueError: boom",
+        "noise-a-" + ("y" * 60),
+        "noise-b-" + ("z" * 60),
+        "tail-a",
+    ]
+    raw = "\n".join(raw_lines)
+
+    transformed = transform_terminal_output(
+        command="pytest -q",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=120,
+        noisegate_max_lines=6,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=1,
+        noisegate_important_context_lines=0,
+    )
+
+    if transformed is None:
+        return
+    omitted = sum(
+        int(match.group(1))
+        for line in transformed.splitlines()
+        if (match := re.fullmatch(r"\[noisegate: omitted (\d+) lines\]", line))
+    )
+    kept = sum(line in raw_lines for line in transformed.splitlines())
+    assert omitted == len(raw_lines) - kept
+    assert "[noisegate: exit_code=1]" in transformed.splitlines()
+
+
+def test_lcm_recovery_notice_impossible_fit_fails_open() -> None:
+    raw_lines = [
+        "pre-0",
+        "externalized_ref=foo",
+        "mid-0",
+        "AssertionError: " + ("x" * 80),
+        "more-0",
+        "FAILED tests/test_demo.py::test_signal",
+        "post-0",
+    ]
+    raw = "\n".join(raw_lines)
+
+    transformed = transform_terminal_output(
+        command="pytest -q",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=80,
+        noisegate_max_lines=4,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_important_context_lines=0,
+    )
+
+    assert transformed is None
+
+
+def test_lcm_recovery_shortening_fails_open_with_upstream_omission_evidence() -> None:
+    results: dict[str, str | None] = {}
+    for unit in ("lines", "chars"):
+        notice = f"[noisegate: omitted 5 {unit}]"
+        raw = "\n".join(
+            [
+                "externalized_ref=foo",
+                *[f"a{index}" for index in range(5)],
+                notice,
+                *[f"b{index}" for index in range(5)],
+                "ValueError: boom",
+                *[f"c{index}" for index in range(5)],
+            ]
+        )
+
+        results[unit] = transform_terminal_output(
+            command="pytest -q",
+            output=raw,
+            exit_code=1,
+            noisegate_max_chars=110,
+            noisegate_max_lines=8,
+            noisegate_head_lines=0,
+            noisegate_tail_lines=0,
+            noisegate_important_context_lines=0,
+            noisegate_max_important_lines=10,
+        )
+
+    assert results == {"lines": None, "chars": None}
+
+
+def test_existing_omission_notices_remain_exact_when_lcm_excerpt_fits() -> None:
+    for notice in (
+        "[noisegate: omitted 123 lines]",
+        "[noisegate: omitted 123 chars]",
+    ):
+        raw = "\n".join(
+            [
+                "externalized_ref=foo",
+                notice,
+                "ValueError: boom",
+                *[f"filler-{index}" for index in range(8)],
+            ]
+        )
+
+        transformed = transform_terminal_output(
+            command="pytest -q",
+            output=raw,
+            exit_code=0,
+            noisegate_max_chars=120,
+            noisegate_max_lines=6,
+            noisegate_head_lines=0,
+            noisegate_tail_lines=0,
+            noisegate_important_context_lines=0,
+        )
+
+        assert isinstance(transformed, str)
+        assert transformed.splitlines().count(notice) == 1
+        assert "externalized_ref=foo" in transformed.splitlines()
+        assert "ValueError: boom" in transformed.splitlines()
+        assert "[noisegate: omitted 8 lines]" in transformed.splitlines()
 
 
 def test_gc_externalized_placeholder_is_preserved_exactly() -> None:
