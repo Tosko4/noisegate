@@ -67,12 +67,52 @@ def transform_tool_result(
     arguments: Mapping[str, Any] | None = None,
     **kwargs: Any,
 ) -> str | None:
+    kwargs.pop("defer_artifact_store", None)
+    return _transform_tool_result(
+        result,
+        tool_name=tool_name,
+        args=args,
+        arguments=arguments,
+        defer_artifact_store=False,
+        **kwargs,
+    )
+
+
+def _preview_tool_result(
+    result: str = "",
+    *,
+    tool_name: str = "",
+    args: Mapping[str, Any] | None = None,
+    arguments: Mapping[str, Any] | None = None,
+    **kwargs: Any,
+) -> str | None:
+    return _transform_tool_result(
+        result,
+        tool_name=tool_name,
+        args=args,
+        arguments=arguments,
+        defer_artifact_store=True,
+        **kwargs,
+    )
+
+
+def _transform_tool_result(
+    result: str,
+    *,
+    tool_name: str,
+    args: Mapping[str, Any] | None,
+    arguments: Mapping[str, Any] | None,
+    defer_artifact_store: bool,
+    **kwargs: Any,
+) -> str | None:
     try:
         override = kwargs.pop("noisegate_exit_code", None)
         exit_code_override = (
             override if isinstance(override, int) and not isinstance(override, bool) else None
         )
-        if not _is_compactable_tool_name(tool_name) or not isinstance(result, str):
+        if not isinstance(result, str):
+            return None
+        if tool_name and not _is_compactable_tool_name(tool_name):
             return None
         options = NoisegateOptions.from_env().with_mapping(kwargs)
         if not options.enabled or options.mode == "off":
@@ -81,10 +121,27 @@ def transform_tool_result(
         parsed = json.loads(result)
         args_map = args if isinstance(args, Mapping) else {}
         arguments_map = arguments if isinstance(arguments, Mapping) else {}
+        call_args = _call_args(
+            args,
+            arguments,
+            parsed,
+            prefer_host_args=bool(tool_name),
+        )
+        if not tool_name and isinstance(parsed, Mapping):
+            embedded_tool_name = _payload_tool_name(parsed)
+            if embedded_tool_name:
+                if not _is_compactable_tool_name(embedded_tool_name):
+                    return None
+                tool_name = embedded_tool_name
+        if not tool_name:
+            if not _looks_terminal_payload(parsed, call_args):
+                return None
+            tool_name = "terminal"
 
         if isinstance(parsed, str):
             command = _select_command(
                 parsed,
+                call_args,
                 args_map,
                 arguments_map,
                 exit_code=exit_code_override,
@@ -125,7 +182,7 @@ def transform_tool_result(
             candidate = json.dumps(text, ensure_ascii=False)
             if len(candidate) >= len(result):
                 return None
-            if options.artifact_enabled:
+            if options.artifact_enabled and not defer_artifact_store:
                 artifact = metadata.get("artifact")
                 if isinstance(artifact, dict) and artifact.get("stored") is True:
                     metadata["artifact"] = _store_artifact(parsed, options)
@@ -147,6 +204,10 @@ def transform_tool_result(
         if exit_code is None:
             exit_code = exit_code_override
         fields = _candidate_fields(tool_name, payload)
+        if options.artifact_enabled and sum(
+            isinstance(payload.get(field), str) and bool(payload.get(field)) for field in fields
+        ) > 1:
+            options = replace(options, artifact_enabled=False)
         command_text = "\n".join(
             value
             for field in fields
@@ -154,6 +215,7 @@ def transform_tool_result(
         )
         command = _select_command(
             command_text,
+            call_args,
             args_map,
             arguments_map,
             payload,
@@ -210,7 +272,7 @@ def transform_tool_result(
         if not field_metadata:
             return None
 
-        metadata_key = "_noisegate" if "noisegate" in payload else "noisegate"
+        metadata_key = _metadata_key(payload)
         payload[metadata_key] = {
             "version": __version__,
             "compacted": True,
@@ -222,7 +284,7 @@ def transform_tool_result(
         if len(candidate) >= len(result):
             return None
 
-        if options.artifact_enabled:
+        if options.artifact_enabled and not defer_artifact_store:
             for field, value in original_values.items():
                 metadata = field_metadata.get(field)
                 reduced_text = reduced_values.get(field)
@@ -262,6 +324,15 @@ def _mark_artifact_notice_dropped_if_missing(
     }
 
 
+def _metadata_key(payload: Mapping[str, JsonValue]) -> str:
+    if "noisegate" not in payload:
+        return "noisegate"
+    candidate = "_noisegate"
+    while candidate in payload:
+        candidate = f"_{candidate}"
+    return candidate
+
+
 def _preserve_patterns_for(
     command: str,
     text: str,
@@ -273,7 +344,7 @@ def _preserve_patterns_for(
 
 
 def transform_terminal_output(
-    *,
+    *positional: Any,
     command: str = "",
     output: str = "",
     exit_code: int = 0,
@@ -281,18 +352,38 @@ def transform_terminal_output(
     **kwargs: Any,
 ) -> str | None:
     try:
+        if positional:
+            if len(positional) >= 1 and not command and isinstance(positional[0], str):
+                command = positional[0]
+            if len(positional) >= 2 and not output and isinstance(positional[1], str):
+                output = positional[1]
+            if (
+                len(positional) >= 3
+                and isinstance(positional[2], int)
+                and not isinstance(positional[2], bool)
+            ):
+                exit_code = positional[2]
+        if not isinstance(output, str):
+            return None
         options = NoisegateOptions.from_env().with_mapping(kwargs)
         # Hermes calls transform_terminal_output before its built-in terminal
         # redaction pass. Inline compaction is still safe because Hermes redacts
         # the returned string afterwards, but raw artifact storage would persist
         # pre-redaction output. Keep artifacts disabled for this early hook.
         options = replace(options, artifact_enabled=False)
+        selected_exit_code = (
+            returncode
+            if isinstance(returncode, int) and not isinstance(returncode, bool)
+            else exit_code
+            if isinstance(exit_code, int) and not isinstance(exit_code, bool)
+            else None
+        )
         reduced = reduce_text(
             output,
             command=command,
             tool_name="terminal",
             source="terminal_output",
-            exit_code=returncode if returncode is not None else exit_code,
+            exit_code=selected_exit_code,
             options=options,
         )
         return reduced.text if reduced.changed else None
@@ -315,6 +406,91 @@ def _commands_from_source(source: Mapping[str, Any]) -> tuple[str, ...]:
     if isinstance(argv, list) and argv and all(isinstance(item, str) for item in argv):
         commands += (shlex.join(argv),)
     return commands
+def _call_args(
+    args: Mapping[str, Any] | None,
+    arguments: Mapping[str, Any] | None,
+    parsed: Any,
+    *,
+    prefer_host_args: bool = False,
+) -> Mapping[str, Any]:
+    parsed_sources: list[Mapping[str, Any]] = []
+    if isinstance(parsed, Mapping):
+        for key in ("args", "arguments"):
+            candidate = parsed.get(key)
+            if isinstance(candidate, Mapping):
+                parsed_sources.append(candidate)
+    host_sources = [
+        candidate for candidate in (args, arguments) if isinstance(candidate, Mapping)
+    ]
+    if prefer_host_args and host_sources:
+        sources = host_sources
+    else:
+        sources = [
+            *host_sources,
+            *parsed_sources,
+        ] if prefer_host_args else [*parsed_sources, *host_sources]
+    return _merge_command_hints(sources)
+
+
+def _merge_command_hints(sources: list[Mapping[str, Any]]) -> Mapping[str, Any]:
+    merged: dict[str, Any] = {}
+    for source in sources:
+        if _has_command_hint(merged):
+            break
+        for key in ("command", "cmd", "shell_command", "code"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                merged[key] = value
+        argv = source.get("argv")
+        if _usable_argv(argv):
+            merged["argv"] = argv
+    return merged
+
+
+def _payload_tool_name(payload: Mapping[str, Any]) -> str:
+    return str(
+        payload.get("tool_name")
+        or payload.get("toolName")
+        or payload.get("tool")
+        or ""
+    )
+
+
+def _looks_terminal_payload(payload: Any, args: Mapping[str, Any] | None = None) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    return any(key in payload for key in ("stdout", "stderr", "output")) and (
+        _has_command_hint(payload)
+        or _has_command_hint(args or {})
+        or _has_numeric_exit_hint(payload)
+    )
+
+
+def _has_numeric_exit_hint(payload: Mapping[str, Any]) -> bool:
+    for key in ("exit", "exit_code", "returncode", "return_code"):
+        value = payload.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return True
+    return False
+
+
+def _has_command_hint(payload: Mapping[str, Any]) -> bool:
+    for key in ("command", "cmd", "shell_command", "code"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    return _usable_argv(payload.get("argv"))
+
+
+def _usable_argv(argv: object) -> bool:
+    return (
+        isinstance(argv, list)
+        and bool(argv)
+        and all(isinstance(item, str) for item in argv)
+        and bool(argv[0].strip())
+    )
 
 
 def _select_command(
@@ -383,14 +559,34 @@ def _command_evidence_text(text: str) -> str:
         if values:
             return "\n".join(values)
     return text
+def _extract_command(payload: Mapping[str, JsonValue], args: Mapping[str, Any]) -> str:
+    for source in (args, payload):
+        for key in ("command", "cmd", "shell_command", "code"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        argv = source.get("argv")
+        if (
+            isinstance(argv, list)
+            and argv
+            and all(isinstance(item, str) for item in argv)
+            and isinstance(argv[0], str)
+            and argv[0].strip()
+        ):
+            return shlex.join([str(item) for item in argv])
+    return ""
 
 
 def _extract_exit_code(payload: Mapping[str, JsonValue], tool_name: str) -> int | None:
+    numeric_values: list[int] = []
     for key in ("exit", "exit_code", "returncode", "return_code"):
         value = payload.get(key)
         if isinstance(value, bool):
             continue
         if isinstance(value, int):
+            numeric_values.append(value)
+    for value in numeric_values:
+        if value != 0:
             return value
     status = payload.get("status")
     if (
@@ -399,4 +595,4 @@ def _extract_exit_code(payload: Mapping[str, JsonValue], tool_name: str) -> int 
         and status.lower() in {"failed", "failure", "error", "errored"}
     ):
         return 1
-    return None
+    return numeric_values[0] if numeric_values else None

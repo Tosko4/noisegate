@@ -363,6 +363,29 @@ def reduce_text(
         return _unchanged(text, "error", "generic", reason=f"fail_open:{type(exc).__name__}")
 
 
+def _preview_reduce_text(
+    text: str,
+    *,
+    command: str | None = None,
+    tool_name: str | None = None,
+    source: str | None = None,
+    exit_code: int | None = None,
+    options: NoisegateOptions | None = None,
+) -> ReducedOutput:
+    try:
+        return _reduce_text(
+            text,
+            command=command,
+            tool_name=tool_name,
+            source=source,
+            exit_code=exit_code,
+            options=options,
+            defer_artifact_store=True,
+        )
+    except Exception as exc:
+        return _unchanged(text, "error", "generic", reason=f"fail_open:{type(exc).__name__}")
+
+
 def _reduce_text(
     text: str,
     *,
@@ -371,6 +394,7 @@ def _reduce_text(
     source: str | None = None,
     exit_code: int | None = None,
     options: NoisegateOptions | None = None,
+    defer_artifact_store: bool = False,
 ) -> ReducedOutput:
     options = options or NoisegateOptions.from_env()
     command_class = classify_command(command, text, exit_code=exit_code)
@@ -476,7 +500,7 @@ def _reduce_text(
             reason="no_gain_after_notices",
             attempted_reducer=reducer_name,
         )
-    if options.artifact_enabled:
+    if options.artifact_enabled and not defer_artifact_store:
         planned_artifact = metadata.get("artifact")
         if isinstance(planned_artifact, dict) and planned_artifact.get("stored") is True:
             planned_id = planned_artifact.get("id")

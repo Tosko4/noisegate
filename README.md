@@ -230,7 +230,13 @@ If capture is truncated, Noisegate adds this marker:
 [noisegate: capture truncated]
 ```
 
-`reduce-json` accepts either a Hermes-like envelope with a `result` string or a direct JSON tool result. Bad JSON fails open and is written back unchanged.
+`reduce-json` accepts a Hermes-like envelope with a `result` string, a nested `result` object, or a direct JSON tool result. Bad JSON fails open and is written back unchanged; non-text result values such as lists and `null` remain valid JSON and pass through unchanged. Mixed payloads can compact both the nested result and direct top-level text fields, but JSON-string results stay parseable and the complete serialized envelope is returned unchanged unless the final form is smaller.
+
+Envelope-shaped payloads belong on the CLI path. The Hermes plugin hook expects the host to pass `tool_name` separately, but blank hook calls may honor an embedded compactable `tool_name` or infer terminal behavior only from terminal-like direct payloads. Explicit host call arguments are authoritative for named hook calls. Across CLI envelopes, protected exact-output intent from usable `command`, `cmd`, `shell_command`, `code`, or quoted `argv` aliases wins over stale noisy aliases; blank aliases do not mask a usable command.
+
+For exit hints, a non-zero `exit`, `exit_code`, `returncode`, or `return_code` wins over a failed/error status, and a failed/error status wins over numeric zero. Existing `noisegate` metadata is never overwritten: transformed direct payloads fall back to `_noisegate`, then add further leading underscores until a free key is available.
+
+`reduce-json` treats the complete serialized envelope as its artifact decision boundary. With artifact mode enabled it first computes a private no-write preview and accepts only a smaller final envelope. When that accepted envelope needs exactly one raw artifact, Noisegate performs the artifact-writing pass and delivers its recovery ID. Envelopes that would need multiple raw artifacts still compact inline but skip artifact storage as one conservative unit, so a later field cannot leave an earlier orphan behind. An outer no-gain decision returns the original payload without creating an orphaned raw artifact or a recovery ID that was never delivered.
 
 Use `--metadata` (or `--debug`) on `reduce`, `reduce-json`, or `wrap` when you need to explain a compaction decision without changing stdout. Diagnostics are written as one JSON object on stderr. `reduce` and `wrap` include the chosen `command_class`, reducer or attempted reducer, unchanged reason code, and chars/lines saved. `reduce-json` reports envelope-level size metrics, includes reducer details when it directly reduces a plain `result` string, exposes that field's sizes under `field_*` keys, and leaves field-level reducer details in the transformed JSON metadata when compaction happens inside nested tool-result JSON.
 
