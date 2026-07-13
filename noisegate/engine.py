@@ -4,15 +4,22 @@ import hashlib
 import os
 import re
 import shlex
-from collections.abc import Mapping
-from dataclasses import dataclass, replace
-from itertools import pairwise
+from bisect import bisect_left, bisect_right
+from collections import Counter
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from ._version import __version__
 from .artifacts import DEFAULT_SIZE_CAP, ArtifactError, ArtifactStore, ArtifactTooLarge
 
 JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
+
+
+class _SourceAlignmentWorkExhausted(Exception):
+    """Internal signal that source alignment must fail open."""
 
 
 class _ShellToken(str):
@@ -80,6 +87,85 @@ LCM_EXTERNALIZED_PATTERNS = tuple(
         r"\bexternalized_ref\b\s*[:=]\s*[^,\s}\]]+",
     )
 )
+LCM_EXTERNALIZED_PATTERN_IDS = frozenset(id(pattern) for pattern in LCM_EXTERNALIZED_PATTERNS)
+OMISSION_NOTICE_PATTERN = re.compile(r"^\[noisegate: omitted \d+ (?:lines|chars)\]$")
+LINE_OMISSION_NOTICE_PATTERN = re.compile(r"^\[noisegate: omitted (\d+) lines\]$")
+CHAR_OMISSION_NOTICE_PATTERN = re.compile(r"^\[noisegate: omitted \d+ chars\]$")
+_SOURCE_ALIGNMENT_WORK_LIMIT = 50_000
+_SOURCE_ALIGNMENT_MAX_DEPTH = 512
+
+
+@dataclass(frozen=True)
+class _SourceAlignmentSourceState:
+    evidence_indices: dict[str, tuple[int, ...]]
+    represented_prefix: tuple[int, ...]
+    represented_ends: dict[int, tuple[int, ...]]
+    source_is_omission: tuple[bool, ...]
+    char_omission_indices: tuple[int, ...]
+
+
+_SourceAlignmentSourceKey = str | tuple[str, ...]
+
+
+@dataclass
+class _SourceAlignmentWorkBudget:
+    """Operation-scoped work and memoized results for source alignment."""
+
+    limit: int
+    spent: int = 0
+    exhausted: bool = False
+    alignment_calls: int = 0
+    _source_cache: dict[
+        _SourceAlignmentSourceKey,
+        _SourceAlignmentSourceState | None,
+    ] = field(default_factory=dict, repr=False)
+    _alignment_cache: dict[
+        tuple[_SourceAlignmentSourceKey, str],
+        tuple[int, ...] | None,
+    ] = field(default_factory=dict, repr=False)
+    _remark_cache: dict[tuple[str, str], str | None] = field(
+        default_factory=dict,
+        repr=False,
+    )
+
+    def spend(self, amount: int = 1) -> None:
+        if amount < 0:
+            raise ValueError("alignment work amount must be non-negative")
+        if self.exhausted or amount > self.limit - self.spent:
+            self.exhausted = True
+            raise _SourceAlignmentWorkExhausted
+        self.spent += amount
+
+
+_SOURCE_ALIGNMENT_WORK_BUDGET: ContextVar[_SourceAlignmentWorkBudget | None] = ContextVar(
+    "noisegate_source_alignment_work_budget",
+    default=None,
+)
+
+
+def _new_source_alignment_work_budget() -> _SourceAlignmentWorkBudget:
+    return _SourceAlignmentWorkBudget(_SOURCE_ALIGNMENT_WORK_LIMIT)
+
+
+@contextmanager
+def _source_alignment_work_operation() -> Iterator[_SourceAlignmentWorkBudget]:
+    """Install one fresh alignment budget for a complete public operation."""
+    budget = _new_source_alignment_work_budget()
+    token = _SOURCE_ALIGNMENT_WORK_BUDGET.set(budget)
+    try:
+        yield budget
+    finally:
+        _SOURCE_ALIGNMENT_WORK_BUDGET.reset(token)
+
+
+def _raise_if_source_alignment_work_exhausted() -> None:
+    budget = _SOURCE_ALIGNMENT_WORK_BUDGET.get()
+    if budget is None:
+        raise RuntimeError("source alignment budget is not active")
+    if budget.exhausted:
+        raise _SourceAlignmentWorkExhausted
+
+
 SHELL_SEPARATORS = {"|", "|&", "||", "&&", ";", "&", "(", ")", "{", "}"}
 SOURCE_SEARCH_COMMANDS = {"rg", "grep", "ag", "ack"}
 SOURCE_SEARCH_OPTIONS_WITH_VALUES = frozenset({
@@ -350,17 +436,16 @@ def reduce_text(
     exit_code: int | None = None,
     options: NoisegateOptions | None = None,
 ) -> ReducedOutput:
-    try:
-        return _reduce_text(
-            text,
-            command=command,
-            tool_name=tool_name,
-            source=source,
-            exit_code=exit_code,
-            options=options,
-        )
-    except Exception as exc:
-        return _unchanged(text, "error", "generic", reason=f"fail_open:{type(exc).__name__}")
+    return _run_text_reduction_operation(
+        text,
+        command=command,
+        tool_name=tool_name,
+        source=source,
+        exit_code=exit_code,
+        options=options,
+        defer_artifact_store=False,
+        share_alignment_budget=False,
+    )
 
 
 def _preview_reduce_text(
@@ -372,16 +457,78 @@ def _preview_reduce_text(
     exit_code: int | None = None,
     options: NoisegateOptions | None = None,
 ) -> ReducedOutput:
-    try:
-        return _reduce_text(
+    return _run_text_reduction_operation(
+        text,
+        command=command,
+        tool_name=tool_name,
+        source=source,
+        exit_code=exit_code,
+        options=options,
+        defer_artifact_store=True,
+        share_alignment_budget=False,
+    )
+
+
+def _reduce_text_in_operation(
+    text: str,
+    *,
+    command: str | None = None,
+    tool_name: str | None = None,
+    source: str | None = None,
+    exit_code: int | None = None,
+    options: NoisegateOptions | None = None,
+    defer_artifact_store: bool = False,
+) -> ReducedOutput:
+    return _run_text_reduction_operation(
+        text,
+        command=command,
+        tool_name=tool_name,
+        source=source,
+        exit_code=exit_code,
+        options=options,
+        defer_artifact_store=defer_artifact_store,
+        share_alignment_budget=True,
+    )
+
+
+def _run_text_reduction_operation(
+    text: str,
+    *,
+    command: str | None,
+    tool_name: str | None,
+    source: str | None,
+    exit_code: int | None,
+    options: NoisegateOptions | None,
+    defer_artifact_store: bool,
+    share_alignment_budget: bool,
+) -> ReducedOutput:
+    if share_alignment_budget:
+        _raise_if_source_alignment_work_exhausted()
+        reduced = _reduce_text(
             text,
             command=command,
             tool_name=tool_name,
             source=source,
             exit_code=exit_code,
             options=options,
-            defer_artifact_store=True,
+            defer_artifact_store=defer_artifact_store,
         )
+        _raise_if_source_alignment_work_exhausted()
+        return reduced
+
+    try:
+        with _source_alignment_work_operation():
+            reduced = _reduce_text(
+                text,
+                command=command,
+                tool_name=tool_name,
+                source=source,
+                exit_code=exit_code,
+                options=options,
+                defer_artifact_store=defer_artifact_store,
+            )
+            _raise_if_source_alignment_work_exhausted()
+            return reduced
     except Exception as exc:
         return _unchanged(text, "error", "generic", reason=f"fail_open:{type(exc).__name__}")
 
@@ -428,16 +575,39 @@ def _reduce_text(
     if not _should_reduce(text, options):
         return _unchanged(text, "below_threshold", command_class, reason="below_threshold")
 
-    reducer_name, compacted = _apply_reducer(text, command_class, options, exit_code)
-    if compacted is not None and _dropped_lcm_externalized_match(before=text, after=compacted):
-        compacted = None
     preserve_patterns = _preserve_patterns_for_output(command_class, text)
+    exit_notices = _recovery_notices({"exit_code": exit_code})
+    reducer_name, compacted = _apply_reducer(text, command_class, options, exit_code)
+    if compacted is not None and _omission_notices(text):
+        compacted = _remark_excerpt_with_line_coverage(text, compacted)
+        compacted = _ensure_ranked_diagnostic_after_line_coverage_remap(
+            before=text,
+            shortened=compacted,
+            options=options,
+            preserve_patterns=preserve_patterns,
+            required_notices=exit_notices,
+        )
+    if compacted is not None and _dropped_lcm_externalized_match(
+        before=text,
+        after=compacted,
+    ):
+        compacted = None
     if compacted is not None:
         compacted = _enforce_final_budget(
             compacted,
             options,
             preserve_patterns=preserve_patterns,
         )
+    if compacted is not None and _omission_notices(text):
+        compacted = _ensure_ranked_diagnostic_after_line_coverage_remap(
+            before=text,
+            shortened=compacted,
+            options=options,
+            preserve_patterns=preserve_patterns,
+            required_notices=exit_notices,
+        )
+    if compacted is not None and _dropped_omission_notice(before=text, after=compacted):
+        compacted = None
     if compacted is None:
         return _unchanged(
             text,
@@ -477,13 +647,51 @@ def _reduce_text(
     if options.artifact_enabled:
         metadata["artifact"] = _plan_artifact(text, options)
         _drop_artifact_if_notice_cannot_fit(metadata, options, artifact_dir=options.artifact_dir)
+    required_notices = _recovery_notices_for_text(
+        compacted_body,
+        metadata,
+        artifact_dir=options.artifact_dir,
+        preserve_patterns=preserve_patterns,
+    )
+    if _omission_notices(text):
+        compacted_body = _ensure_ranked_diagnostic_after_line_coverage_remap(
+            before=text,
+            shortened=compacted_body,
+            options=options,
+            preserve_patterns=preserve_patterns,
+            required_notices=required_notices,
+        )
+        if compacted_body is None:
+            return _unchanged(
+                text,
+                "no_gain",
+                command_class,
+                reason="ranked_diagnostic_cannot_fit_with_notices",
+                attempted_reducer=reducer_name,
+            )
+        _refresh_compacted_metrics(metadata, original=text, compacted=compacted_body)
     compacted = _append_recovery_notices(
         compacted_body,
         metadata,
         artifact_dir=options.artifact_dir,
         options=options,
         preserve_patterns=preserve_patterns,
+        fail_open_text=text,
     )
+    if _line_coverage_remap_dropped_ranked_diagnostic(
+        before=text,
+        after=compacted,
+        options=options,
+        preserve_patterns=preserve_patterns,
+        required_notices=required_notices,
+    ):
+        return _unchanged(
+            text,
+            "no_gain",
+            command_class,
+            reason="ranked_diagnostic_dropped_after_notices",
+            attempted_reducer=reducer_name,
+        )
     if not _fits_budget(compacted, options):
         return _unchanged(
             text,
@@ -503,6 +711,7 @@ def _reduce_text(
     if options.artifact_enabled and not defer_artifact_store:
         planned_artifact = metadata.get("artifact")
         if isinstance(planned_artifact, dict) and planned_artifact.get("stored") is True:
+            _raise_if_source_alignment_work_exhausted()
             planned_id = planned_artifact.get("id")
             if not isinstance(planned_id, str) or planned_id not in compacted:
                 metadata["artifact"] = {
@@ -516,16 +725,59 @@ def _reduce_text(
                     artifact_dir=options.artifact_dir,
                     options=options,
                     preserve_patterns=preserve_patterns,
+                    fail_open_text=text,
                 )
             else:
                 metadata["artifact"] = _store_artifact(text, options)
+                required_notices = _recovery_notices_for_text(
+                    compacted_body,
+                    metadata,
+                    artifact_dir=options.artifact_dir,
+                    preserve_patterns=preserve_patterns,
+                )
+                if _omission_notices(text):
+                    compacted_body = _ensure_ranked_diagnostic_after_line_coverage_remap(
+                        before=text,
+                        shortened=compacted_body,
+                        options=options,
+                        preserve_patterns=preserve_patterns,
+                        required_notices=required_notices,
+                    )
+                    if compacted_body is None:
+                        return _unchanged(
+                            text,
+                            "no_gain",
+                            command_class,
+                            reason="ranked_diagnostic_cannot_fit_after_artifact_store",
+                            attempted_reducer=reducer_name,
+                        )
+                    _refresh_compacted_metrics(
+                        metadata,
+                        original=text,
+                        compacted=compacted_body,
+                    )
                 compacted = _append_recovery_notices(
                     compacted_body,
                     metadata,
                     artifact_dir=options.artifact_dir,
                     options=options,
                     preserve_patterns=preserve_patterns,
+                    fail_open_text=text,
                 )
+                if _line_coverage_remap_dropped_ranked_diagnostic(
+                    before=text,
+                    after=compacted,
+                    options=options,
+                    preserve_patterns=preserve_patterns,
+                    required_notices=required_notices,
+                ):
+                    return _unchanged(
+                        text,
+                        "no_gain",
+                        command_class,
+                        reason="ranked_diagnostic_dropped_after_artifact_store",
+                        attempted_reducer=reducer_name,
+                    )
                 if not _fits_budget(compacted, options):
                     return _unchanged(
                         text,
@@ -708,27 +960,47 @@ def _preserve_patterns_for_output(
     text: str,
 ) -> tuple[re.Pattern[str], ...] | None:
     lcm_patterns = _lcm_externalized_patterns_for(text)
+    preserve_patterns: tuple[re.Pattern[str], ...] = ()
     if command_class in {"pytest", "unittest"}:
-        return _preservation_patterns(text, CRITICAL_PATTERNS)
-    if command_class in {"apt", "python_package"}:
-        return _priority_preservation_patterns(
+        preserve_patterns = _preservation_patterns(text, CRITICAL_PATTERNS)
+    elif command_class in {"apt", "python_package"}:
+        preserve_patterns = _priority_preservation_patterns(
             text,
             PACKAGE_PATTERNS,
             PACKAGE_HIGH_SIGNAL_PRIORITY_PATTERNS,
         )
-    if command_class == "node":
-        return _preservation_patterns(text, NODE_PATTERNS)
-    if command_class == "docker_build":
-        return _priority_preservation_patterns(
+    elif command_class == "node":
+        preserve_patterns = _preservation_patterns(text, NODE_PATTERNS)
+    elif command_class == "docker_build":
+        preserve_patterns = _priority_preservation_patterns(
             text,
             DOCKER_BUILD_PRESERVATION_PATTERNS,
             DOCKER_BUILD_HIGH_SIGNAL_PRIORITY_PATTERNS,
         )
-    if command_class == "docker_logs":
-        return _preservation_patterns(text, DOCKER_LOG_PATTERNS)
-    if command_class == "generic" and _first_pattern_match(text, CRITICAL_PATTERNS):
-        return _preservation_patterns(text, CRITICAL_PATTERNS)
-    return lcm_patterns or None
+    elif command_class == "docker_logs":
+        preserve_patterns = _preservation_patterns(text, DOCKER_LOG_PATTERNS)
+    elif command_class == "generic" and _first_pattern_match(text, CRITICAL_PATTERNS):
+        preserve_patterns = _preservation_patterns(text, CRITICAL_PATTERNS)
+
+    reducer_patterns = REDUCER_ANCHOR_PATTERNS_BY_COMMAND_CLASS.get(command_class, ())
+    base_patterns = preserve_patterns or lcm_patterns
+    combined = list(base_patterns)
+    seen_pattern_ids = {id(pattern) for pattern in combined}
+    added_pattern = False
+    source_lines = text.splitlines()
+    for pattern in (*lcm_patterns, *reducer_patterns):
+        pattern_id = id(pattern)
+        if pattern_id in seen_pattern_ids or (
+            pattern in reducer_patterns
+            and not any(pattern.search(line) for line in source_lines)
+        ):
+            continue
+        seen_pattern_ids.add(pattern_id)
+        combined.append(pattern)
+        added_pattern = True
+    if not added_pattern:
+        return base_patterns or None
+    return tuple(combined)
 
 
 def _apply_reducer(
@@ -738,37 +1010,61 @@ def _apply_reducer(
     exit_code: int | None,
 ) -> tuple[str, str | None]:
     lcm_patterns = _lcm_externalized_patterns_for(text)
+    reducer_patterns = REDUCER_ANCHOR_PATTERNS_BY_COMMAND_CLASS.get(command_class, ())
     if options.mode == "head_tail":
         if lcm_patterns:
-            return "generic_head_tail", _important_lines(text, options, lcm_patterns)
+            return "generic_head_tail", _important_lines(
+                text,
+                options,
+                lcm_patterns,
+                exit_code=exit_code,
+            )
         return "generic_head_tail", _head_tail(text, options)
     if command_class in {"pytest", "unittest"}:
-        return command_class, _important_lines(text, options, TEST_PATTERNS + lcm_patterns)
+        return command_class, _important_lines(
+            text,
+            options,
+            reducer_patterns + lcm_patterns,
+            exit_code=exit_code,
+        )
     if command_class in {"apt", "python_package"}:
         return command_class, _important_lines(
             text,
             options,
-            PACKAGE_PATTERNS + lcm_patterns,
+            reducer_patterns + lcm_patterns,
             priority_patterns=PACKAGE_HIGH_SIGNAL_PRIORITY_PATTERNS,
+            exit_code=exit_code,
         )
     if command_class == "node":
         return "node", _important_lines(
             text,
             options,
-            NODE_PRESERVATION_PATTERNS + lcm_patterns,
+            reducer_patterns + lcm_patterns,
             priority_patterns=NODE_HIGH_SIGNAL_PRIORITY_PATTERNS,
+            exit_code=exit_code,
         )
     if command_class == "docker_build":
         return "docker_build", _important_lines(
             text,
             options,
-            DOCKER_BUILD_PRESERVATION_PATTERNS + lcm_patterns,
+            reducer_patterns + lcm_patterns,
             priority_patterns=DOCKER_BUILD_HIGH_SIGNAL_PRIORITY_PATTERNS,
+            exit_code=exit_code,
         )
     if command_class == "docker_logs":
-        return "docker_logs", _important_lines(text, options, DOCKER_LOG_PATTERNS + lcm_patterns)
+        return "docker_logs", _important_lines(
+            text,
+            options,
+            reducer_patterns + lcm_patterns,
+            exit_code=exit_code,
+        )
     if command_class == "git_status":
-        return "git_status", _important_lines(text, options, GIT_STATUS_PATTERNS + lcm_patterns)
+        return "git_status", _important_lines(
+            text,
+            options,
+            reducer_patterns + lcm_patterns,
+            exit_code=exit_code,
+        )
     if command_class == "git_log":
         return "git_log", _head_tail(text, replace(options, head_lines=40, tail_lines=8))
     if (
@@ -776,9 +1072,19 @@ def _apply_reducer(
         and exit_code != 0
         and _first_pattern_match(text, CRITICAL_PATTERNS)
     ):
-        return "generic_critical", _important_lines(text, options, CRITICAL_PATTERNS + lcm_patterns)
+        return "generic_critical", _important_lines(
+            text,
+            options,
+            CRITICAL_PATTERNS + lcm_patterns,
+            exit_code=exit_code,
+        )
     if lcm_patterns:
-        return "generic_head_tail", _important_lines(text, options, lcm_patterns)
+        return "generic_head_tail", _important_lines(
+            text,
+            options,
+            lcm_patterns,
+            exit_code=exit_code,
+        )
     return "generic_head_tail", _head_tail(text, options)
 
 
@@ -802,11 +1108,15 @@ CRITICAL_PATTERNS = tuple(
         r"\bFAILED\b|\bERROR\b",
         r"^(failed|error)\s+",
         r"^(e:|err:|error:)",
-        r"assertionerror|traceback|exceptiongroup|baseexception|\bexception\b\s*:",
+        r"assertionerror|traceback|(?:base)?exceptiongroup|baseexception|\bexception\b\s*:",
         r"valueerror|typeerror|referenceerror|syntaxerror|rangeerror|runtimeerror",
         r"\b[a-z_]+(?:error|exception)\b(?=:|$)",
         r"\bunhandled\s+exception\b",
         r"\bexception\s+in\b",
+        r"\btask\s+exception\s+was\s+never\s+retrieved\b",
+        r"\bexception\s+was\s+never\s+retrieved\b",
+        r"\bduring\s+handling\b.*\banother\s+exception\s+occurred\b",
+        r"\bthe\s+above\s+exception\s+was\s+the\s+direct\s+cause\b.*\bfollowing\s+exception\b",
         r"^\s*E\s+",
         r"\d+\s+failed",
         r"\berror\b|\bfailed\b|\bfail\b",
@@ -901,6 +1211,11 @@ HIGH_SIGNAL_PRIORITY_PATTERNS = tuple(
     for group in (
         (
             r"traceback \(most recent call last\)",
+            r"^\s*(?:\|\s*)*(?:base)?exceptiongroup\b(?=:|$)",
+            r"\btask\s+exception\s+was\s+never\s+retrieved\b",
+            r"\bexception\s+was\s+never\s+retrieved\b",
+            r"\bduring\s+handling\b.*\banother\s+exception\s+occurred\b",
+            r"\bthe\s+above\s+exception\s+was\s+the\s+direct\s+cause\b.*\bfollowing\s+exception\b",
             r"valueerror|typeerror|referenceerror|runtimeerror|assertionerror",
             r"\b[a-z_]+(?:error|exception)\b(?=:|$)|^\s*exception:|unhandled\s+exception",
             r"npm err!.*cannot find module",
@@ -1005,6 +1320,17 @@ GIT_STATUS_PATTERNS = tuple(
     )
 )
 
+REDUCER_ANCHOR_PATTERNS_BY_COMMAND_CLASS = {
+    "pytest": TEST_PATTERNS,
+    "unittest": TEST_PATTERNS,
+    "apt": PACKAGE_PATTERNS,
+    "python_package": PACKAGE_PATTERNS,
+    "node": NODE_PRESERVATION_PATTERNS,
+    "docker_build": DOCKER_BUILD_PRESERVATION_PATTERNS,
+    "docker_logs": DOCKER_LOG_PATTERNS,
+    "git_status": GIT_STATUS_PATTERNS,
+}
+
 
 def _important_lines(
     text: str,
@@ -1012,6 +1338,7 @@ def _important_lines(
     patterns: tuple[re.Pattern[str], ...],
     *,
     priority_patterns: tuple[tuple[re.Pattern[str], ...], ...] = HIGH_SIGNAL_PRIORITY_PATTERNS,
+    exit_code: int | None = None,
 ) -> str | None:
     lines = text.splitlines()
     if (
@@ -1028,11 +1355,13 @@ def _important_lines(
 
     important: list[int] = []
     for index, line in enumerate(lines):
-        if any(pattern.search(line) for pattern in patterns):
+        if any(pattern.search(line) for pattern in patterns) or OMISSION_NOTICE_PATTERN.fullmatch(
+            line
+        ):
             important.append(index)
 
     if len(important) > options.max_important_lines:
-        priority = _important_priority_indices(lines, important, priority_patterns)
+        priority = _important_priority_indices(lines, important, options, priority_patterns)
         if priority:
             important = _trim_indices_around_priority(
                 important,
@@ -1061,6 +1390,7 @@ def _important_lines(
                 options,
                 patterns,
                 priority_patterns,
+                exit_code=exit_code,
             )
             if budgeted is not None:
                 return budgeted
@@ -1072,6 +1402,7 @@ def _important_lines(
                 options,
                 patterns,
                 priority_patterns,
+                exit_code=exit_code,
             )
             if budgeted is not None:
                 return budgeted
@@ -1081,7 +1412,13 @@ def _important_lines(
                 _priority_preservation_patterns(text, patterns, priority_patterns),
             )
         return _char_head_tail(text, options)
-    selected = _lines_with_markers(lines, sorted(keep))
+    selected_indices = sorted(keep)
+    if _matching_indices(lines, selected_indices, LCM_EXTERNALIZED_PATTERNS):
+        selected = _marked_excerpt_for_line_indices(lines, selected_indices)
+        if selected is None:
+            return None
+    else:
+        selected = _lines_with_markers(lines, selected_indices)
     if _line_count(selected) > options.max_lines:
         budgeted = _line_budgeted_important_excerpt(
             lines,
@@ -1089,6 +1426,7 @@ def _important_lines(
             options,
             patterns,
             priority_patterns,
+            exit_code=exit_code,
         )
         if budgeted is None:
             return None
@@ -1100,6 +1438,7 @@ def _important_lines(
             options,
             patterns,
             priority_patterns,
+            exit_code=exit_code,
         )
         if budgeted is not None:
             return budgeted
@@ -1133,7 +1472,9 @@ def _preservation_patterns(
     lcm_patterns = _lcm_externalized_patterns_for(text)
     if lcm_patterns:
         return lcm_patterns + tuple(
-            pattern for pattern in base_patterns if pattern not in lcm_patterns
+            pattern
+            for pattern in base_patterns
+            if id(pattern) not in LCM_EXTERNALIZED_PATTERN_IDS
         )
     return base_patterns
 
@@ -1182,15 +1523,25 @@ def _line_budgeted_important_excerpt(
     options: NoisegateOptions,
     patterns: tuple[re.Pattern[str], ...],
     priority_patterns: tuple[tuple[re.Pattern[str], ...], ...] = HIGH_SIGNAL_PRIORITY_PATTERNS,
+    *,
+    exit_code: int | None = None,
 ) -> str | None:
     if not important:
         return None
     lcm_priority = _matching_indices(lines, important, LCM_EXTERNALIZED_PATTERNS)
+    omission_priority = [
+        index
+        for index in important
+        if OMISSION_NOTICE_PATTERN.fullmatch(lines[index])
+    ]
+    recovery_priority = lcm_priority + [
+        index for index in omission_priority if index not in lcm_priority
+    ]
     signal_priority = _priority_indices(lines, important, priority_patterns)
     critical_priority = _matching_indices(lines, important, CRITICAL_PATTERNS)
     ranked_priority = sorted(
         signal_priority or critical_priority or important,
-        key=lambda index: (_failure_detail_rank(lines[index]), index),
+        key=lambda index: _failure_detail_sort_key(lines[index], index),
     )
     fallback_priority = sorted(
         [
@@ -1198,29 +1549,67 @@ def _line_budgeted_important_excerpt(
             for index in critical_priority
             if index not in signal_priority and index not in ranked_priority
         ],
-        key=lambda index: (_failure_detail_rank(lines[index]), index),
+        key=lambda index: _failure_detail_sort_key(lines[index], index),
     )
-    priority = lcm_priority + [
+    priority = recovery_priority + [
         index
         for index in ranked_priority + fallback_priority
-        if index not in lcm_priority
+        if index not in recovery_priority
     ]
     best_rank = min(_failure_detail_rank(lines[index]) for index in ranked_priority)
     max_context = max(0, options.important_context_lines)
 
-    # Externalized payload refs are recovery handles, not just interesting log
-    # lines. If they appear alongside a failure cluster, keep the refs and at
-    # least one failure anchor together when the line budget allows it. If the
-    # budget is too tight for both, the fallback below prioritizes the refs so
-    # the externalized-payload recovery path stays intact.
+    # Externalized payload refs and existing omission notices are recovery
+    # evidence, not just interesting log lines. Try one ranked diagnostic at a
+    # time with all evidence so an overlong primary failure does not hide a
+    # shorter active-reducer anchor. If none fit, preserve all evidence alone or
+    # fail open.
+    if recovery_priority:
+        all_signal_priority = _all_priority_indices(lines, important, priority_patterns)
+        lcm_diagnostic_priority: list[int] = []
+        for index in [
+            *all_signal_priority,
+            *sorted(
+                critical_priority,
+                key=lambda item: _failure_detail_sort_key(lines[item], item),
+            ),
+        ]:
+            if index not in recovery_priority and index not in lcm_diagnostic_priority:
+                lcm_diagnostic_priority.append(index)
+
+        for diagnostic_anchor in lcm_diagnostic_priority:
+            for context in range(max_context, -1, -1):
+                keep: set[int] = set(recovery_priority)
+                start = max(0, diagnostic_anchor - context)
+                end = min(len(lines), diagnostic_anchor + context + 1)
+                keep.update(range(start, end))
+                sorted_keep = sorted(keep)
+                marked_candidate = _marked_excerpt_for_line_indices(lines, sorted_keep)
+                if marked_candidate is not None and _fits_budget(marked_candidate, options):
+                    return marked_candidate
+
+        marked_refs = _marked_excerpt_for_line_indices(lines, recovery_priority)
+        if marked_refs is not None and _fits_budget(marked_refs, options):
+            return marked_refs
+        return None
+
+    best_detail_key = min(
+        (
+            _failure_detail_rank(lines[index]),
+            _failure_detail_subrank(lines[index]),
+        )
+        for index in ranked_priority
+    )
     best_ranked_priority = [
         index
         for index in ranked_priority
-        if _failure_detail_rank(lines[index]) == best_rank
+        if (
+            _failure_detail_rank(lines[index]),
+            _failure_detail_subrank(lines[index]),
+        )
+        == best_detail_key
     ][:3]
-    multi_anchor_priority = lcm_priority + [
-        index for index in ranked_priority[:3] if index not in lcm_priority
-    ]
+    multi_anchor_priority = ranked_priority[:3]
     if options.max_lines <= 5:
         concrete_tight_priority = [
             index
@@ -1247,74 +1636,113 @@ def _line_budgeted_important_excerpt(
                 concrete_tight_priority if has_failed_test_id else best_ranked_priority
             )
             tight_anchor_candidate = _marked_excerpt_for_line_indices(lines, tight_indices)
-            exit_notice_reserve = len("\n[noisegate: exit_code=1]")
+            exit_notice = (
+                f"[noisegate: exit_code={exit_code}]"
+                if isinstance(exit_code, int) and exit_code != 0
+                else None
+            )
+            tight_options = replace(
+                options,
+                max_chars=max(
+                    0,
+                    options.max_chars - (len(exit_notice) + 1 if exit_notice else 0),
+                ),
+                max_lines=max(0, options.max_lines - (1 if exit_notice else 0)),
+            )
             if (
                 tight_anchor_candidate is not None
-                and _fits_budget(tight_anchor_candidate, options)
-                and len(tight_anchor_candidate) + exit_notice_reserve <= options.max_chars
-                and _line_count(tight_anchor_candidate) + 1 <= options.max_lines
+                and _fits_budget(tight_anchor_candidate, tight_options)
+                and len(tight_anchor_candidate) < len("\n".join(lines))
             ):
                 return tight_anchor_candidate
-            if all(b == a + 1 for a, b in pairwise(tight_indices)):
-                contiguous_candidate = "\n".join(lines[index] for index in tight_indices)
+            single_tight_priority = (
+                concrete_tight_priority if has_failed_test_id else best_ranked_priority
+            )
+            if has_failed_test_id:
+                single_tight_priority = sorted(
+                    single_tight_priority,
+                    key=lambda index: not re.search(
+                        failed_test_id_pattern,
+                        lines[index],
+                        re.IGNORECASE,
+                    ),
+                )
+            for index in single_tight_priority:
+                marked_line = _marked_excerpt_for_line_indices(lines, [index])
                 if (
-                    _fits_budget(contiguous_candidate, options)
-                    and len(contiguous_candidate) + exit_notice_reserve <= options.max_chars
-                    and _line_count(contiguous_candidate) + 1 <= options.max_lines
+                    marked_line is not None
+                    and _fits_budget(marked_line, tight_options)
+                    and len(marked_line) < len("\n".join(lines))
                 ):
-                    return contiguous_candidate
-            for index in tight_indices:
-                line = lines[index]
-                if (
-                    _fits_budget(line, options)
-                    and len(line) + exit_notice_reserve <= options.max_chars
-                    and options.max_lines >= 2
-                ):
-                    return line
+                    return marked_line
     if len(multi_anchor_priority) > 1:
+        notice = (
+            f"[noisegate: exit_code={exit_code}]"
+            if isinstance(exit_code, int) and exit_code != 0
+            else None
+        )
+        reserved_options = replace(
+            options,
+            max_chars=max(0, options.max_chars - (len(notice) + 1 if notice else 0)),
+            max_lines=max(0, options.max_lines - (1 if notice else 0)),
+        )
+        concrete_candidate = _concrete_failure_excerpt_for_notices(
+            "\n".join(lines),
+            reserved_options,
+        )
+        if (
+            concrete_candidate is not None
+            and _represented_line_coverage(concrete_candidate) != len(lines)
+        ):
+            concrete_candidate = None
+        if (
+            reserved_options.max_lines <= 5
+            and concrete_candidate is not None
+            and re.search(
+                r"\bFAILED\b.*tests?/.*::|tests?/.*::.*\bFAILED\b",
+                concrete_candidate,
+                re.IGNORECASE,
+            )
+        ):
+            return concrete_candidate
+
         for context in range(max_context, -1, -1):
             keep: set[int] = set()
             for anchor in multi_anchor_priority:
                 start = max(0, anchor - context)
                 end = min(len(lines), anchor + context + 1)
                 keep.update(range(start, end))
-            sorted_keep = sorted(keep)
-            candidate = _lines_with_markers(lines, sorted_keep)
-            if sorted_keep and sorted_keep[-1] < len(lines) - 1:
-                omitted_tail = len(lines) - sorted_keep[-1] - 1
-                candidate_with_tail_marker = (
-                    f"{candidate}\n[noisegate: omitted {omitted_tail} lines]"
+            candidate = _marked_excerpt_for_line_indices(lines, sorted(keep))
+            if candidate is not None and _fits_budget(candidate, reserved_options):
+                return candidate
+
+        best_candidate = _marked_excerpt_for_line_indices(lines, best_ranked_priority)
+        if best_candidate is not None and _fits_budget(best_candidate, reserved_options):
+            return best_candidate
+
+        if concrete_candidate is not None:
+            return concrete_candidate
+
+        for anchor in priority:
+            if (
+                _would_hide_better_failure_anchor(
+                    best_rank,
+                    _failure_detail_rank(lines[anchor]),
                 )
-                if (
-                    _line_count(candidate_with_tail_marker) <= options.max_lines
-                    and len(candidate_with_tail_marker) < len("\n".join(lines))
-                ):
-                    candidate = candidate_with_tail_marker
-            if _line_count(candidate) <= options.max_lines:
-                if len(candidate) <= options.max_chars:
+                and not re.search(r"tests?/.*::.*\bFAILED\b", lines[anchor], re.IGNORECASE)
+            ):
+                return None
+            for context in range(max_context, -1, -1):
+                start = max(0, anchor - context)
+                end = min(len(lines), anchor + context + 1)
+                candidate = _lines_with_surrounding_omission_markers(
+                    lines,
+                    start,
+                    end - 1,
+                )
+                if _fits_budget(candidate, reserved_options):
                     return candidate
-                char_capped = _char_head_tail_preserving_patterns(
-                    candidate,
-                    options,
-                    _preservation_patterns(candidate, patterns),
-                )
-                if (
-                    char_capped is not None
-                    and _fits_budget(char_capped, options)
-                    and (
-                        "[noisegate: omitted" not in candidate
-                        or "[noisegate: omitted" in char_capped
-                    )
-                    and all(
-                        _contains_full_line(char_capped, lines[index])
-                        for index in best_ranked_priority
-                    )
-                ):
-                    return char_capped
-                if "[noisegate: omitted" in candidate:
-                    head_tail_capped = _head_tail(candidate, options)
-                    if head_tail_capped is not None and _fits_budget(head_tail_capped, options):
-                        return head_tail_capped
+        return None
 
     for anchor in priority:
         if (
@@ -1403,6 +1831,24 @@ def _failure_detail_rank(line: str) -> int:
     return 5
 
 
+def _failure_detail_sort_key(line: str, index: int) -> tuple[int, int, int]:
+    return (_failure_detail_rank(line), _failure_detail_subrank(line), index)
+
+
+def _failure_detail_subrank(line: str) -> int:
+    if re.search(
+        r"^\s*(?:\|\s*)*(?:base)?exceptiongroup\b(?=:|$)"
+        r"|\btask\s+exception\s+was\s+never\s+retrieved\b"
+        r"|\bexception\s+was\s+never\s+retrieved\b"
+        r"|\bduring\s+handling\b.*\banother\s+exception\s+occurred\b"
+        r"|\bthe\s+above\s+exception\s+was\s+the\s+direct\s+cause\b.*\bfollowing\s+exception\b",
+        line,
+        re.IGNORECASE,
+    ):
+        return 0
+    return 1
+
+
 def _is_diagnostic_detail_line(line: str) -> bool:
     if re.search(r"^\s*E\s+", line):
         return True
@@ -1412,10 +1858,16 @@ def _is_diagnostic_detail_line(line: str) -> bool:
         return False
     return bool(
         re.search(
-            r"\b(assertionerror|[a-z0-9_]+error|exceptiongroup|baseexception)\b(?::|$)"
+            r"\b(assertionerror|[a-z0-9_]+error)\b(?::|$)"
+            r"|^\s*(?:\|\s*)*(?:base)?exceptiongroup\b(?=:|$)"
+            r"|^\s*(?:\|\s*)*baseexception\b(?=:|$)"
             r"|\bexception\b\s*:"
             r"|\bunhandled\s+exception\b"
-            r"|\bexception\s+in\b",
+            r"|\bexception\s+in\b"
+            r"|\btask\s+exception\s+was\s+never\s+retrieved\b"
+            r"|\bexception\s+was\s+never\s+retrieved\b"
+            r"|\bduring\s+handling\b.*\banother\s+exception\s+occurred\b"
+            r"|\bthe\s+above\s+exception\s+was\s+the\s+direct\s+cause\b.*\bfollowing\s+exception\b",
             line,
             re.IGNORECASE,
         )
@@ -1429,26 +1881,68 @@ def _is_incidental_exception_line(line: str) -> bool:
 def _important_priority_indices(
     lines: list[str],
     indices: list[int],
+    options: NoisegateOptions,
     priority_patterns: tuple[tuple[re.Pattern[str], ...], ...] = HIGH_SIGNAL_PRIORITY_PATTERNS,
 ) -> list[int]:
     lcm_priority = _matching_indices(lines, indices, LCM_EXTERNALIZED_PATTERNS)
-    signal_priority = sorted(
-        _priority_indices(lines, indices, priority_patterns),
-        key=lambda index: (_failure_detail_rank(lines[index]), index),
-    )
+    omission_priority = [
+        index for index in indices if OMISSION_NOTICE_PATTERN.fullmatch(lines[index])
+    ]
+    recovery_priority = lcm_priority + [
+        index for index in omission_priority if index not in lcm_priority
+    ]
+    signal_priority = _all_priority_indices(lines, indices, priority_patterns)
     critical_priority = sorted(
         [
             index
             for index in _matching_indices(lines, indices, CRITICAL_PATTERNS)
             if index not in signal_priority
         ],
-        key=lambda index: (_failure_detail_rank(lines[index]), index),
+        key=lambda index: _failure_detail_sort_key(lines[index], index),
     )
-    return lcm_priority + [
-        index
-        for index in signal_priority + critical_priority
-        if index not in lcm_priority
+
+    def might_fit_with_refs(index: int) -> bool:
+        candidate_indices = sorted({*recovery_priority, index})
+        if recovery_priority:
+            candidate = _marked_excerpt_for_line_indices(lines, candidate_indices)
+            return candidate is not None and _fits_budget(candidate, options)
+        return _fits_budget(lines[index], options)
+
+    fitting_signals = [index for index in signal_priority if might_fit_with_refs(index)]
+    fitting_critical = next(
+        (index for index in critical_priority if might_fit_with_refs(index)),
+        critical_priority[0] if critical_priority else None,
+    )
+    fallback_aware_priority = [*fitting_signals]
+    if not fitting_signals and fitting_critical is not None:
+        fallback_aware_priority.append(fitting_critical)
+    fallback_aware_priority.extend(
+        index for index in signal_priority if index not in fitting_signals
+    )
+    fallback_aware_priority.extend(critical_priority)
+    return recovery_priority + [
+        index for index in fallback_aware_priority if index not in recovery_priority
     ]
+
+
+def _all_priority_indices(
+    lines: list[str],
+    indices: list[int],
+    priority_patterns: tuple[tuple[re.Pattern[str], ...], ...],
+) -> list[int]:
+    priority: list[int] = []
+    for pattern_group in priority_patterns:
+        group_matches = sorted(
+            [
+                index
+                for index in indices
+                if index not in priority
+                and any(pattern.search(lines[index]) for pattern in pattern_group)
+            ],
+            key=lambda index: _failure_detail_sort_key(lines[index], index),
+        )
+        priority.extend(group_matches)
+    return priority
 
 
 def _matching_indices(
@@ -1527,16 +2021,35 @@ def _enforce_final_budget(
 ) -> str | None:
     compacted = text
     if _line_count(compacted) > options.max_lines:
-        if preserve_patterns is not None and _first_pattern_match(compacted, preserve_patterns):
+        has_preserved_match = (
+            preserve_patterns is not None
+            and _first_pattern_match(compacted, preserve_patterns) is not None
+        )
+        if has_preserved_match:
             line_capped = _important_lines(compacted, options, preserve_patterns)
         else:
             line_capped = _head_tail(compacted, options)
         if line_capped is not None and len(line_capped) < len(compacted):
-            if _dropped_lcm_externalized_match(before=compacted, after=line_capped):
+            line_capped = _remark_budget_rewrite_with_line_coverage(
+                before=compacted,
+                after=line_capped,
+                options=options,
+                allow_boundary_fallback=not has_preserved_match,
+            )
+            if line_capped is None:
+                return None
+            if _budget_rewrite_loses_recovery_evidence(
+                before=compacted,
+                after=line_capped,
+            ):
                 return None
             compacted = line_capped
     if len(compacted) > options.max_chars:
-        if preserve_patterns is not None and _first_pattern_match(compacted, preserve_patterns):
+        has_preserved_match = (
+            preserve_patterns is not None
+            and _first_pattern_match(compacted, preserve_patterns) is not None
+        )
+        if has_preserved_match:
             char_capped = _char_head_tail_preserving_patterns(
                 compacted,
                 options,
@@ -1545,7 +2058,18 @@ def _enforce_final_budget(
         else:
             char_capped = _char_head_tail(compacted, options)
         if char_capped is not None and len(char_capped) < len(compacted):
-            if _dropped_lcm_externalized_match(before=compacted, after=char_capped):
+            char_capped = _remark_budget_rewrite_with_line_coverage(
+                before=compacted,
+                after=char_capped,
+                options=options,
+                allow_boundary_fallback=not has_preserved_match,
+            )
+            if char_capped is None:
+                return None
+            if _budget_rewrite_loses_recovery_evidence(
+                before=compacted,
+                after=char_capped,
+            ):
                 return None
             compacted = char_capped
     if not _fits_budget(compacted, options):
@@ -1564,13 +2088,51 @@ def _char_head_tail_preserving_patterns(
     if not matches:
         return _char_head_tail(text, options)
     layout = _line_layout(text)
+    multi_anchor_excerpt = _lcm_and_diagnostic_excerpt(layout, options, matches)
+    if multi_anchor_excerpt is not None:
+        return multi_anchor_excerpt
     best_rank = min(_rank_for_span_match(match, layout) for match in matches)
     for match in matches:
-        if _would_hide_better_failure_anchor(best_rank, _rank_for_span_match(match, layout)):
+        if (
+            not _span_match_line_has_lcm_ref(match, layout)
+            and _would_hide_better_failure_anchor(best_rank, _rank_for_span_match(match, layout))
+        ):
             return None
         line_excerpt = _line_centered_excerpt(text, options, match, layout=layout)
         if line_excerpt is not None:
             return line_excerpt
+    return None
+
+
+def _lcm_and_diagnostic_excerpt(
+    layout: _LineLayout,
+    options: NoisegateOptions,
+    matches: list[_SpanMatch],
+) -> str | None:
+    lcm_lines: list[int] = []
+    for index, line in enumerate(layout.lines):
+        if any(pattern.search(line) for pattern in LCM_EXTERNALIZED_PATTERNS):
+            lcm_lines.append(index)
+
+    diagnostic_lines: list[int] = []
+    for match in matches:
+        index = match.line_index
+        if (
+            index is not None
+            and index not in lcm_lines
+            and index not in diagnostic_lines
+        ):
+            diagnostic_lines.append(index)
+    if not lcm_lines or not diagnostic_lines:
+        return None
+
+    for diagnostic_line in diagnostic_lines:
+        candidate = _marked_excerpt_for_line_indices(
+            layout.lines,
+            sorted({*lcm_lines, diagnostic_line}),
+        )
+        if candidate is not None and _fits_budget(candidate, options):
+            return candidate
     return None
 
 
@@ -1583,22 +2145,93 @@ def _rank_for_span_match(match: _SpanMatch, layout: _LineLayout) -> int:
     return 5
 
 
+def _span_match_line_has_lcm_ref(match: _SpanMatch, layout: _LineLayout) -> bool:
+    line_index = match.line_index
+    if line_index is None or line_index < 0 or line_index >= len(layout.lines):
+        return False
+    return any(pattern.search(layout.lines[line_index]) for pattern in LCM_EXTERNALIZED_PATTERNS)
+
+
 def _would_hide_better_failure_anchor(best_rank: int, candidate_rank: int) -> bool:
     return best_rank <= 1 and candidate_rank > 1
 
 
 def _dropped_lcm_externalized_match(*, before: str, after: str) -> bool:
-    return any(match not in after for match in _lcm_externalized_matches(before))
+    before_matches = Counter(_lcm_externalized_matches(before))
+    after_matches = Counter(_lcm_externalized_matches(after))
+    return any(after_matches[match] < count for match, count in before_matches.items())
+
+
+def _budget_rewrite_loses_recovery_evidence(*, before: str, after: str) -> bool:
+    if _dropped_lcm_externalized_match(before=before, after=after):
+        return True
+    return _dropped_omission_notice(before=before, after=after)
+
+
+def _remark_budget_rewrite_with_line_coverage(
+    *,
+    before: str,
+    after: str,
+    options: NoisegateOptions,
+    allow_boundary_fallback: bool,
+) -> str | None:
+    if not _omission_notices(before):
+        return after
+    remarked = _remark_excerpt_with_line_coverage(before, after)
+    if remarked == after:
+        return after
+    if remarked is not None and _fits_budget(remarked, options):
+        return remarked
+    if allow_boundary_fallback:
+        source_lines = before.splitlines()
+        boundary_indices = [
+            index
+            for index, line in enumerate(source_lines)
+            if not OMISSION_NOTICE_PATTERN.fullmatch(line)
+        ]
+        boundary_groups: list[tuple[int, ...]] = []
+        if boundary_indices:
+            boundary_groups.extend(
+                [
+                    (boundary_indices[0], boundary_indices[-1]),
+                    (boundary_indices[0],),
+                    (boundary_indices[-1],),
+                ]
+            )
+        for group in dict.fromkeys(boundary_groups):
+            candidate = _marked_excerpt_for_line_indices(source_lines, list(group))
+            if candidate is None:
+                continue
+            boundary_excerpt = _remark_excerpt_with_line_coverage(before, candidate)
+            if boundary_excerpt is not None and _fits_budget(boundary_excerpt, options):
+                return boundary_excerpt
+    return remarked
 
 
 def _lcm_externalized_matches(text: str) -> list[str]:
     matches: list[str] = []
     for pattern in LCM_EXTERNALIZED_PATTERNS:
         for match in pattern.finditer(text):
-            value = match.group(0)
-            if value not in matches:
-                matches.append(value)
+            matches.append(match.group(0))
     return matches
+
+
+def _omission_notices(text: str) -> list[str]:
+    return [line for line in text.splitlines() if OMISSION_NOTICE_PATTERN.fullmatch(line)]
+
+
+def _dropped_omission_notice(*, before: str, after: str) -> bool:
+    if not _omission_notices(before):
+        return False
+    return _remark_excerpt_with_line_coverage(before, after) != after
+
+
+def _represented_line_coverage(text: str) -> int:
+    coverage = 0
+    for line in text.splitlines():
+        match = LINE_OMISSION_NOTICE_PATTERN.fullmatch(line)
+        coverage += int(match.group(1)) if match is not None else 1
+    return coverage
 
 
 def _match_centered_excerpt(
@@ -1831,7 +2464,7 @@ def _ranked_pattern_line_matches(
     text: str,
     patterns: tuple[re.Pattern[str], ...],
 ) -> list[_SpanMatch]:
-    candidates: list[tuple[tuple[int, int, int, int, int], _SpanMatch]] = []
+    candidates: list[tuple[tuple[int, int, int, int, int, int, int], _SpanMatch]] = []
     pattern_order_first = patterns is NODE_PATTERNS or _patterns_prefer_declared_order(
         patterns
     )
@@ -1843,17 +2476,23 @@ def _ranked_pattern_line_matches(
             if match is None:
                 continue
             detail_rank = _failure_detail_rank(stripped_line)
+            detail_subrank = _failure_detail_subrank(stripped_line)
+            recovery_rank = 0 if id(pattern) in LCM_EXTERNALIZED_PATTERN_IDS else 1
             if pattern_order_first:
                 rank = (
+                    recovery_rank,
                     pattern_index,
                     detail_rank,
+                    detail_subrank,
                     line_index,
                     offset + match.start(),
                     offset + match.end(),
                 )
             else:
                 rank = (
+                    recovery_rank,
                     detail_rank,
+                    detail_subrank,
                     pattern_index,
                     line_index,
                     offset + match.start(),
@@ -1881,8 +2520,16 @@ def _patterns_prefer_declared_order(patterns: tuple[re.Pattern[str], ...]) -> bo
         tuple(pattern for group in PACKAGE_HIGH_SIGNAL_PRIORITY_PATTERNS for pattern in group),
         tuple(pattern for group in DOCKER_BUILD_HIGH_SIGNAL_PRIORITY_PATTERNS for pattern in group),
     )
+    diagnostic_patterns = tuple(
+        pattern for pattern in patterns if id(pattern) not in LCM_EXTERNALIZED_PATTERN_IDS
+    )
     return any(
-        patterns is priority_set or patterns == priority_set
+        patterns is priority_set
+        or patterns == priority_set
+        or (
+            len(diagnostic_patterns) > len(priority_set)
+            and diagnostic_patterns[: len(priority_set)] == priority_set
+        )
         for priority_set in priority_sets
     )
 
@@ -1972,6 +2619,16 @@ def _metadata(
     return metadata
 
 
+def _refresh_compacted_metrics(
+    metadata: dict[str, JsonValue],
+    *,
+    original: str,
+    compacted: str,
+) -> None:
+    metadata["omitted_chars"] = max(0, len(original) - len(compacted))
+    metadata["omitted_lines"] = max(0, _line_count(original) - _line_count(compacted))
+
+
 def _unchanged(
     text: str,
     reducer: str,
@@ -2058,6 +2715,19 @@ def _concrete_failure_excerpt_for_notices(
     lines = text.splitlines()
     if options.max_lines < 2:
         return None
+
+    def fully_represented(candidate: str | None) -> str | None:
+        if candidate is None:
+            return None
+        if _omission_notices(text):
+            candidate = _remark_excerpt_with_line_coverage(text, candidate)
+        if (
+            candidate is None
+            or _represented_line_coverage(candidate) != _represented_line_coverage(text)
+        ):
+            return None
+        return candidate
+
     concrete_indices = [
         index
         for index, line in enumerate(lines)
@@ -2094,12 +2764,9 @@ def _concrete_failure_excerpt_for_notices(
     if len(rich_keep) > 1:
         rich_indices = sorted(rich_keep)
         marked_rich_candidate = _marked_excerpt_for_line_indices(lines, rich_indices)
+        marked_rich_candidate = fully_represented(marked_rich_candidate)
         if marked_rich_candidate is not None and _fits_budget(marked_rich_candidate, options):
             return marked_rich_candidate
-        if all(b == a + 1 for a, b in pairwise(rich_indices)):
-            rich_candidate = "\n".join(lines[index] for index in rich_indices)
-            if _fits_budget(rich_candidate, options):
-                return rich_candidate
 
     keep = [concrete_indices[0]]
     if failed_indices:
@@ -2120,17 +2787,14 @@ def _concrete_failure_excerpt_for_notices(
             )
             if part
         )
-        if _fits_budget(marked_candidate, options):
-            return marked_candidate
-    candidate = "\n".join(lines[index] for index in keep)
-    if len(keep) == 1 and _fits_budget(candidate, options):
-        return candidate
-    if len(keep) > 1:
-        marked_candidate = _marked_excerpt_for_line_indices(lines, keep)
+        marked_candidate = fully_represented(marked_candidate)
         if marked_candidate is not None and _fits_budget(marked_candidate, options):
             return marked_candidate
-        if all(b == a + 1 for a, b in pairwise(keep)) and _fits_budget(candidate, options):
-            return candidate
+    if len(keep) > 1:
+        marked_candidate = _marked_excerpt_for_line_indices(lines, keep)
+        marked_candidate = fully_represented(marked_candidate)
+        if marked_candidate is not None and _fits_budget(marked_candidate, options):
+            return marked_candidate
     return None
 
 
@@ -2159,6 +2823,516 @@ def _marked_excerpt_for_line_indices(lines: list[str], indices: list[int]) -> st
     return "\n".join(parts)
 
 
+def _ranked_diagnostic_line_indices(
+    text: str,
+    preserve_patterns: tuple[re.Pattern[str], ...] | None,
+) -> list[int]:
+    if preserve_patterns is None:
+        return []
+
+    lines = text.splitlines()
+    indices: list[int] = []
+    for match in _ranked_pattern_line_matches(text, preserve_patterns):
+        index = match.line_index
+        if (
+            index is None
+            or index < 0
+            or index >= len(lines)
+            or index in indices
+            or OMISSION_NOTICE_PATTERN.fullmatch(lines[index])
+            or any(pattern.search(lines[index]) for pattern in LCM_EXTERNALIZED_PATTERNS)
+        ):
+            continue
+        indices.append(index)
+    return indices
+
+
+def _line_coverage_remap_dropped_ranked_diagnostic(
+    *,
+    before: str,
+    after: str,
+    options: NoisegateOptions,
+    preserve_patterns: tuple[re.Pattern[str], ...] | None,
+    required_notices: list[str] | None = None,
+) -> bool:
+    if not _omission_notices(before):
+        return False
+    lines = before.splitlines()
+    diagnostic_indices = _ranked_diagnostic_line_indices(before, preserve_patterns)
+    if not diagnostic_indices:
+        return False
+    best = _best_ranked_diagnostic_excerpt(
+        before=before,
+        options=options,
+        preserve_patterns=preserve_patterns,
+        required_notices=required_notices,
+    )
+    if best is None:
+        return after != before
+    best_index, _ = best
+    body = after
+    notices = required_notices or []
+    after_lines = after.splitlines()
+    if notices and after_lines[-len(notices) :] == notices:
+        body = "\n".join(after_lines[: -len(notices)])
+    selected_indices = _source_line_indices_for_excerpt(
+        lines,
+        body,
+        _source_key=before,
+    )
+    return selected_indices is None or best_index not in selected_indices
+
+
+def _ensure_ranked_diagnostic_after_line_coverage_remap(
+    *,
+    before: str,
+    shortened: str | None,
+    options: NoisegateOptions,
+    preserve_patterns: tuple[re.Pattern[str], ...] | None,
+    required_notices: list[str] | None = None,
+) -> str | None:
+    if shortened is None or not _omission_notices(before):
+        return shortened
+
+    best = _best_ranked_diagnostic_excerpt(
+        before=before,
+        options=options,
+        preserve_patterns=preserve_patterns,
+        required_notices=required_notices,
+    )
+    diagnostic_indices = _ranked_diagnostic_line_indices(before, preserve_patterns)
+    if not diagnostic_indices:
+        return shortened
+    if best is None:
+        return None
+
+    best_index, best_excerpt = best
+    body_options = _options_reserving_notices(options, required_notices)
+    if body_options is None:
+        return None
+    selected_indices = _source_line_indices_for_excerpt(
+        before.splitlines(),
+        shortened,
+        _source_key=before,
+    )
+    if (
+        selected_indices is not None
+        and best_index in selected_indices
+        and _fits_budget(shortened, body_options)
+    ):
+        return shortened
+    return best_excerpt
+
+
+def _best_ranked_diagnostic_excerpt(
+    *,
+    before: str,
+    options: NoisegateOptions,
+    preserve_patterns: tuple[re.Pattern[str], ...] | None,
+    required_notices: list[str] | None = None,
+) -> tuple[int, str] | None:
+    token = None
+    try:
+        if _SOURCE_ALIGNMENT_WORK_BUDGET.get() is None:
+            token = _SOURCE_ALIGNMENT_WORK_BUDGET.set(
+                _new_source_alignment_work_budget()
+            )
+        return _best_ranked_diagnostic_excerpt_with_budget(
+            before=before,
+            options=options,
+            preserve_patterns=preserve_patterns,
+            required_notices=required_notices,
+        )
+    except _SourceAlignmentWorkExhausted:
+        if token is None:
+            raise
+        return None
+    finally:
+        if token is not None:
+            _SOURCE_ALIGNMENT_WORK_BUDGET.reset(token)
+
+
+def _best_ranked_diagnostic_excerpt_with_budget(
+    *,
+    before: str,
+    options: NoisegateOptions,
+    preserve_patterns: tuple[re.Pattern[str], ...] | None,
+    required_notices: list[str] | None,
+) -> tuple[int, str] | None:
+    body_options = _options_reserving_notices(options, required_notices)
+    if body_options is None:
+        return None
+
+    lines = before.splitlines()
+    lcm_indices = [
+        index
+        for index, line in enumerate(lines)
+        if any(pattern.search(line) for pattern in LCM_EXTERNALIZED_PATTERNS)
+    ]
+    for diagnostic_index in _ranked_diagnostic_line_indices(before, preserve_patterns):
+        candidate = _marked_excerpt_for_line_indices(
+            lines,
+            [*lcm_indices, diagnostic_index],
+        )
+        if candidate is None:
+            continue
+        candidate = _remark_excerpt_with_line_coverage_with_budget(
+            before,
+            candidate,
+            source_lines=lines,
+        )
+        if candidate is not None and _fits_budget(candidate, body_options):
+            return diagnostic_index, candidate
+    return None
+
+
+def _options_reserving_notices(
+    options: NoisegateOptions,
+    required_notices: list[str] | None,
+) -> NoisegateOptions | None:
+    notices = required_notices or []
+    if not notices:
+        return options
+    suffix = "\n" + "\n".join(notices)
+    max_chars = options.max_chars - len(suffix)
+    max_lines = options.max_lines - len(notices)
+    if max_chars <= 0 or max_lines <= 0:
+        return None
+    return replace(options, max_chars=max_chars, max_lines=max_lines)
+
+
+def _remark_excerpt_with_line_coverage(
+    before: str,
+    shortened: str,
+) -> str | None:
+    token = None
+    try:
+        if _SOURCE_ALIGNMENT_WORK_BUDGET.get() is None:
+            token = _SOURCE_ALIGNMENT_WORK_BUDGET.set(
+                _new_source_alignment_work_budget()
+            )
+        return _remark_excerpt_with_line_coverage_with_budget(before, shortened)
+    except _SourceAlignmentWorkExhausted:
+        if token is None:
+            raise
+        return None
+    finally:
+        if token is not None:
+            _SOURCE_ALIGNMENT_WORK_BUDGET.reset(token)
+
+
+def _remark_excerpt_with_line_coverage_with_budget(
+    before: str,
+    shortened: str,
+    *,
+    source_lines: list[str] | None = None,
+) -> str | None:
+    budget = _SOURCE_ALIGNMENT_WORK_BUDGET.get()
+    if budget is None:
+        raise RuntimeError("source alignment budget is not active")
+    cache_key = (before, shortened)
+    if cache_key in budget._remark_cache:
+        return budget._remark_cache[cache_key]
+
+    source_lines = before.splitlines() if source_lines is None else source_lines
+    selected_indices = _source_line_indices_for_excerpt(
+        source_lines,
+        shortened,
+        _source_key=before,
+    )
+    if selected_indices is None:
+        budget._remark_cache[cache_key] = None
+        return None
+
+    # Character notices cannot be represented by a line-coverage marker. Keep
+    # every source occurrence at its source position; generated lookalikes in
+    # ``shortened`` are deliberately ignored above.
+    selected_set = set(selected_indices)
+    source_state = budget._source_cache.get(before)
+    if source_state is None:
+        budget._remark_cache[cache_key] = None
+        return None
+    selected_set.update(source_state.char_omission_indices)
+    ordered_indices = sorted(selected_set)
+    budget.spend(1 + len(ordered_indices))
+
+    parts: list[str] = []
+    source_cursor = 0
+    for index in ordered_indices:
+        omitted_coverage = (
+            source_state.represented_prefix[index]
+            - source_state.represented_prefix[source_cursor]
+        )
+        if omitted_coverage:
+            parts.append(f"[noisegate: omitted {omitted_coverage} lines]")
+        parts.append(source_lines[index])
+        source_cursor = index + 1
+    omitted_coverage = (
+        source_state.represented_prefix[-1]
+        - source_state.represented_prefix[source_cursor]
+    )
+    if omitted_coverage:
+        parts.append(f"[noisegate: omitted {omitted_coverage} lines]")
+    remarked = "\n".join(parts) or None
+    budget._remark_cache[cache_key] = remarked
+    return remarked
+
+
+def _source_line_indices_for_excerpt(
+    source_lines: list[str],
+    excerpt: str,
+    *,
+    _work_limit: int | None = None,
+    _source_key: str | None = None,
+) -> list[int] | None:
+    """Return the unique source occurrences selected by a marked excerpt.
+
+    Omission notices in an excerpt have two possible provenances: immutable
+    notices copied from the source, or markers generated for a skipped source
+    interval. Generated line markers can describe either physical lines (the
+    first reducer pass) or represented coverage (a later remap pass). Keeping
+    both interpretations until adjacent anchors disambiguate them preserves
+    occurrence identity without trusting marker text alone. Alignment search
+    is explicitly bounded; exhausting the bound returns ambiguous so callers
+    fail open.
+    """
+    excerpt_lines = excerpt.splitlines()
+    work_limit = _SOURCE_ALIGNMENT_WORK_LIMIT if _work_limit is None else _work_limit
+    budget = _SOURCE_ALIGNMENT_WORK_BUDGET.get()
+    owns_budget = budget is None
+    if owns_budget:
+        if work_limit < 0:
+            return None
+        budget = _SourceAlignmentWorkBudget(work_limit)
+    elif _work_limit is not None and _work_limit < 0:
+        budget.exhausted = True
+        raise _SourceAlignmentWorkExhausted
+    if budget.exhausted:
+        if owns_budget:
+            return None
+        raise _SourceAlignmentWorkExhausted
+
+    budget.alignment_calls += 1
+    source_key: _SourceAlignmentSourceKey = (
+        tuple(source_lines) if _source_key is None else _source_key
+    )
+    operation_cache_key = (source_key, excerpt)
+    if operation_cache_key in budget._alignment_cache:
+        cached = budget._alignment_cache[operation_cache_key]
+        return None if cached is None else list(cached)
+    if len(excerpt_lines) > _SOURCE_ALIGNMENT_MAX_DEPTH:
+        budget._alignment_cache[operation_cache_key] = None
+        return None
+
+    call_work_limit = _work_limit if not owns_budget else None
+    call_work = 0
+    result_limit = 2
+
+    def spend_work(amount: int = 1) -> None:
+        nonlocal call_work
+        if call_work_limit is not None and amount > call_work_limit - call_work:
+            budget.exhausted = True
+            raise _SourceAlignmentWorkExhausted
+        budget.spend(amount)
+        call_work += amount
+
+    def add_unique(
+        results: list[tuple[int, ...]],
+        candidates: tuple[tuple[int, ...], ...],
+    ) -> None:
+        for candidate in candidates:
+            # Tuple construction and equality are linear in the selected-anchor
+            # count, so charge that work as well as the state transition.
+            spend_work(1 + (len(candidate) * len(results)))
+            if candidate not in results:
+                results.append(candidate)
+                if len(results) >= result_limit:
+                    return
+
+    if source_key in budget._source_cache:
+        source_state = budget._source_cache[source_key]
+    else:
+        evidence_indices_building: dict[str, list[int]] = {}
+        represented_prefix_building = [0]
+        represented_ends_building: dict[int, list[int]] = {}
+        source_is_omission_building: list[bool] = []
+        char_omission_indices_building: list[int] = []
+        try:
+            # Source indices are immutable within an operation. Build and charge
+            # them once, then share them across ranked candidates and later passes.
+            spend_work(len(source_lines))
+            for index, source_line in enumerate(source_lines):
+                source_is_omission_building.append(
+                    OMISSION_NOTICE_PATTERN.fullmatch(source_line) is not None
+                )
+                if source_is_omission_building[-1]:
+                    evidence_indices_building.setdefault(source_line, []).append(index)
+                line_omission = LINE_OMISSION_NOTICE_PATTERN.fullmatch(source_line)
+                if source_is_omission_building[-1] and line_omission is None:
+                    char_omission_indices_building.append(index)
+                coverage = int(line_omission.group(1)) if line_omission is not None else 1
+                represented = represented_prefix_building[-1] + coverage
+                represented_prefix_building.append(represented)
+                represented_ends_building.setdefault(represented, []).append(index + 1)
+        except ValueError:
+            budget._source_cache[source_key] = None
+            budget._alignment_cache[operation_cache_key] = None
+            return None
+        except _SourceAlignmentWorkExhausted:
+            if owns_budget:
+                return None
+            raise
+        source_state = _SourceAlignmentSourceState(
+            evidence_indices={
+                line: tuple(indices)
+                for line, indices in evidence_indices_building.items()
+            },
+            represented_prefix=tuple(represented_prefix_building),
+            represented_ends={
+                coverage: tuple(indices)
+                for coverage, indices in represented_ends_building.items()
+            },
+            source_is_omission=tuple(source_is_omission_building),
+            char_omission_indices=tuple(char_omission_indices_building),
+        )
+        budget._source_cache[source_key] = source_state
+    if source_state is None:
+        budget._alignment_cache[operation_cache_key] = None
+        return None
+
+    evidence_indices = source_state.evidence_indices
+    represented_prefix = source_state.represented_prefix
+    represented_ends = source_state.represented_ends
+    source_is_omission = source_state.source_is_omission
+    excerpt_is_omission: list[bool] = []
+    excerpt_line_coverage: list[int | None] = []
+    try:
+        spend_work(len(excerpt_lines))
+        for excerpt_line in excerpt_lines:
+            excerpt_is_omission.append(
+                OMISSION_NOTICE_PATTERN.fullmatch(excerpt_line) is not None
+            )
+            line_omission = LINE_OMISSION_NOTICE_PATTERN.fullmatch(excerpt_line)
+            excerpt_line_coverage.append(
+                int(line_omission.group(1)) if line_omission is not None else None
+            )
+    except ValueError:
+        budget._alignment_cache[operation_cache_key] = None
+        return None
+    except _SourceAlignmentWorkExhausted:
+        if owns_budget:
+            return None
+        raise
+
+    suffix_has_ordinary_line = [False] * (len(excerpt_lines) + 1)
+    for index in range(len(excerpt_lines) - 1, -1, -1):
+        suffix_has_ordinary_line[index] = (
+            not excerpt_is_omission[index] or suffix_has_ordinary_line[index + 1]
+        )
+
+    def represented_gap_end(start: int, coverage: int) -> int | None:
+        ends = represented_ends.get(represented_prefix[start] + coverage, ())
+        spend_work(1 + len(ends).bit_length())
+        position = bisect_right(ends, start)
+        return ends[position] if position < len(ends) else None
+
+    cache: dict[tuple[int, int], tuple[tuple[int, ...], ...]] = {}
+
+    def align(excerpt_index: int, source_index: int) -> tuple[tuple[int, ...], ...]:
+        cache_key = (excerpt_index, source_index)
+        if cache_key in cache:
+            return cache[cache_key]
+        spend_work()
+        if excerpt_index == len(excerpt_lines):
+            aligned = ((),)
+            cache[cache_key] = aligned
+            return aligned
+
+        excerpt_line = excerpt_lines[excerpt_index]
+        results: list[tuple[int, ...]] = []
+        if not excerpt_is_omission[excerpt_index]:
+            if (
+                source_index < len(source_lines)
+                and source_lines[source_index] == excerpt_line
+                and not source_is_omission[source_index]
+            ):
+                suffixes = align(excerpt_index + 1, source_index + 1)
+                prefixed: list[tuple[int, ...]] = []
+                for suffix in suffixes:
+                    spend_work(1 + len(suffix))
+                    prefixed.append((source_index, *suffix))
+                add_unique(
+                    results,
+                    tuple(prefixed),
+                )
+        else:
+            # A source notice is immutable evidence rather than kept content.
+            # Reducers may rank it independently of nearby ordinary lines, so
+            # let it match a later source occurrence. Any resulting kept-line
+            # ambiguity is still rejected below.
+            occurrences = evidence_indices.get(excerpt_line, [])
+            spend_work(1 + len(occurrences).bit_length())
+            occurrence_index = bisect_left(occurrences, source_index)
+            while occurrence_index < len(occurrences):
+                spend_work()
+                evidence_index = occurrences[occurrence_index]
+                add_unique(results, align(excerpt_index + 1, evidence_index + 1))
+                # With no ordinary line left, every successful provenance path
+                # has the same empty mapping. One success therefore exhausts
+                # the distinct result space without exploring quadratic marker
+                # combinations.
+                if results and not suffix_has_ordinary_line[excerpt_index]:
+                    aligned = (results[0],)
+                    cache[cache_key] = aligned
+                    return aligned
+                if len(results) >= result_limit:
+                    break
+                occurrence_index += 1
+
+            omitted = excerpt_line_coverage[excerpt_index]
+            if omitted is not None:
+                generated_ends: set[int] = set()
+                physical_end = source_index + omitted
+                if omitted > 0 and physical_end <= len(source_lines):
+                    generated_ends.add(physical_end)
+                represented_end = (
+                    represented_gap_end(source_index, omitted) if omitted > 0 else None
+                )
+                if omitted > 0 and represented_end is not None:
+                    generated_ends.add(represented_end)
+
+                for generated_end in sorted(generated_ends):
+                    spend_work()
+                    if excerpt_index == len(excerpt_lines) - 1:
+                        suffixes = ((),) if generated_end == len(source_lines) else ()
+                    else:
+                        suffixes = align(excerpt_index + 1, generated_end)
+                    add_unique(results, suffixes)
+                    if results and not suffix_has_ordinary_line[excerpt_index]:
+                        aligned = (results[0],)
+                        cache[cache_key] = aligned
+                        return aligned
+                    if len(results) >= result_limit:
+                        break
+
+        aligned = tuple(results)
+        cache[cache_key] = aligned
+        return aligned
+
+    try:
+        mappings = align(0, 0)
+    except _SourceAlignmentWorkExhausted:
+        if owns_budget:
+            return None
+        raise
+    if len(mappings) != 1:
+        budget._alignment_cache[operation_cache_key] = None
+        return None
+    mapping = mappings[0]
+    budget._alignment_cache[operation_cache_key] = mapping
+    return list(mapping)
+
+
 def _append_recovery_notices(
     text: str,
     metadata: dict[str, JsonValue],
@@ -2166,31 +3340,51 @@ def _append_recovery_notices(
     artifact_dir: Path | None = None,
     options: NoisegateOptions | None = None,
     preserve_patterns: tuple[re.Pattern[str], ...] | None = None,
+    fail_open_text: str | None = None,
 ) -> str:
-    notice_metadata = metadata
-    if (
-        preserve_patterns is not None
-        and _first_pattern_match(text, preserve_patterns) is not None
-        and _has_nonrecoverable_artifact(metadata)
-    ):
-        notice_metadata = dict(metadata)
-        notice_metadata.pop("artifact", None)
-
-    notices = _recovery_notices(notice_metadata, artifact_dir=artifact_dir)
+    fallback = text if fail_open_text is None else fail_open_text
+    notices = _recovery_notices_for_text(
+        text,
+        metadata,
+        artifact_dir=artifact_dir,
+        preserve_patterns=preserve_patterns,
+    )
     if not notices:
         return text
+    requires_exit_notice = any(
+        notice.startswith("[noisegate: exit_code=") for notice in notices
+    )
     suffix = "\n" + "\n".join(notices)
     if options is None:
         return f"{text}{suffix}"
 
     budget = max(0, options.max_chars)
     if budget == 0:
-        return ""
+        return fallback if requires_exit_notice else ""
     if len(text) + len(suffix) <= budget:
         candidate = f"{text}{suffix}"
         if _fits_budget(candidate, options):
             return candidate
+    # Notices already present in the original output are immutable recovery
+    # evidence. The reducer has already canonicalized their coverage/position;
+    # if a recovery suffix still requires another shortening pass, fail open.
+    if fail_open_text is not None and _omission_notices(fail_open_text):
+        return fallback
+    if (
+        fail_open_text is not None
+        and not _omission_notices(fallback)
+        and any(
+            CHAR_OMISSION_NOTICE_PATTERN.fullmatch(line)
+            for line in text.splitlines()
+        )
+    ):
+        # Recompute generated char coverage from the original output when room
+        # must be reserved for an exit/artifact notice. The intermediate char
+        # marker only describes the first rewrite and cannot cover a second.
+        text = fallback
     if len(suffix) >= budget:
+        if requires_exit_notice:
+            return fallback
         return _enforce_final_budget(
             text,
             options,
@@ -2201,7 +3395,7 @@ def _append_recovery_notices(
     reserved_options = replace(
         options,
         max_chars=text_budget,
-        max_lines=max(1, options.max_lines - _line_count(suffix)),
+        max_lines=max(1, options.max_lines - len(notices)),
     )
     reserved_tight_excerpt = _concrete_failure_excerpt_for_notices(
         text,
@@ -2212,7 +3406,7 @@ def _append_recovery_notices(
         text,
         re.IGNORECASE,
     ):
-        return text
+        return fallback if requires_exit_notice else text
     used_reserved_tight_excerpt = reserved_tight_excerpt is not None
     if used_reserved_tight_excerpt:
         shortened = reserved_tight_excerpt
@@ -2253,7 +3447,7 @@ def _append_recovery_notices(
             preserve_patterns,
         )
         if shortened is None:
-            return text
+            return fallback if requires_exit_notice else text
     if shortened is None:
         shortened = _single_preserved_line_excerpt(
             text,
@@ -2268,11 +3462,66 @@ def _append_recovery_notices(
             and _fits_budget(notice_only, options)
         ):
             return notice_only
+        if requires_exit_notice:
+            return fallback
         return text
+    source_has_omission_marker = fail_open_text is not None and bool(
+        _omission_notices(fallback)
+    )
+    has_line_omission_marker = any(
+        LINE_OMISSION_NOTICE_PATTERN.fullmatch(line)
+        for line in text.splitlines()
+    )
+    evidence_source = fallback if source_has_omission_marker else text
+    if (
+        source_has_omission_marker
+        or has_line_omission_marker
+        or _lcm_externalized_matches(text)
+    ):
+        remarked = _remark_excerpt_with_line_coverage(evidence_source, shortened)
+        if remarked is None:
+            return fallback
+        shortened = remarked
+        if (
+            _dropped_omission_notice(before=evidence_source, after=shortened)
+            or (
+                (source_has_omission_marker or has_line_omission_marker)
+                and _represented_line_coverage(evidence_source)
+                != _represented_line_coverage(shortened)
+            )
+        ):
+            return fallback
+    if _dropped_lcm_externalized_match(before=text, after=shortened):
+        return fallback
+    if (
+        (source_has_omission_marker or has_line_omission_marker)
+        and _dropped_omission_notice(before=evidence_source, after=shortened)
+    ):
+        return fallback
     candidate = f"{shortened}{suffix}"
     if not _fits_budget(candidate, options):
+        if requires_exit_notice:
+            return fallback
         return text
     return candidate
+
+
+def _recovery_notices_for_text(
+    text: str,
+    metadata: dict[str, JsonValue],
+    *,
+    artifact_dir: Path | None,
+    preserve_patterns: tuple[re.Pattern[str], ...] | None,
+) -> list[str]:
+    notice_metadata = metadata
+    if (
+        preserve_patterns is not None
+        and _first_pattern_match(text, preserve_patterns) is not None
+        and _has_nonrecoverable_artifact(metadata)
+    ):
+        notice_metadata = dict(metadata)
+        notice_metadata.pop("artifact", None)
+    return _recovery_notices(notice_metadata, artifact_dir=artifact_dir)
 
 
 def _single_preserved_line_excerpt(
@@ -2316,7 +3565,7 @@ def _single_preserved_line_excerpt(
         excerpt = _line_centered_excerpt(text, options, match, layout=layout)
         if excerpt is not None:
             return excerpt
-        if _fits_budget(line, options):
+        if len(layout.lines) == 1 and _fits_budget(line, options):
             return line
     return None
 

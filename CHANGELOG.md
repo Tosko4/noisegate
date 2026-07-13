@@ -18,6 +18,8 @@ All notable changes to Noisegate are documented here. Release notes are generate
 - `install-hermes` now rejects non-Hermes Python launchers instead of trusting any virtualenv Python shebang, and it validates shell shims that exec Python are actually invoking `hermes_cli`.
 - The Hermes config helper now avoids rewriting an already-correct plugin config while still removing stale `noisegate` entries from `plugins.disabled`.
 - Pytest compaction now prefers assertion/traceback detail over progress lines when tight budgets force a single failure excerpt.
+- Tight-budget compaction now preserves Python task/chained exception headers, `BaseExceptionGroup` detail, and LCM externalized refs ahead of diagnostics.
+- Tight-budget LCM compaction now tries shorter ranked or reducer-specific failure anchors that fit alongside every externalized ref, and ranks actual `BaseExceptionGroup` headers ahead of pytest summaries.
 - Preserve source-like exact output for direct terminal file-display commands, V4A patches, and `reduce-json` command aliases even when the content resembles noisy failures.
 - Preserve uv dependency-resolution failures that occur before `uv run pytest` starts instead of routing them through the pytest reducer.
 - Preserve exact file output from attached `fd` / `fdfind` `--exec=cat` and `--exec-batch=cat` forms without protecting non-read consumers or swallowing diagnostics from later compactable commands.

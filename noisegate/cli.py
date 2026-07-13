@@ -14,18 +14,28 @@ from typing import Any, cast
 from ._version import __version__
 from .artifacts import ArtifactError, ArtifactStore
 from .engine import (
+    _SOURCE_ALIGNMENT_WORK_BUDGET,
     NoisegateOptions,
     _is_compactable_tool_name,
-    _preview_reduce_text,
+    _raise_if_source_alignment_work_exhausted,
+    _reduce_text_in_operation,
+    _source_alignment_work_operation,
+    _SourceAlignmentWorkExhausted,
     env_diagnostics,
     reduce_text,
 )
 from .installer import DEFAULT_PACKAGE_SPEC, InstallHermesError, install_hermes
 from .plugin import (
+    _artifact_preview_plan,
+    _artifact_preview_plan_matches_serialized_output,
+    _artifact_preview_plan_notice_present_in_text,
+    _artifact_preview_plan_with_owner_prefix,
+    _ArtifactNoticeOwnerStep,
+    _ArtifactPreviewPlan,
     _extract_exit_code,
-    _preview_tool_result,
     _select_command,
-    transform_tool_result,
+    _store_artifact_preview_plan,
+    _transform_tool_result_in_operation,
 )
 from .wrap import DEFAULT_MAX_CAPTURE_BYTES, WrappedCommandInterrupted, run_wrapped_command
 
@@ -138,6 +148,15 @@ def cmd_reduce(args: argparse.Namespace) -> int:
 def cmd_reduce_json(args: argparse.Namespace) -> int:
     raw = sys.stdin.read()
     try:
+        with _source_alignment_work_operation():
+            return _cmd_reduce_json_with_budget(args, raw)
+    except Exception:
+        sys.stdout.write(raw)
+        return 0
+
+
+def _cmd_reduce_json_with_budget(args: argparse.Namespace, raw: str) -> int:
+    try:
         parsed = json.loads(raw)
     except (json.JSONDecodeError, RecursionError, ValueError):
         sys.stdout.write(raw)
@@ -154,37 +173,60 @@ def cmd_reduce_json(args: argparse.Namespace) -> int:
     try:
         if options.artifact_enabled:
             preview_metadata: dict[str, Any] = {}
+            preview_plans: list[_ArtifactPreviewPlan] = []
             preview = _reduce_json_value(
                 parsed,
                 raw,
                 options,
                 metadata_out=preview_metadata,
                 defer_artifact_store=True,
+                artifact_plans_out=preview_plans,
             )
+            _raise_if_source_alignment_work_exhausted()
             if preview == raw:
                 output = raw
                 metadata = preview_metadata
                 _discard_preview_artifact_plans(metadata)
-            else:
-                planned_artifacts = _count_planned_artifacts(preview) + _count_artifact_plans(
-                    preview_metadata
+            elif not all(
+                _artifact_preview_plan_matches_serialized_output(plan, preview)
+                for plan in preview_plans
+            ):
+                output = _reduce_json_value(
+                    parsed,
+                    raw,
+                    options.with_mapping({"artifacts": False}),
+                    metadata_out=metadata,
                 )
-                if planned_artifacts == 1:
-                    output = _reduce_json_value(parsed, raw, options, metadata_out=metadata)
-                elif planned_artifacts > 1:
-                    output = _reduce_json_value(
-                        parsed,
-                        raw,
-                        options.with_mapping({"artifacts": False}),
-                        metadata_out=metadata,
-                    )
-                else:
+            elif len(preview_plans) == 1:
+                _raise_if_source_alignment_work_exhausted()
+                if _store_artifact_preview_plan(preview_plans[0], options):
                     output = preview
                     metadata = preview_metadata
+                else:
+                    output = raw
+                    metadata = preview_metadata
+                    _discard_preview_artifact_plans(
+                        metadata,
+                        reason="artifact_store_failed",
+                    )
+            elif len(preview_plans) > 1:
+                output = _reduce_json_value(
+                    parsed,
+                    raw,
+                    options.with_mapping({"artifacts": False}),
+                    metadata_out=metadata,
+                )
+            else:
+                output = preview
+                metadata = preview_metadata
         else:
             output = _reduce_json_value(parsed, raw, options, metadata_out=metadata)
+        _raise_if_source_alignment_work_exhausted()
+    except _SourceAlignmentWorkExhausted:
+        raise
     except Exception:
         output = raw
+        metadata = {}
     sys.stdout.write(output)
     if metadata:
         metadata = _json_metadata_with_envelope_metrics(metadata, raw, output, options)
@@ -347,47 +389,27 @@ def cmd_artifacts_verify(args: argparse.Namespace) -> int:
     return 2 if failed else 0
 
 
-def _discard_preview_artifact_plans(value: Any) -> None:
+def _discard_preview_artifact_plans(
+    value: Any,
+    *,
+    reason: str = "outer_no_gain",
+) -> None:
     if isinstance(value, dict):
         artifact = value.get("artifact")
         if isinstance(artifact, dict) and artifact.get("stored") is True:
             replacement: dict[str, Any] = {
                 "stored": False,
-                "reason": "outer_no_gain",
+                "reason": reason,
             }
             size_bytes = artifact.get("size_bytes")
             if isinstance(size_bytes, int) and not isinstance(size_bytes, bool):
                 replacement["size_bytes"] = size_bytes
             value["artifact"] = replacement
         for child in value.values():
-            _discard_preview_artifact_plans(child)
+            _discard_preview_artifact_plans(child, reason=reason)
     elif isinstance(value, list):
         for child in value:
-            _discard_preview_artifact_plans(child)
-
-
-def _count_artifact_plans(value: Any) -> int:
-    if isinstance(value, dict):
-        count = 0
-        artifact = value.get("artifact")
-        if isinstance(artifact, dict) and artifact.get("stored") is True:
-            count += 1
-        return count + sum(_count_artifact_plans(child) for child in value.values())
-    if isinstance(value, list):
-        return sum(_count_artifact_plans(child) for child in value)
-    if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
-        try:
-            return _count_artifact_plans(json.loads(value))
-        except (json.JSONDecodeError, RecursionError, ValueError):
-            return 0
-    return 0
-
-
-def _count_planned_artifacts(serialized: str) -> int:
-    try:
-        return _count_artifact_plans(json.loads(serialized))
-    except (json.JSONDecodeError, RecursionError, ValueError):
-        return 0
+            _discard_preview_artifact_plans(child, reason=reason)
 
 
 def _reduce_json_value(
@@ -397,9 +419,62 @@ def _reduce_json_value(
     *,
     metadata_out: dict[str, Any] | None = None,
     defer_artifact_store: bool = False,
+    artifact_plans_out: list[_ArtifactPreviewPlan] | None = None,
+) -> str:
+    local_metadata: dict[str, Any] | None = {} if metadata_out is not None else None
+    local_plans: list[_ArtifactPreviewPlan] | None = (
+        [] if artifact_plans_out is not None else None
+    )
+
+    def reduce_value() -> str:
+        output = _reduce_json_value_with_budget(
+            parsed,
+            raw,
+            options,
+            metadata_out=local_metadata,
+            defer_artifact_store=defer_artifact_store,
+            artifact_plans_out=local_plans,
+        )
+        _raise_if_source_alignment_work_exhausted()
+        if metadata_out is not None and local_metadata:
+            metadata_out.update(local_metadata)
+        if artifact_plans_out is not None and local_plans:
+            artifact_plans_out.extend(local_plans)
+        return output
+
+    if _SOURCE_ALIGNMENT_WORK_BUDGET.get() is not None:
+        return reduce_value()
+    try:
+        with _source_alignment_work_operation():
+            return reduce_value()
+    except Exception:
+        return raw
+
+
+def _reduce_json_value_with_budget(
+    parsed: Any,
+    raw: str,
+    options: NoisegateOptions,
+    *,
+    metadata_out: dict[str, Any] | None = None,
+    defer_artifact_store: bool = False,
+    artifact_plans_out: list[_ArtifactPreviewPlan] | None = None,
 ) -> str:
     hook_kwargs = _options_to_hook_kwargs(options)
-    tool_transform = _preview_tool_result if defer_artifact_store else transform_tool_result
+
+    def tool_transform(
+        result: str,
+        *,
+        artifact_plans_out: list[_ArtifactPreviewPlan] | None = None,
+        **kwargs: Any,
+    ) -> str | None:
+        return _transform_tool_result_in_operation(
+            result,
+            defer_artifact_store=defer_artifact_store,
+            artifact_plans_out=artifact_plans_out,
+            **kwargs,
+        )
+
     call_args: dict[str, Any] = _envelope_call_args(parsed) if isinstance(parsed, dict) else {}
     if isinstance(parsed, dict) and "result" in parsed:
         explicit_tool_name = _envelope_tool_name(parsed)
@@ -412,6 +487,9 @@ def _reduce_json_value(
         transformed: str | None = None
         injected_exit_keys: tuple[str, ...] = ()
         replace_with_json_value = False
+        result_plans: list[_ArtifactPreviewPlan] = []
+        local_result_plans: list[_ArtifactPreviewPlan] = []
+        result_metadata: dict[str, Any] = {}
 
         if isinstance(result_value, str):
             result_input, injected_exit_keys = _result_transform_input(result_value, parsed)
@@ -429,6 +507,7 @@ def _reduce_json_value(
                 tool_name=nested_transform_tool_name,
                 args=result_call_args,
                 noisegate_exit_code=result_exit_code,
+                artifact_plans_out=local_result_plans,
                 **cast(Any, hook_kwargs),
             )
             if transformed is not None and injected_exit_keys:
@@ -436,26 +515,67 @@ def _reduce_json_value(
                     transformed,
                     injected_exit_keys,
                 )
+            if transformed is not None:
+                result_owner = (
+                    _ArtifactNoticeOwnerStep("result", parse_json=True),
+                )
+                result_plans.extend(
+                    _artifact_preview_plan_with_owner_prefix(plan, result_owner)
+                    for plan in local_result_plans
+                )
             if (
                 transformed is None
                 and _is_compactable_tool_name(tool_name)
                 and not _is_json_text(result_value)
             ):
                 command = selected_command or _envelope_command(call_args)
-                reducer = _preview_reduce_text if defer_artifact_store else reduce_text
-                reduced = reducer(
+                reduced = _reduce_text_in_operation(
                     result_value,
                     command=command,
                     tool_name=tool_name,
                     source="reduce-json",
                     exit_code=result_exit_code,
                     options=options,
+                    defer_artifact_store=defer_artifact_store,
                 )
-                if metadata_out is not None:
-                    metadata_out.update(
-                        _debug_metadata(reduced.metadata, result_value, reduced.text)
-                    )
-                transformed = reduced.text if reduced.changed else None
+                result_metadata.update(
+                    _debug_metadata(reduced.metadata, result_value, reduced.text)
+                )
+                if reduced.changed:
+                    transformed = reduced.text
+                    if defer_artifact_store:
+                        artifact = reduced.metadata.get("artifact")
+                        if isinstance(artifact, dict) and artifact.get("stored") is True:
+                            plan = _artifact_preview_plan(
+                                result_value,
+                                reduced.metadata,
+                                artifact_dir=options.artifact_dir,
+                                owner_path=(_ArtifactNoticeOwnerStep("result"),),
+                            )
+                            if plan is None or not _artifact_preview_plan_notice_present_in_text(
+                                plan,
+                                reduced.text,
+                            ):
+                                inline = _reduce_text_in_operation(
+                                    result_value,
+                                    command=command,
+                                    tool_name=tool_name,
+                                    source="reduce-json",
+                                    exit_code=result_exit_code,
+                                    options=options.with_mapping({"artifacts": False}),
+                                    defer_artifact_store=defer_artifact_store,
+                                )
+                                result_metadata.clear()
+                                result_metadata.update(
+                                    _debug_metadata(
+                                        inline.metadata,
+                                        result_value,
+                                        inline.text,
+                                    )
+                                )
+                                transformed = inline.text if inline.changed else None
+                            else:
+                                result_plans.append(plan)
         elif isinstance(result_value, dict):
             nested_input, injected_exit_keys = _result_transform_input(result_value, parsed)
             result_call_args = _result_call_args(result_value) or call_args
@@ -472,9 +592,16 @@ def _reduce_json_value(
                 tool_name=nested_transform_tool_name,
                 args=result_call_args,
                 noisegate_exit_code=result_exit_code,
+                artifact_plans_out=local_result_plans,
                 **cast(Any, hook_kwargs),
             )
             replace_with_json_value = True
+            if transformed is not None:
+                result_owner = (_ArtifactNoticeOwnerStep("result"),)
+                result_plans.extend(
+                    _artifact_preview_plan_with_owner_prefix(plan, result_owner)
+                    for plan in local_result_plans
+                )
 
         if transformed is not None:
             parsed = dict(parsed)
@@ -490,22 +617,51 @@ def _reduce_json_value(
                 parsed["result"] = transformed
             candidate = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
             if _has_direct_text_payload(parsed):
+                direct_plans: list[_ArtifactPreviewPlan] = []
                 direct_transformed = _transform_direct_payload_preserving_json_result(
                     parsed,
                     tool_name=tool_name,
                     call_args=call_args,
                     hook_kwargs=hook_kwargs,
                     tool_transform=tool_transform,
+                    artifact_plans_out=direct_plans,
                 )
                 if direct_transformed is not None and len(direct_transformed) < len(raw):
+                    accepted_plans = [*result_plans, *direct_plans]
+                    if not all(
+                        _artifact_preview_plan_matches_serialized_output(
+                            plan,
+                            direct_transformed,
+                        )
+                        for plan in accepted_plans
+                    ):
+                        return raw
+                    if artifact_plans_out is not None:
+                        artifact_plans_out.extend(accepted_plans)
                     return direct_transformed
-            return candidate if len(candidate) < len(raw) else raw
+            if len(candidate) >= len(raw):
+                if metadata_out is not None:
+                    metadata_out.update(result_metadata)
+                return raw
+            if not all(
+                _artifact_preview_plan_matches_serialized_output(plan, candidate)
+                for plan in result_plans
+            ):
+                return raw
+            if artifact_plans_out is not None:
+                artifact_plans_out.extend(result_plans)
+            if metadata_out is not None:
+                metadata_out.update(result_metadata)
+            return candidate
         if not _has_direct_text_payload(parsed):
+            if metadata_out is not None:
+                metadata_out.update(result_metadata)
             return raw
 
     tool_name = ""
     if isinstance(parsed, dict):
         tool_name = _payload_tool_name(parsed, call_args)
+    direct_plans: list[_ArtifactPreviewPlan] = []
     if isinstance(parsed, dict):
         transformed = _transform_direct_payload_preserving_json_result(
             parsed,
@@ -513,15 +669,26 @@ def _reduce_json_value(
             call_args=call_args,
             hook_kwargs=hook_kwargs,
             tool_transform=tool_transform,
+            artifact_plans_out=direct_plans,
         )
     else:
         transformed = tool_transform(
             raw,
             tool_name=tool_name,
             args=call_args,
+            artifact_plans_out=direct_plans,
             **cast(Any, hook_kwargs),
         )
-    return transformed if transformed is not None and len(transformed) < len(raw) else raw
+    if transformed is None or len(transformed) >= len(raw):
+        return raw
+    if not all(
+        _artifact_preview_plan_matches_serialized_output(plan, transformed)
+        for plan in direct_plans
+    ):
+        return raw
+    if artifact_plans_out is not None:
+        artifact_plans_out.extend(direct_plans)
+    return transformed
 
 
 def _transform_direct_payload_preserving_json_result(
@@ -531,6 +698,7 @@ def _transform_direct_payload_preserving_json_result(
     call_args: dict[str, Any],
     hook_kwargs: dict[str, object],
     tool_transform: Callable[..., str | None],
+    artifact_plans_out: list[_ArtifactPreviewPlan] | None = None,
 ) -> str | None:
     result_value = payload.get("result")
     if isinstance(result_value, str) and _is_json_text(result_value):
@@ -543,6 +711,7 @@ def _transform_direct_payload_preserving_json_result(
             direct_raw,
             tool_name=tool_name,
             args=call_args,
+            artifact_plans_out=artifact_plans_out,
             **cast(Any, hook_kwargs),
         )
         if transformed is None:
@@ -561,6 +730,7 @@ def _transform_direct_payload_preserving_json_result(
         direct_raw,
         tool_name=tool_name,
         args=call_args,
+        artifact_plans_out=artifact_plans_out,
         **cast(Any, hook_kwargs),
     )
 

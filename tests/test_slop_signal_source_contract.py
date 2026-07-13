@@ -371,7 +371,8 @@ def test_package_failures_outrank_warning_noise_even_under_tight_char_budget() -
         command="uv sync",
         tool_name="terminal",
         exit_code=1,
-        options=opts(max_chars=140, max_lines=6, head_lines=1, tail_lines=1),
+        # Markers + ResolutionImpossible + exit notice occupy exactly 150 chars.
+        options=opts(max_chars=150, max_lines=6, head_lines=1, tail_lines=1),
     )
 
     assert result.changed is True
@@ -453,13 +454,14 @@ def test_tight_package_budget_preserves_exit_code_notice_with_priority_failure()
         command="pytest -q",
         tool_name="terminal",
         exit_code=1,
-        options=opts(max_chars=100, max_lines=4, head_lines=1, tail_lines=1),
+        # Markers + failed node + exit notice occupy exactly 123 characters.
+        options=opts(max_chars=123, max_lines=4, head_lines=1, tail_lines=1),
     )
 
     assert pytest_result.changed is True
     assert "FAILED tests/test_demo.py::test_signal" in pytest_result.text
     assert "[noisegate: exit_code=1]" in pytest_result.text
-    assert len(pytest_result.text) <= 100
+    assert len(pytest_result.text) <= 123
 
     too_tight_result = reduce_text(
         raw.replace("transient resolver noise", "generic noisy line"),
@@ -883,6 +885,11 @@ def test_node_reducer_keeps_late_plain_error_root_cause_under_tight_budget() -> 
             )
 
             case = f"{command} max_chars={max_chars} max_lines={max_lines}"
+            if max_lines == 3:
+                # An interior root cause needs two markers plus the exit notice.
+                assert result.changed is False, case
+                assert result.text == raw, case
+                continue
             assert result.changed is True, case
             assert result.metadata["command_class"] == "node", case
             assert "Error: Cannot find module 'left-pad'" in result.text, case
