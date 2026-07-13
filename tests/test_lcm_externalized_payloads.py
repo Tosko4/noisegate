@@ -170,6 +170,228 @@ def test_tight_mixed_failure_budget_preserves_lcm_ref_or_fails_open() -> None:
     assert transformed is None or TOOL_PLACEHOLDER in transformed
 
 
+def test_lcm_char_budget_tries_shorter_lower_ranked_failure_summary() -> None:
+    raw = "\n".join(
+        [
+            TOOL_PLACEHOLDER,
+            numbered("middle noise", 12),
+            "E       AssertionError: " + ("x" * 180),
+            numbered("more noise", 12),
+            "FAILED tests/test_lcm.py::test_externalized_recovery",
+            numbered("tail noise", 12),
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="pytest -q",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=340,
+        noisegate_max_lines=80,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_important_context_lines=0,
+    )
+
+    assert isinstance(transformed, str)
+    assert TOOL_PLACEHOLDER in transformed
+    assert "FAILED tests/test_lcm.py::test_externalized_recovery" in transformed
+    assert "E       AssertionError" not in transformed
+
+
+def test_lcm_line_budget_tries_shorter_lower_ranked_failure_summary() -> None:
+    raw = "\n".join(
+        [
+            TOOL_PLACEHOLDER,
+            numbered("middle noise", 12),
+            "E       AssertionError: " + ("x" * 180),
+            numbered("more noise", 12),
+            "FAILED tests/test_lcm.py::test_externalized_recovery",
+            numbered("tail noise", 12),
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="pytest -q",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=340,
+        noisegate_max_lines=5,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_important_context_lines=0,
+    )
+
+    assert isinstance(transformed, str)
+    assert TOOL_PLACEHOLDER in transformed
+    assert "FAILED tests/test_lcm.py::test_externalized_recovery" in transformed
+    assert "E       AssertionError" not in transformed
+
+
+def test_lcm_char_budget_keeps_docker_preservation_anchor() -> None:
+    raw = "\n".join(
+        [
+            TOOL_PLACEHOLDER,
+            numbered("#1 build progress", 12),
+            'unable to prepare context: path "missing" not found',
+            numbered("#2 build progress", 12),
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="docker build .",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=320,
+        noisegate_max_lines=80,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_important_context_lines=0,
+    )
+
+    assert isinstance(transformed, str)
+    assert TOOL_PLACEHOLDER in transformed
+    assert 'unable to prepare context: path "missing" not found' in transformed
+
+
+def test_lcm_line_budget_keeps_docker_preservation_anchor() -> None:
+    raw = "\n".join(
+        [
+            TOOL_PLACEHOLDER,
+            numbered("#1 build progress", 12),
+            'unable to prepare context: path "missing" not found',
+            numbered("#2 build progress", 12),
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="docker build .",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=320,
+        noisegate_max_lines=5,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_important_context_lines=0,
+    )
+
+    assert isinstance(transformed, str)
+    assert TOOL_PLACEHOLDER in transformed
+    assert 'unable to prepare context: path "missing" not found' in transformed
+
+
+def test_lcm_char_budget_tries_docker_anchor_after_overlong_generic_error() -> None:
+    raw = "\n".join(
+        [
+            TOOL_PLACEHOLDER,
+            numbered("#1 build progress", 12),
+            "Error: " + ("x" * 260),
+            numbered("#2 build progress", 12),
+            'unable to prepare context: path "missing" not found',
+            numbered("#3 build progress", 12),
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="docker build .",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=340,
+        noisegate_max_lines=80,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_important_context_lines=0,
+    )
+
+    assert isinstance(transformed, str)
+    assert TOOL_PLACEHOLDER in transformed
+    assert 'unable to prepare context: path "missing" not found' in transformed
+    assert "Error: " not in transformed
+
+
+def test_lcm_line_budget_tries_docker_anchor_after_overlong_generic_error() -> None:
+    raw = "\n".join(
+        [
+            TOOL_PLACEHOLDER,
+            numbered("#1 build progress", 12),
+            "Error: " + ("x" * 260),
+            numbered("#2 build progress", 12),
+            'unable to prepare context: path "missing" not found',
+            numbered("#3 build progress", 12),
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="docker build .",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=340,
+        noisegate_max_lines=5,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_important_context_lines=0,
+    )
+
+    assert isinstance(transformed, str)
+    assert TOOL_PLACEHOLDER in transformed
+    assert 'unable to prepare context: path "missing" not found' in transformed
+    assert "Error: " not in transformed
+
+
+def test_lcm_char_budget_keeps_docker_anchor_after_important_line_trimming() -> None:
+    raw = "\n".join(
+        [
+            TOOL_PLACEHOLDER,
+            numbered("#1 build progress", 100),
+            'unable to prepare context: path "missing" not found',
+            numbered("#2 build progress", 100),
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="docker build .",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=340,
+        noisegate_max_lines=80,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_max_important_lines=20,
+        noisegate_important_context_lines=0,
+    )
+
+    assert isinstance(transformed, str)
+    assert TOOL_PLACEHOLDER in transformed
+    assert 'unable to prepare context: path "missing" not found' in transformed
+
+
+def test_lcm_line_budget_keeps_docker_anchor_after_important_line_trimming() -> None:
+    raw = "\n".join(
+        [
+            TOOL_PLACEHOLDER,
+            numbered("#1 build progress", 100),
+            'unable to prepare context: path "missing" not found',
+            numbered("#2 build progress", 100),
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="docker build .",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=10_000,
+        noisegate_max_lines=5,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_max_important_lines=20,
+        noisegate_important_context_lines=0,
+    )
+
+    assert isinstance(transformed, str)
+    assert TOOL_PLACEHOLDER in transformed
+    assert 'unable to prepare context: path "missing" not found' in transformed
+
+
 def test_node_char_budget_keeps_lcm_ref_ahead_of_diagnostics() -> None:
     raw = "\n".join(
         [

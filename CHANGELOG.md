@@ -19,6 +19,7 @@ All notable changes to Noisegate are documented here. Release notes are generate
 - The Hermes config helper now avoids rewriting an already-correct plugin config while still removing stale `noisegate` entries from `plugins.disabled`.
 - Pytest compaction now prefers assertion/traceback detail over progress lines when tight budgets force a single failure excerpt.
 - Tight-budget compaction now preserves Python task/chained exception headers, `BaseExceptionGroup` detail, and LCM externalized refs ahead of diagnostics.
+- Tight-budget LCM compaction now tries shorter ranked or reducer-specific failure anchors that fit alongside every externalized ref, and ranks actual `BaseExceptionGroup` headers ahead of pytest summaries.
 - Preserve source-like exact output for direct terminal file-display commands, V4A patches, and `reduce-json` command aliases even when the content resembles noisy failures.
 
 ## [0.1.2] - 2026-07-07

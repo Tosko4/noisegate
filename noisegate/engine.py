@@ -540,7 +540,7 @@ def _important_lines(
             important.append(index)
 
     if len(important) > options.max_important_lines:
-        priority = _important_priority_indices(lines, important)
+        priority = _important_priority_indices(lines, important, patterns)
         if priority:
             important = _trim_indices_around_priority(
                 important,
@@ -598,7 +598,10 @@ def _preservation_patterns(
         if _first_pattern_match(text, CRITICAL_PATTERNS):
             base_patterns = NODE_PRESERVATION_PATTERNS
     elif _first_pattern_match(text, CRITICAL_PATTERNS):
-        base_patterns = CRITICAL_PATTERNS
+        critical_ids = {id(pattern) for pattern in CRITICAL_PATTERNS}
+        base_patterns = CRITICAL_PATTERNS + tuple(
+            pattern for pattern in patterns if id(pattern) not in critical_ids
+        )
 
     lcm_patterns = _lcm_externalized_patterns_for(text)
     if lcm_patterns:
@@ -619,24 +622,28 @@ def _line_budgeted_important_excerpt(
     if not important:
         return None
     lcm_priority = _matching_indices(lines, important, LCM_EXTERNALIZED_PATTERNS)
-    critical_priority = _matching_indices(lines, important, CRITICAL_PATTERNS)
-    ranked_priority = sorted(
-        critical_priority or important,
-        key=lambda index: _failure_detail_sort_key(lines[index], index),
+    ranked_priority = [
+        index
+        for index in _ranked_matching_indices(lines, important, patterns)
+        if index not in lcm_priority
+    ]
+    priority = [*lcm_priority, *ranked_priority]
+    best_rank = (
+        min(_failure_detail_rank(lines[index]) for index in ranked_priority)
+        if ranked_priority
+        else None
     )
-    priority = lcm_priority + [index for index in ranked_priority if index not in lcm_priority]
-    best_rank = min(_failure_detail_rank(lines[index]) for index in ranked_priority)
     max_context = max(0, options.important_context_lines)
 
     # Externalized payload refs are recovery handles, not just interesting log
     # lines. If they appear alongside a failure cluster, keep the refs and at
-    # least one failure anchor together when the line budget allows it. If the
-    # budget is too tight for both, the fallback below prioritizes the refs so
-    # the externalized-payload recovery path stays intact.
-    multi_anchor_priority = lcm_priority + [
-        index for index in ranked_priority[:1] if index not in lcm_priority
-    ]
-    if len(multi_anchor_priority) > 1:
+    # least one failure anchor together when the budget allows it. If the budget
+    # is too tight for both, the fallback below prioritizes the refs so the
+    # externalized-payload recovery path stays intact.
+    for diagnostic_anchor in ranked_priority:
+        multi_anchor_priority = [*lcm_priority, diagnostic_anchor]
+        if len(multi_anchor_priority) <= 1:
+            break
         for context in range(max_context, -1, -1):
             keep: set[int] = set()
             for anchor in multi_anchor_priority:
@@ -644,13 +651,17 @@ def _line_budgeted_important_excerpt(
                 end = min(len(lines), anchor + context + 1)
                 keep.update(range(start, end))
             candidate = _lines_with_markers(lines, sorted(keep))
-            if _line_count(candidate) <= options.max_lines:
+            if _fits_budget(candidate, options):
                 return candidate
 
     for anchor in priority:
-        if anchor not in lcm_priority and _would_hide_better_failure_anchor(
-            best_rank,
-            _failure_detail_rank(lines[anchor]),
+        if (
+            best_rank is not None
+            and anchor not in lcm_priority
+            and _would_hide_better_failure_anchor(
+                best_rank,
+                _failure_detail_rank(lines[anchor]),
+            )
         ):
             return None
         for context in range(max_context, -1, -1):
@@ -722,7 +733,8 @@ def _is_diagnostic_detail_line(line: str) -> bool:
         return False
     return bool(
         re.search(
-            r"\b(assertionerror|[a-z0-9_]*error|(?:base)?exceptiongroup|baseexception)\b(?::|$)"
+            r"\b(assertionerror|[a-z0-9_]*error)\b(?::|$)"
+            r"|^\s*(?:\|\s*)*((?:base)?exceptiongroup|baseexception)\b(?::|$)"
             r"|\bexception\b\s*:"
             r"|\bunhandled\s+exception\b"
             r"|\bexception\s+in\b"
@@ -740,13 +752,14 @@ def _is_incidental_exception_line(line: str) -> bool:
     return bool(re.search(r"\bexception ignored\b", line, re.IGNORECASE))
 
 
-def _important_priority_indices(lines: list[str], indices: list[int]) -> list[int]:
+def _important_priority_indices(
+    lines: list[str],
+    indices: list[int],
+    patterns: tuple[re.Pattern[str], ...],
+) -> list[int]:
     lcm_priority = _matching_indices(lines, indices, LCM_EXTERNALIZED_PATTERNS)
-    critical_priority = sorted(
-        _matching_indices(lines, indices, CRITICAL_PATTERNS),
-        key=lambda index: _failure_detail_sort_key(lines[index], index),
-    )
-    return lcm_priority + [index for index in critical_priority if index not in lcm_priority]
+    ranked_priority = _ranked_matching_indices(lines, indices, patterns)
+    return lcm_priority + [index for index in ranked_priority if index not in lcm_priority]
 
 
 def _matching_indices(
@@ -759,6 +772,22 @@ def _matching_indices(
         for index in indices
         if any(pattern.search(lines[index]) for pattern in patterns)
     ]
+
+
+def _ranked_matching_indices(
+    lines: list[str],
+    indices: list[int],
+    patterns: tuple[re.Pattern[str], ...],
+) -> list[int]:
+    eligible = set(indices)
+    ranked: list[int] = []
+    seen: set[int] = set()
+    for match in _ranked_pattern_line_matches("\n".join(lines), patterns):
+        index = match.line_index
+        if index is not None and index in eligible and index not in seen:
+            ranked.append(index)
+            seen.add(index)
+    return ranked
 
 
 def _trim_indices_around_priority(
@@ -862,7 +891,7 @@ def _char_head_tail_preserving_patterns(
     if not matches:
         return _char_head_tail(text, options)
     layout = _line_layout(text)
-    multi_anchor_excerpt = _lcm_and_diagnostic_excerpt(layout, options)
+    multi_anchor_excerpt = _lcm_and_diagnostic_excerpt(layout, options, matches)
     if multi_anchor_excerpt is not None:
         return multi_anchor_excerpt
     best_rank = min(_rank_for_span_match(match, layout) for match in matches)
@@ -881,24 +910,32 @@ def _char_head_tail_preserving_patterns(
 def _lcm_and_diagnostic_excerpt(
     layout: _LineLayout,
     options: NoisegateOptions,
+    matches: list[_SpanMatch],
 ) -> str | None:
     lcm_lines: list[int] = []
-    diagnostic_lines: list[int] = []
     for index, line in enumerate(layout.lines):
         if any(pattern.search(line) for pattern in LCM_EXTERNALIZED_PATTERNS):
             lcm_lines.append(index)
-        elif _failure_detail_rank(line) <= 1:
+
+    diagnostic_lines: list[int] = []
+    for match in matches:
+        index = match.line_index
+        if (
+            index is not None
+            and index not in lcm_lines
+            and index not in diagnostic_lines
+        ):
             diagnostic_lines.append(index)
     if not lcm_lines or not diagnostic_lines:
         return None
 
-    best_diagnostic = min(
-        diagnostic_lines,
-        key=lambda index: _failure_detail_sort_key(layout.lines[index], index),
-    )
-    candidate = _lines_with_markers(layout.lines, sorted({*lcm_lines, best_diagnostic}))
-    if _fits_budget(candidate, options):
-        return candidate
+    for diagnostic_line in diagnostic_lines:
+        candidate = _lines_with_markers(
+            layout.lines,
+            sorted({*lcm_lines, diagnostic_line}),
+        )
+        if _fits_budget(candidate, options):
+            return candidate
     return None
 
 

@@ -751,6 +751,72 @@ def test_line_budget_ranks_base_exception_group_as_detail() -> None:
     assert "FAILED tests/test_widget.py::test_widget" not in result.text
 
 
+def test_base_exception_group_header_ranks_above_pytest_summary() -> None:
+    summary = "FAILED tests/test_widget.py::test_widget - BaseExceptionGroup"
+    header = "BaseExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)"
+
+    assert engine._failure_detail_sort_key(header, 1) < engine._failure_detail_sort_key(
+        summary,
+        0,
+    )
+
+
+def test_char_budget_prefers_base_exception_group_header_over_earlier_summary() -> None:
+    raw = "\n".join(
+        [
+            "FAILED tests/test_widget.py::test_widget - BaseExceptionGroup",
+            *[f"noise {index}" for index in range(20)],
+            "BaseExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)",
+            *[f"teardown {index}" for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=150,
+            max_lines=80,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "BaseExceptionGroup: unhandled errors" in result.text
+    assert "FAILED tests/test_widget.py::test_widget" not in result.text
+
+
+def test_exception_group_tree_header_ranks_above_pytest_summary() -> None:
+    raw = "\n".join(
+        [
+            "FAILED tests/test_widget.py::test_widget - BaseExceptionGroup",
+            *[f"noise {index}" for index in range(20)],
+            "  | BaseExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)",
+            *[f"teardown {index}" for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=150,
+            max_lines=80,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "| BaseExceptionGroup: unhandled errors" in result.text
+    assert "FAILED tests/test_widget.py::test_widget" not in result.text
+
+
 def test_line_budget_prefers_pytest_pass_summary_over_progress_line() -> None:
     raw = "\n".join(
         [
