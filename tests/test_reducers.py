@@ -38,6 +38,24 @@ def options(**overrides: object) -> NoisegateOptions:
     return NoisegateOptions(**values)  # type: ignore[arg-type]
 
 
+def capture_alignment_budgets(
+    monkeypatch: pytest.MonkeyPatch,
+    *limits: int,
+) -> list[engine._SourceAlignmentWorkBudget]:
+    budgets: list[engine._SourceAlignmentWorkBudget] = []
+    configured_limits = iter(limits)
+
+    def new_budget() -> engine._SourceAlignmentWorkBudget:
+        budget = engine._SourceAlignmentWorkBudget(
+            next(configured_limits, engine._SOURCE_ALIGNMENT_WORK_LIMIT)
+        )
+        budgets.append(budget)
+        return budget
+
+    monkeypatch.setattr(engine, "_new_source_alignment_work_budget", new_budget)
+    return budgets
+
+
 def assert_fail_open_or_truthful_failure_excerpt(
     raw: str,
     transformed: str | None,
@@ -121,6 +139,438 @@ def test_generic_head_tail_remaps_colliding_upstream_line_omission_by_coverage()
     assert result.changed is True
     assert result.text == "head\n[noisegate: omitted 15 lines]\ntail"
     assert engine._represented_line_coverage(result.text) == 17
+
+
+@pytest.mark.parametrize(
+    "trailing_newline",
+    ["", "\n"],
+    ids=("no_trailing_newline", "trailing_newline"),
+)
+def test_generic_tail_only_remap_preserves_duplicate_line_source_position(
+    trailing_newline: str,
+) -> None:
+    raw = "\n".join(
+        [
+            "same",
+            "[noisegate: omitted 100 lines]",
+            "middle",
+            "same",
+        ]
+    ) + trailing_newline
+
+    result = reduce_text(
+        raw,
+        command="make noisy",
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=1,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.text == "[noisegate: omitted 102 lines]\nsame"
+    assert engine._represented_line_coverage(result.text) == 103
+
+
+def test_generic_head_only_remap_preserves_duplicate_line_source_position() -> None:
+    raw = "\n".join(
+        [
+            "same",
+            "[noisegate: omitted 100 lines]",
+            "middle",
+            "same",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="make noisy",
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=1,
+            tail_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.text == "same\n[noisegate: omitted 102 lines]"
+    assert engine._represented_line_coverage(result.text) == 103
+
+
+def test_remap_selects_interior_duplicate_between_generated_boundary_markers() -> None:
+    source_lines = [
+        "same",
+        "before",
+        "[noisegate: omitted 5 lines]",
+        "same",
+        "after",
+        "same",
+    ]
+    excerpt = engine._marked_excerpt_for_line_indices(source_lines, [3])
+
+    assert excerpt == "[noisegate: omitted 3 lines]\nsame\n[noisegate: omitted 2 lines]"
+    assert engine._remark_excerpt_with_line_coverage(
+        "\n".join(source_lines),
+        excerpt,
+    ) == "[noisegate: omitted 7 lines]\nsame\n[noisegate: omitted 2 lines]"
+
+
+@pytest.mark.parametrize(
+    ("source_lines", "kept_indices", "expected"),
+    [
+        (
+            [
+                "duplicate anchor",
+                "noise-a",
+                "[noisegate: omitted 10 lines]",
+                "duplicate anchor",
+                "noise-b",
+                "duplicate anchor",
+            ],
+            [0, 5],
+            "duplicate anchor\n[noisegate: omitted 13 lines]\nduplicate anchor",
+        ),
+        (
+            [
+                "duplicate anchor",
+                "noise-a",
+                "duplicate anchor",
+                "[noisegate: omitted 5 lines]",
+                "noise-b",
+                "duplicate anchor",
+                "noise-c",
+                "duplicate anchor",
+                "noise-d",
+            ],
+            [0, 5, 7],
+            "\n".join(
+                [
+                    "duplicate anchor",
+                    "[noisegate: omitted 8 lines]",
+                    "duplicate anchor",
+                    "[noisegate: omitted 1 lines]",
+                    "duplicate anchor",
+                    "[noisegate: omitted 1 lines]",
+                ]
+            ),
+        ),
+    ],
+    ids=("two_anchors", "three_anchors"),
+)
+def test_stitched_duplicate_anchors_remap_monotonically_by_occurrence(
+    source_lines: list[str],
+    kept_indices: list[int],
+    expected: str,
+) -> None:
+    excerpt = engine._marked_excerpt_for_line_indices(source_lines, kept_indices)
+
+    assert excerpt is not None
+    assert engine._remark_excerpt_with_line_coverage(
+        "\n".join(source_lines),
+        excerpt,
+    ) == expected
+    assert engine._represented_line_coverage(expected) == engine._represented_line_coverage(
+        "\n".join(source_lines)
+    )
+
+
+def test_ambiguous_generated_or_upstream_marker_mapping_fails_open() -> None:
+    raw = "\n".join(
+        [
+            "[noisegate: omitted 3 lines]",
+            "same",
+            "middle",
+            "same",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="make noisy",
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=1,
+        ),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reason"] == "reducer_no_output"
+
+
+def test_repeated_omission_only_alignment_has_linear_work_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "[noisegate: omitted 1 lines]"
+    source_size = 1_000
+    source_lines = [marker] * source_size
+    excerpt = "\n".join(
+        [
+            *([marker] * 24),
+            "[noisegate: omitted 960 lines]",
+            *([marker] * 16),
+        ]
+    )
+    work_limit = source_size * 2
+
+    assert engine._source_line_indices_for_excerpt(
+        source_lines,
+        excerpt,
+        _work_limit=work_limit,
+    ) == []
+
+    monkeypatch.setattr(engine, "_SOURCE_ALIGNMENT_WORK_LIMIT", work_limit)
+    result = reduce_text(
+        "\n".join(source_lines),
+        command="make noisy",
+        options=NoisegateOptions(
+            max_chars=4_000,
+            max_lines=160,
+            head_lines=24,
+            tail_lines=16,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.text == "[noisegate: omitted 1000 lines]"
+
+
+def test_duplicate_alignment_work_exhaustion_returns_ambiguous() -> None:
+    marker = "[noisegate: omitted 1 lines]"
+    source_lines = [part for _ in range(20) for part in ("same", marker)] + ["tail"]
+    excerpt = "\n".join(source_lines)
+
+    assert engine._source_line_indices_for_excerpt(
+        source_lines,
+        excerpt,
+        _work_limit=8,
+    ) is None
+    assert engine._source_line_indices_for_excerpt(
+        source_lines,
+        excerpt,
+        _work_limit=10_000,
+    ) == [*range(0, 40, 2), 40]
+
+
+@pytest.mark.parametrize(
+    "entrypoint_name",
+    ["reduce_text", "_preview_reduce_text"],
+)
+def test_public_reduction_shares_one_alignment_budget_across_ranked_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint_name: str,
+) -> None:
+    budgets = capture_alignment_budgets(monkeypatch)
+    marker = "[noisegate: omitted 1 lines]"
+    ref = "externalized_ref=dup"
+    raw = "\n".join(
+        [
+            marker,
+            *([ref] * 20),
+            *[f"ValueError: diagnostic-{index}" for index in range(4_000)],
+        ]
+    )
+
+    result = getattr(engine, entrypoint_name)(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=NoisegateOptions(
+            max_chars=500_000,
+            max_lines=22,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert len(raw.splitlines()) == 4_021
+    assert len(budgets) == 1
+    assert 1 < budgets[0].alignment_calls < 200
+    assert budgets[0].exhausted is True
+    assert budgets[0].spent <= budgets[0].limit
+    assert engine._SOURCE_ALIGNMENT_WORK_BUDGET.get() is None
+
+
+def test_direct_ranked_loop_cannot_mint_alignment_budget_per_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budgets = capture_alignment_budgets(monkeypatch, 1_000)
+    marker = "[noisegate: omitted 1 lines]"
+    ref = "externalized_ref=dup"
+    raw = "\n".join(
+        [
+            marker,
+            *([ref] * 20),
+            *[f"ValueError: diagnostic-{index}" for index in range(100)],
+        ]
+    )
+
+    best = engine._best_ranked_diagnostic_excerpt(
+        before=raw,
+        options=NoisegateOptions(
+            max_chars=500_000,
+            max_lines=22,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+        preserve_patterns=engine._preserve_patterns_for_output("pytest", raw),
+    )
+
+    assert best is None
+    assert len(budgets) == 1
+    assert budgets[0].exhausted is True
+    assert engine._SOURCE_ALIGNMENT_WORK_BUDGET.get() is None
+
+
+def test_non_exhausted_public_alignment_budget_still_compacts_correctly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budgets = capture_alignment_budgets(monkeypatch)
+    raw = "\n".join(
+        [
+            "externalized_ref=foo",
+            "[noisegate: omitted 8 lines]",
+            "ValueError: actionable boom",
+            *[f"middle-{index}-" + ("x" * 80) for index in range(5)],
+            "ERROR: generic transient noise",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=NoisegateOptions(
+            max_chars=140,
+            max_lines=50,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=0,
+            max_important_lines=1,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.text == "\n".join(
+        [
+            "externalized_ref=foo",
+            "[noisegate: omitted 8 lines]",
+            "ValueError: actionable boom",
+            "[noisegate: omitted 6 lines]",
+            "[noisegate: exit_code=1]",
+        ]
+    )
+    assert len(budgets) == 1
+    assert budgets[0].alignment_calls > 1
+    assert 0 < budgets[0].spent < budgets[0].limit
+    assert budgets[0].exhausted is False
+    assert engine._SOURCE_ALIGNMENT_WORK_BUDGET.get() is None
+
+
+def test_exhausted_public_alignment_budget_does_not_leak_to_next_reduction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budgets = capture_alignment_budgets(
+        monkeypatch,
+        1,
+        engine._SOURCE_ALIGNMENT_WORK_LIMIT,
+    )
+    raw = "\n".join(
+        [
+            "head",
+            "[noisegate: omitted 8 lines]",
+            "middle",
+            "tail",
+        ]
+    )
+    reduction_options = NoisegateOptions(
+        max_chars=10_000,
+        max_lines=3,
+        head_lines=1,
+        tail_lines=1,
+    )
+
+    exhausted = reduce_text(raw, command="make noisy", options=reduction_options)
+    independent = reduce_text(raw, command="make noisy", options=reduction_options)
+
+    assert exhausted.changed is False
+    assert exhausted.text == raw
+    assert independent.changed is True
+    assert independent.text == "head\n[noisegate: omitted 9 lines]\ntail"
+    assert len(budgets) == 2
+    assert budgets[0].exhausted is True
+    assert budgets[1].exhausted is False
+    assert budgets[0] is not budgets[1]
+    assert engine._SOURCE_ALIGNMENT_WORK_BUDGET.get() is None
+
+
+def test_top_level_reduction_isolates_inherited_alignment_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inherited = engine._SourceAlignmentWorkBudget(0)
+    created = capture_alignment_budgets(monkeypatch)
+    token = engine._SOURCE_ALIGNMENT_WORK_BUDGET.set(inherited)
+    raw = "\n".join(
+        [
+            "head",
+            "[noisegate: omitted 8 lines]",
+            "middle",
+            "tail",
+        ]
+    )
+    try:
+        result = reduce_text(
+            raw,
+            command="make noisy",
+            options=NoisegateOptions(
+                max_chars=10_000,
+                max_lines=3,
+                head_lines=1,
+                tail_lines=1,
+            ),
+        )
+        assert engine._SOURCE_ALIGNMENT_WORK_BUDGET.get() is inherited
+    finally:
+        engine._SOURCE_ALIGNMENT_WORK_BUDGET.reset(token)
+
+    assert result.changed is True
+    assert len(created) == 1
+    assert inherited.spent == 0
+    assert inherited.exhausted is False
+    assert engine._SOURCE_ALIGNMENT_WORK_BUDGET.get() is None
+
+
+def test_cached_alignment_does_not_spend_shared_budget_twice() -> None:
+    budget = engine._SourceAlignmentWorkBudget(10_000)
+    token = engine._SOURCE_ALIGNMENT_WORK_BUDGET.set(budget)
+    source_lines = [
+        "head",
+        "[noisegate: omitted 8 lines]",
+        "middle",
+        "tail",
+    ]
+    excerpt = "head\n[noisegate: omitted 2 lines]\ntail"
+    try:
+        first = engine._source_line_indices_for_excerpt(source_lines, excerpt)
+        spent_after_first = budget.spent
+        second = engine._source_line_indices_for_excerpt(source_lines, excerpt)
+    finally:
+        engine._SOURCE_ALIGNMENT_WORK_BUDGET.reset(token)
+
+    assert first == second == [0, 3]
+    assert spent_after_first > 0
+    assert budget.spent == spent_after_first
+    assert budget.alignment_calls == 2
+    assert engine._SOURCE_ALIGNMENT_WORK_BUDGET.get() is None
 
 
 def test_generic_head_tail_aggregates_duplicate_upstream_line_omissions() -> None:
@@ -273,6 +723,110 @@ def test_line_coverage_remap_keeps_lcm_ref_with_best_ranked_diagnostic(
             "[noisegate: exit_code=1]",
         ]
     )
+
+
+@pytest.mark.parametrize(
+    ("max_chars", "max_lines"),
+    [(140, 50), (10_000, 5)],
+    ids=("char_budget_second_pass", "line_budget_second_pass"),
+)
+def test_duplicate_lcm_refs_and_diagnostics_preserve_multiplicity_and_position(
+    max_chars: int,
+    max_lines: int,
+) -> None:
+    raw = "\n".join(
+        [
+            "externalized_ref=dup",
+            "ValueError: repeated",
+            "[noisegate: omitted 5 lines]",
+            *[f"middle-{index}-" + ("x" * 80) for index in range(5)],
+            "ValueError: repeated",
+            "externalized_ref=dup",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=NoisegateOptions(
+            max_chars=max_chars,
+            max_lines=max_lines,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+            max_important_lines=3,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.text == "\n".join(
+        [
+            "externalized_ref=dup",
+            "ValueError: repeated",
+            "[noisegate: omitted 11 lines]",
+            "externalized_ref=dup",
+            "[noisegate: exit_code=1]",
+        ]
+    )
+    assert result.text.splitlines().count("externalized_ref=dup") == 2
+    body = "\n".join(result.text.splitlines()[:-1])
+    assert engine._represented_line_coverage(body) == engine._represented_line_coverage(raw)
+
+
+def test_duplicate_diagnostic_text_preserves_best_source_occurrence() -> None:
+    source_lines = [
+        "externalized_ref=dup",
+        "ValueError: repeated",
+        "[noisegate: omitted 5 lines]",
+        "noise",
+        "ValueError: repeated",
+        "externalized_ref=dup",
+    ]
+    raw = "\n".join(source_lines)
+    later_marked = engine._marked_excerpt_for_line_indices(source_lines, [0, 4, 5])
+    assert later_marked is not None
+    later_excerpt = engine._remark_excerpt_with_line_coverage(raw, later_marked)
+    assert later_excerpt is not None
+    preserve_patterns = engine._preserve_patterns_for_output("pytest", raw)
+    remap_options = NoisegateOptions(
+        max_chars=200,
+        max_lines=6,
+        head_lines=0,
+        tail_lines=0,
+        important_context_lines=0,
+    )
+
+    ensured = engine._ensure_ranked_diagnostic_after_line_coverage_remap(
+        before=raw,
+        shortened=later_excerpt,
+        options=remap_options,
+        preserve_patterns=preserve_patterns,
+    )
+
+    assert ensured == "\n".join(
+        [
+            "externalized_ref=dup",
+            "ValueError: repeated",
+            "[noisegate: omitted 7 lines]",
+            "externalized_ref=dup",
+        ]
+    )
+    assert engine._source_line_indices_for_excerpt(source_lines, ensured) == [0, 1, 5]
+    exit_notice = "[noisegate: exit_code=1]"
+    assert engine._line_coverage_remap_dropped_ranked_diagnostic(
+        before=raw,
+        after=f"{later_excerpt}\n{exit_notice}",
+        options=NoisegateOptions(
+            max_chars=240,
+            max_lines=7,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+        preserve_patterns=preserve_patterns,
+        required_notices=[exit_notice],
+    ) is True
 
 
 def test_line_coverage_remap_keeps_reducer_specific_anchor_with_lcm_ref() -> None:
@@ -2744,6 +3298,67 @@ def test_artifact_path_does_not_turn_char_marker_collision_into_a_gain(tmp_path)
     assert result.changed is False
     assert result.text == raw
     assert not artifact_dir.exists()
+
+
+def test_duplicate_tail_remap_survives_exit_and_artifact_notice_path(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budgets = capture_alignment_budgets(monkeypatch)
+    spent_when_stored: list[int] = []
+    store_artifact = engine._store_artifact
+
+    def tracked_store_artifact(
+        text: str,
+        artifact_options: NoisegateOptions,
+    ) -> dict[str, engine.JsonValue]:
+        budget = engine._SOURCE_ALIGNMENT_WORK_BUDGET.get()
+        assert budget is not None
+        spent_when_stored.append(budget.spent)
+        return store_artifact(text, artifact_options)
+
+    monkeypatch.setattr(engine, "_store_artifact", tracked_store_artifact)
+    raw = "\n".join(
+        [
+            "same",
+            "[noisegate: omitted 100 lines]",
+            *[f"filler-{index}-" + ("x" * 80) for index in range(5)],
+            "same",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="make noisy",
+        exit_code=7,
+        options=options(
+            max_chars=400,
+            max_lines=4,
+            head_lines=0,
+            tail_lines=1,
+            artifact_enabled=True,
+            artifact_dir=tmp_path,
+        ),
+    )
+
+    output_lines = result.text.splitlines()
+    assert result.changed is True
+    assert output_lines[:3] == [
+        "[noisegate: omitted 106 lines]",
+        "same",
+        "[noisegate: exit_code=7]",
+    ]
+    assert output_lines[3].startswith("[noisegate artifact: id=")
+    assert engine._represented_line_coverage("\n".join(output_lines[:2])) == 107
+    artifact = result.metadata["artifact"]
+    assert isinstance(artifact, dict)
+    artifact_id = artifact["id"]
+    assert isinstance(artifact_id, str)
+    assert engine.ArtifactStore(tmp_path).read(artifact_id) == raw
+    assert len(budgets) == 1
+    assert spent_when_stored == [budgets[0].spent]
+    assert budgets[0].alignment_calls > 1
+    assert budgets[0].exhausted is False
 
 
 def test_important_line_reducer_tight_line_cap_preserves_middle_failure() -> None:

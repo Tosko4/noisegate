@@ -4,15 +4,22 @@ import hashlib
 import os
 import re
 import shlex
+from bisect import bisect_left, bisect_right
 from collections import Counter
-from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from ._version import __version__
 from .artifacts import DEFAULT_SIZE_CAP, ArtifactError, ArtifactStore, ArtifactTooLarge
 
 JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
+
+
+class _SourceAlignmentWorkExhausted(Exception):
+    """Internal signal that source alignment must fail open."""
 
 
 class _ShellToken(str):
@@ -84,6 +91,81 @@ LCM_EXTERNALIZED_PATTERN_IDS = frozenset(id(pattern) for pattern in LCM_EXTERNAL
 OMISSION_NOTICE_PATTERN = re.compile(r"^\[noisegate: omitted \d+ (?:lines|chars)\]$")
 LINE_OMISSION_NOTICE_PATTERN = re.compile(r"^\[noisegate: omitted (\d+) lines\]$")
 CHAR_OMISSION_NOTICE_PATTERN = re.compile(r"^\[noisegate: omitted \d+ chars\]$")
+_SOURCE_ALIGNMENT_WORK_LIMIT = 50_000
+_SOURCE_ALIGNMENT_MAX_DEPTH = 512
+
+
+@dataclass(frozen=True)
+class _SourceAlignmentSourceState:
+    evidence_indices: dict[str, tuple[int, ...]]
+    represented_prefix: tuple[int, ...]
+    represented_ends: dict[int, tuple[int, ...]]
+    source_is_omission: tuple[bool, ...]
+    char_omission_indices: tuple[int, ...]
+
+
+_SourceAlignmentSourceKey = str | tuple[str, ...]
+
+
+@dataclass
+class _SourceAlignmentWorkBudget:
+    """Operation-scoped work and memoized results for source alignment."""
+
+    limit: int
+    spent: int = 0
+    exhausted: bool = False
+    alignment_calls: int = 0
+    _source_cache: dict[
+        _SourceAlignmentSourceKey,
+        _SourceAlignmentSourceState | None,
+    ] = field(default_factory=dict, repr=False)
+    _alignment_cache: dict[
+        tuple[_SourceAlignmentSourceKey, str],
+        tuple[int, ...] | None,
+    ] = field(default_factory=dict, repr=False)
+    _remark_cache: dict[tuple[str, str], str | None] = field(
+        default_factory=dict,
+        repr=False,
+    )
+
+    def spend(self, amount: int = 1) -> None:
+        if amount < 0:
+            raise ValueError("alignment work amount must be non-negative")
+        if self.exhausted or amount > self.limit - self.spent:
+            self.exhausted = True
+            raise _SourceAlignmentWorkExhausted
+        self.spent += amount
+
+
+_SOURCE_ALIGNMENT_WORK_BUDGET: ContextVar[_SourceAlignmentWorkBudget | None] = ContextVar(
+    "noisegate_source_alignment_work_budget",
+    default=None,
+)
+
+
+def _new_source_alignment_work_budget() -> _SourceAlignmentWorkBudget:
+    return _SourceAlignmentWorkBudget(_SOURCE_ALIGNMENT_WORK_LIMIT)
+
+
+@contextmanager
+def _source_alignment_work_operation() -> Iterator[_SourceAlignmentWorkBudget]:
+    """Install one fresh alignment budget for a complete public operation."""
+    budget = _new_source_alignment_work_budget()
+    token = _SOURCE_ALIGNMENT_WORK_BUDGET.set(budget)
+    try:
+        yield budget
+    finally:
+        _SOURCE_ALIGNMENT_WORK_BUDGET.reset(token)
+
+
+def _raise_if_source_alignment_work_exhausted() -> None:
+    budget = _SOURCE_ALIGNMENT_WORK_BUDGET.get()
+    if budget is None:
+        raise RuntimeError("source alignment budget is not active")
+    if budget.exhausted:
+        raise _SourceAlignmentWorkExhausted
+
+
 SHELL_SEPARATORS = {"|", "|&", "||", "&&", ";", "&", "(", ")", "{", "}"}
 SOURCE_SEARCH_COMMANDS = {"rg", "grep", "ag", "ack"}
 SOURCE_SEARCH_OPTIONS_WITH_VALUES = frozenset({
@@ -354,17 +436,16 @@ def reduce_text(
     exit_code: int | None = None,
     options: NoisegateOptions | None = None,
 ) -> ReducedOutput:
-    try:
-        return _reduce_text(
-            text,
-            command=command,
-            tool_name=tool_name,
-            source=source,
-            exit_code=exit_code,
-            options=options,
-        )
-    except Exception as exc:
-        return _unchanged(text, "error", "generic", reason=f"fail_open:{type(exc).__name__}")
+    return _run_text_reduction_operation(
+        text,
+        command=command,
+        tool_name=tool_name,
+        source=source,
+        exit_code=exit_code,
+        options=options,
+        defer_artifact_store=False,
+        share_alignment_budget=False,
+    )
 
 
 def _preview_reduce_text(
@@ -376,16 +457,78 @@ def _preview_reduce_text(
     exit_code: int | None = None,
     options: NoisegateOptions | None = None,
 ) -> ReducedOutput:
-    try:
-        return _reduce_text(
+    return _run_text_reduction_operation(
+        text,
+        command=command,
+        tool_name=tool_name,
+        source=source,
+        exit_code=exit_code,
+        options=options,
+        defer_artifact_store=True,
+        share_alignment_budget=False,
+    )
+
+
+def _reduce_text_in_operation(
+    text: str,
+    *,
+    command: str | None = None,
+    tool_name: str | None = None,
+    source: str | None = None,
+    exit_code: int | None = None,
+    options: NoisegateOptions | None = None,
+    defer_artifact_store: bool = False,
+) -> ReducedOutput:
+    return _run_text_reduction_operation(
+        text,
+        command=command,
+        tool_name=tool_name,
+        source=source,
+        exit_code=exit_code,
+        options=options,
+        defer_artifact_store=defer_artifact_store,
+        share_alignment_budget=True,
+    )
+
+
+def _run_text_reduction_operation(
+    text: str,
+    *,
+    command: str | None,
+    tool_name: str | None,
+    source: str | None,
+    exit_code: int | None,
+    options: NoisegateOptions | None,
+    defer_artifact_store: bool,
+    share_alignment_budget: bool,
+) -> ReducedOutput:
+    if share_alignment_budget:
+        _raise_if_source_alignment_work_exhausted()
+        reduced = _reduce_text(
             text,
             command=command,
             tool_name=tool_name,
             source=source,
             exit_code=exit_code,
             options=options,
-            defer_artifact_store=True,
+            defer_artifact_store=defer_artifact_store,
         )
+        _raise_if_source_alignment_work_exhausted()
+        return reduced
+
+    try:
+        with _source_alignment_work_operation():
+            reduced = _reduce_text(
+                text,
+                command=command,
+                tool_name=tool_name,
+                source=source,
+                exit_code=exit_code,
+                options=options,
+                defer_artifact_store=defer_artifact_store,
+            )
+            _raise_if_source_alignment_work_exhausted()
+            return reduced
     except Exception as exc:
         return _unchanged(text, "error", "generic", reason=f"fail_open:{type(exc).__name__}")
 
@@ -568,6 +711,7 @@ def _reduce_text(
     if options.artifact_enabled and not defer_artifact_store:
         planned_artifact = metadata.get("artifact")
         if isinstance(planned_artifact, dict) and planned_artifact.get("stored") is True:
+            _raise_if_source_alignment_work_exhausted()
             planned_id = planned_artifact.get("id")
             if not isinstance(planned_id, str) or planned_id not in compacted:
                 metadata["artifact"] = {
@@ -2039,18 +2183,25 @@ def _remark_budget_rewrite_with_line_coverage(
     if remarked is not None and _fits_budget(remarked, options):
         return remarked
     if allow_boundary_fallback:
-        source_lines = [
-            line
-            for line in before.splitlines()
+        source_lines = before.splitlines()
+        boundary_indices = [
+            index
+            for index, line in enumerate(source_lines)
             if not OMISSION_NOTICE_PATTERN.fullmatch(line)
         ]
-        boundary_candidates: list[str] = []
-        if source_lines:
-            boundary_candidates.append(
-                "\n".join(source_lines[:1] + source_lines[-1:])
+        boundary_groups: list[tuple[int, ...]] = []
+        if boundary_indices:
+            boundary_groups.extend(
+                [
+                    (boundary_indices[0], boundary_indices[-1]),
+                    (boundary_indices[0],),
+                    (boundary_indices[-1],),
+                ]
             )
-            boundary_candidates.extend(source_lines[:1] + source_lines[-1:])
-        for candidate in dict.fromkeys(boundary_candidates):
+        for group in dict.fromkeys(boundary_groups):
+            candidate = _marked_excerpt_for_line_indices(source_lines, list(group))
+            if candidate is None:
+                continue
             boundary_excerpt = _remark_excerpt_with_line_coverage(before, candidate)
             if boundary_excerpt is not None and _fits_budget(boundary_excerpt, options):
                 return boundary_excerpt
@@ -2719,7 +2870,17 @@ def _line_coverage_remap_dropped_ranked_diagnostic(
     if best is None:
         return after != before
     best_index, _ = best
-    return lines[best_index] not in after.splitlines()
+    body = after
+    notices = required_notices or []
+    after_lines = after.splitlines()
+    if notices and after_lines[-len(notices) :] == notices:
+        body = "\n".join(after_lines[: -len(notices)])
+    selected_indices = _source_line_indices_for_excerpt(
+        lines,
+        body,
+        _source_key=before,
+    )
+    return selected_indices is None or best_index not in selected_indices
 
 
 def _ensure_ranked_diagnostic_after_line_coverage_remap(
@@ -2749,8 +2910,14 @@ def _ensure_ranked_diagnostic_after_line_coverage_remap(
     body_options = _options_reserving_notices(options, required_notices)
     if body_options is None:
         return None
+    selected_indices = _source_line_indices_for_excerpt(
+        before.splitlines(),
+        shortened,
+        _source_key=before,
+    )
     if (
-        before.splitlines()[best_index] in shortened.splitlines()
+        selected_indices is not None
+        and best_index in selected_indices
         and _fits_budget(shortened, body_options)
     ):
         return shortened
@@ -2763,6 +2930,34 @@ def _best_ranked_diagnostic_excerpt(
     options: NoisegateOptions,
     preserve_patterns: tuple[re.Pattern[str], ...] | None,
     required_notices: list[str] | None = None,
+) -> tuple[int, str] | None:
+    token = None
+    try:
+        if _SOURCE_ALIGNMENT_WORK_BUDGET.get() is None:
+            token = _SOURCE_ALIGNMENT_WORK_BUDGET.set(
+                _new_source_alignment_work_budget()
+            )
+        return _best_ranked_diagnostic_excerpt_with_budget(
+            before=before,
+            options=options,
+            preserve_patterns=preserve_patterns,
+            required_notices=required_notices,
+        )
+    except _SourceAlignmentWorkExhausted:
+        if token is None:
+            raise
+        return None
+    finally:
+        if token is not None:
+            _SOURCE_ALIGNMENT_WORK_BUDGET.reset(token)
+
+
+def _best_ranked_diagnostic_excerpt_with_budget(
+    *,
+    before: str,
+    options: NoisegateOptions,
+    preserve_patterns: tuple[re.Pattern[str], ...] | None,
+    required_notices: list[str] | None,
 ) -> tuple[int, str] | None:
     body_options = _options_reserving_notices(options, required_notices)
     if body_options is None:
@@ -2781,7 +2976,11 @@ def _best_ranked_diagnostic_excerpt(
         )
         if candidate is None:
             continue
-        candidate = _remark_excerpt_with_line_coverage(before, candidate)
+        candidate = _remark_excerpt_with_line_coverage_with_budget(
+            before,
+            candidate,
+            source_lines=lines,
+        )
         if candidate is not None and _fits_budget(candidate, body_options):
             return diagnostic_index, candidate
     return None
@@ -2806,54 +3005,332 @@ def _remark_excerpt_with_line_coverage(
     before: str,
     shortened: str,
 ) -> str | None:
-    source_lines = before.splitlines()
-    selected_lines = [
-        line
-        for line in shortened.splitlines()
-        if not OMISSION_NOTICE_PATTERN.fullmatch(line)
-    ]
+    token = None
+    try:
+        if _SOURCE_ALIGNMENT_WORK_BUDGET.get() is None:
+            token = _SOURCE_ALIGNMENT_WORK_BUDGET.set(
+                _new_source_alignment_work_budget()
+            )
+        return _remark_excerpt_with_line_coverage_with_budget(before, shortened)
+    except _SourceAlignmentWorkExhausted:
+        if token is None:
+            raise
+        return None
+    finally:
+        if token is not None:
+            _SOURCE_ALIGNMENT_WORK_BUDGET.reset(token)
 
-    selected_indices: list[int] = []
-    cursor = 0
-    for selected_line in selected_lines:
-        selected_index = next(
-            (
-                index
-                for index in range(cursor, len(source_lines))
-                if source_lines[index] == selected_line
-                and not OMISSION_NOTICE_PATTERN.fullmatch(source_lines[index])
-            ),
-            None,
-        )
-        if selected_index is None:
-            return None
-        selected_indices.append(selected_index)
-        cursor = selected_index + 1
+
+def _remark_excerpt_with_line_coverage_with_budget(
+    before: str,
+    shortened: str,
+    *,
+    source_lines: list[str] | None = None,
+) -> str | None:
+    budget = _SOURCE_ALIGNMENT_WORK_BUDGET.get()
+    if budget is None:
+        raise RuntimeError("source alignment budget is not active")
+    cache_key = (before, shortened)
+    if cache_key in budget._remark_cache:
+        return budget._remark_cache[cache_key]
+
+    source_lines = before.splitlines() if source_lines is None else source_lines
+    selected_indices = _source_line_indices_for_excerpt(
+        source_lines,
+        shortened,
+        _source_key=before,
+    )
+    if selected_indices is None:
+        budget._remark_cache[cache_key] = None
+        return None
 
     # Character notices cannot be represented by a line-coverage marker. Keep
     # every source occurrence at its source position; generated lookalikes in
     # ``shortened`` are deliberately ignored above.
     selected_set = set(selected_indices)
-    selected_set.update(
-        index
-        for index, line in enumerate(source_lines)
-        if CHAR_OMISSION_NOTICE_PATTERN.fullmatch(line)
-    )
+    source_state = budget._source_cache.get(before)
+    if source_state is None:
+        budget._remark_cache[cache_key] = None
+        return None
+    selected_set.update(source_state.char_omission_indices)
+    ordered_indices = sorted(selected_set)
+    budget.spend(1 + len(ordered_indices))
+
     parts: list[str] = []
-    omitted_coverage = 0
-    for index, line in enumerate(source_lines):
-        line_omission = LINE_OMISSION_NOTICE_PATTERN.fullmatch(line)
-        coverage = int(line_omission.group(1)) if line_omission is not None else 1
-        if index not in selected_set:
-            omitted_coverage += coverage
-            continue
+    source_cursor = 0
+    for index in ordered_indices:
+        omitted_coverage = (
+            source_state.represented_prefix[index]
+            - source_state.represented_prefix[source_cursor]
+        )
         if omitted_coverage:
             parts.append(f"[noisegate: omitted {omitted_coverage} lines]")
-            omitted_coverage = 0
-        parts.append(line)
+        parts.append(source_lines[index])
+        source_cursor = index + 1
+    omitted_coverage = (
+        source_state.represented_prefix[-1]
+        - source_state.represented_prefix[source_cursor]
+    )
     if omitted_coverage:
         parts.append(f"[noisegate: omitted {omitted_coverage} lines]")
-    return "\n".join(parts) or None
+    remarked = "\n".join(parts) or None
+    budget._remark_cache[cache_key] = remarked
+    return remarked
+
+
+def _source_line_indices_for_excerpt(
+    source_lines: list[str],
+    excerpt: str,
+    *,
+    _work_limit: int | None = None,
+    _source_key: str | None = None,
+) -> list[int] | None:
+    """Return the unique source occurrences selected by a marked excerpt.
+
+    Omission notices in an excerpt have two possible provenances: immutable
+    notices copied from the source, or markers generated for a skipped source
+    interval. Generated line markers can describe either physical lines (the
+    first reducer pass) or represented coverage (a later remap pass). Keeping
+    both interpretations until adjacent anchors disambiguate them preserves
+    occurrence identity without trusting marker text alone. Alignment search
+    is explicitly bounded; exhausting the bound returns ambiguous so callers
+    fail open.
+    """
+    excerpt_lines = excerpt.splitlines()
+    work_limit = _SOURCE_ALIGNMENT_WORK_LIMIT if _work_limit is None else _work_limit
+    budget = _SOURCE_ALIGNMENT_WORK_BUDGET.get()
+    owns_budget = budget is None
+    if owns_budget:
+        if work_limit < 0:
+            return None
+        budget = _SourceAlignmentWorkBudget(work_limit)
+    elif _work_limit is not None and _work_limit < 0:
+        budget.exhausted = True
+        raise _SourceAlignmentWorkExhausted
+    if budget.exhausted:
+        if owns_budget:
+            return None
+        raise _SourceAlignmentWorkExhausted
+
+    budget.alignment_calls += 1
+    source_key: _SourceAlignmentSourceKey = (
+        tuple(source_lines) if _source_key is None else _source_key
+    )
+    operation_cache_key = (source_key, excerpt)
+    if operation_cache_key in budget._alignment_cache:
+        cached = budget._alignment_cache[operation_cache_key]
+        return None if cached is None else list(cached)
+    if len(excerpt_lines) > _SOURCE_ALIGNMENT_MAX_DEPTH:
+        budget._alignment_cache[operation_cache_key] = None
+        return None
+
+    call_work_limit = _work_limit if not owns_budget else None
+    call_work = 0
+    result_limit = 2
+
+    def spend_work(amount: int = 1) -> None:
+        nonlocal call_work
+        if call_work_limit is not None and amount > call_work_limit - call_work:
+            budget.exhausted = True
+            raise _SourceAlignmentWorkExhausted
+        budget.spend(amount)
+        call_work += amount
+
+    def add_unique(
+        results: list[tuple[int, ...]],
+        candidates: tuple[tuple[int, ...], ...],
+    ) -> None:
+        for candidate in candidates:
+            # Tuple construction and equality are linear in the selected-anchor
+            # count, so charge that work as well as the state transition.
+            spend_work(1 + (len(candidate) * len(results)))
+            if candidate not in results:
+                results.append(candidate)
+                if len(results) >= result_limit:
+                    return
+
+    if source_key in budget._source_cache:
+        source_state = budget._source_cache[source_key]
+    else:
+        evidence_indices_building: dict[str, list[int]] = {}
+        represented_prefix_building = [0]
+        represented_ends_building: dict[int, list[int]] = {}
+        source_is_omission_building: list[bool] = []
+        char_omission_indices_building: list[int] = []
+        try:
+            # Source indices are immutable within an operation. Build and charge
+            # them once, then share them across ranked candidates and later passes.
+            spend_work(len(source_lines))
+            for index, source_line in enumerate(source_lines):
+                source_is_omission_building.append(
+                    OMISSION_NOTICE_PATTERN.fullmatch(source_line) is not None
+                )
+                if source_is_omission_building[-1]:
+                    evidence_indices_building.setdefault(source_line, []).append(index)
+                line_omission = LINE_OMISSION_NOTICE_PATTERN.fullmatch(source_line)
+                if source_is_omission_building[-1] and line_omission is None:
+                    char_omission_indices_building.append(index)
+                coverage = int(line_omission.group(1)) if line_omission is not None else 1
+                represented = represented_prefix_building[-1] + coverage
+                represented_prefix_building.append(represented)
+                represented_ends_building.setdefault(represented, []).append(index + 1)
+        except ValueError:
+            budget._source_cache[source_key] = None
+            budget._alignment_cache[operation_cache_key] = None
+            return None
+        except _SourceAlignmentWorkExhausted:
+            if owns_budget:
+                return None
+            raise
+        source_state = _SourceAlignmentSourceState(
+            evidence_indices={
+                line: tuple(indices)
+                for line, indices in evidence_indices_building.items()
+            },
+            represented_prefix=tuple(represented_prefix_building),
+            represented_ends={
+                coverage: tuple(indices)
+                for coverage, indices in represented_ends_building.items()
+            },
+            source_is_omission=tuple(source_is_omission_building),
+            char_omission_indices=tuple(char_omission_indices_building),
+        )
+        budget._source_cache[source_key] = source_state
+    if source_state is None:
+        budget._alignment_cache[operation_cache_key] = None
+        return None
+
+    evidence_indices = source_state.evidence_indices
+    represented_prefix = source_state.represented_prefix
+    represented_ends = source_state.represented_ends
+    source_is_omission = source_state.source_is_omission
+    excerpt_is_omission: list[bool] = []
+    excerpt_line_coverage: list[int | None] = []
+    try:
+        spend_work(len(excerpt_lines))
+        for excerpt_line in excerpt_lines:
+            excerpt_is_omission.append(
+                OMISSION_NOTICE_PATTERN.fullmatch(excerpt_line) is not None
+            )
+            line_omission = LINE_OMISSION_NOTICE_PATTERN.fullmatch(excerpt_line)
+            excerpt_line_coverage.append(
+                int(line_omission.group(1)) if line_omission is not None else None
+            )
+    except ValueError:
+        budget._alignment_cache[operation_cache_key] = None
+        return None
+    except _SourceAlignmentWorkExhausted:
+        if owns_budget:
+            return None
+        raise
+
+    suffix_has_ordinary_line = [False] * (len(excerpt_lines) + 1)
+    for index in range(len(excerpt_lines) - 1, -1, -1):
+        suffix_has_ordinary_line[index] = (
+            not excerpt_is_omission[index] or suffix_has_ordinary_line[index + 1]
+        )
+
+    def represented_gap_end(start: int, coverage: int) -> int | None:
+        ends = represented_ends.get(represented_prefix[start] + coverage, ())
+        spend_work(1 + len(ends).bit_length())
+        position = bisect_right(ends, start)
+        return ends[position] if position < len(ends) else None
+
+    cache: dict[tuple[int, int], tuple[tuple[int, ...], ...]] = {}
+
+    def align(excerpt_index: int, source_index: int) -> tuple[tuple[int, ...], ...]:
+        cache_key = (excerpt_index, source_index)
+        if cache_key in cache:
+            return cache[cache_key]
+        spend_work()
+        if excerpt_index == len(excerpt_lines):
+            aligned = ((),)
+            cache[cache_key] = aligned
+            return aligned
+
+        excerpt_line = excerpt_lines[excerpt_index]
+        results: list[tuple[int, ...]] = []
+        if not excerpt_is_omission[excerpt_index]:
+            if (
+                source_index < len(source_lines)
+                and source_lines[source_index] == excerpt_line
+                and not source_is_omission[source_index]
+            ):
+                suffixes = align(excerpt_index + 1, source_index + 1)
+                prefixed: list[tuple[int, ...]] = []
+                for suffix in suffixes:
+                    spend_work(1 + len(suffix))
+                    prefixed.append((source_index, *suffix))
+                add_unique(
+                    results,
+                    tuple(prefixed),
+                )
+        else:
+            # A source notice is immutable evidence rather than kept content.
+            # Reducers may rank it independently of nearby ordinary lines, so
+            # let it match a later source occurrence. Any resulting kept-line
+            # ambiguity is still rejected below.
+            occurrences = evidence_indices.get(excerpt_line, [])
+            spend_work(1 + len(occurrences).bit_length())
+            occurrence_index = bisect_left(occurrences, source_index)
+            while occurrence_index < len(occurrences):
+                spend_work()
+                evidence_index = occurrences[occurrence_index]
+                add_unique(results, align(excerpt_index + 1, evidence_index + 1))
+                # With no ordinary line left, every successful provenance path
+                # has the same empty mapping. One success therefore exhausts
+                # the distinct result space without exploring quadratic marker
+                # combinations.
+                if results and not suffix_has_ordinary_line[excerpt_index]:
+                    aligned = (results[0],)
+                    cache[cache_key] = aligned
+                    return aligned
+                if len(results) >= result_limit:
+                    break
+                occurrence_index += 1
+
+            omitted = excerpt_line_coverage[excerpt_index]
+            if omitted is not None:
+                generated_ends: set[int] = set()
+                physical_end = source_index + omitted
+                if omitted > 0 and physical_end <= len(source_lines):
+                    generated_ends.add(physical_end)
+                represented_end = (
+                    represented_gap_end(source_index, omitted) if omitted > 0 else None
+                )
+                if omitted > 0 and represented_end is not None:
+                    generated_ends.add(represented_end)
+
+                for generated_end in sorted(generated_ends):
+                    spend_work()
+                    if excerpt_index == len(excerpt_lines) - 1:
+                        suffixes = ((),) if generated_end == len(source_lines) else ()
+                    else:
+                        suffixes = align(excerpt_index + 1, generated_end)
+                    add_unique(results, suffixes)
+                    if results and not suffix_has_ordinary_line[excerpt_index]:
+                        aligned = (results[0],)
+                        cache[cache_key] = aligned
+                        return aligned
+                    if len(results) >= result_limit:
+                        break
+
+        aligned = tuple(results)
+        cache[cache_key] = aligned
+        return aligned
+
+    try:
+        mappings = align(0, 0)
+    except _SourceAlignmentWorkExhausted:
+        if owns_budget:
+            return None
+        raise
+    if len(mappings) != 1:
+        budget._alignment_cache[operation_cache_key] = None
+        return None
+    mapping = mappings[0]
+    budget._alignment_cache[operation_cache_key] = mapping
+    return list(mapping)
 
 
 def _append_recovery_notices(

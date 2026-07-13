@@ -24,10 +24,13 @@ from .engine import (
     _is_compactable_tool_name,
     _plan_artifact,
     _preserve_patterns_for_output,
+    _raise_if_source_alignment_work_exhausted,
     _recovery_notices,
+    _reduce_text_in_operation,
+    _source_alignment_work_operation,
+    _SourceAlignmentWorkExhausted,
     _store_artifact,
     classify_command,
-    reduce_text,
 )
 
 HookCallback: TypeAlias = Callable[..., str | None]
@@ -90,6 +93,7 @@ def transform_tool_result(
     **kwargs: Any,
 ) -> str | None:
     kwargs.pop("defer_artifact_store", None)
+    kwargs.pop("_share_alignment_budget", None)
     return _transform_tool_result(
         result,
         tool_name=tool_name,
@@ -110,6 +114,7 @@ def _preview_tool_result(
     artifact_plans_out: list[_ArtifactPreviewPlan] | None = None,
     **kwargs: Any,
 ) -> str | None:
+    kwargs.pop("_share_alignment_budget", None)
     return _transform_tool_result(
         result,
         tool_name=tool_name,
@@ -121,7 +126,68 @@ def _preview_tool_result(
     )
 
 
+def _transform_tool_result_in_operation(
+    result: str = "",
+    *,
+    tool_name: str = "",
+    args: Mapping[str, Any] | None = None,
+    arguments: Mapping[str, Any] | None = None,
+    defer_artifact_store: bool = False,
+    artifact_plans_out: list[_ArtifactPreviewPlan] | None = None,
+    **kwargs: Any,
+) -> str | None:
+    return _transform_tool_result(
+        result,
+        tool_name=tool_name,
+        args=args,
+        arguments=arguments,
+        defer_artifact_store=defer_artifact_store,
+        artifact_plans_out=artifact_plans_out,
+        _share_alignment_budget=True,
+        **kwargs,
+    )
+
+
 def _transform_tool_result(
+    result: str,
+    *,
+    tool_name: str,
+    args: Mapping[str, Any] | None,
+    arguments: Mapping[str, Any] | None,
+    defer_artifact_store: bool,
+    artifact_plans_out: list[_ArtifactPreviewPlan] | None,
+    _share_alignment_budget: bool = False,
+    **kwargs: Any,
+) -> str | None:
+    local_plans: list[_ArtifactPreviewPlan] | None = (
+        [] if artifact_plans_out is not None else None
+    )
+
+    def transform() -> str | None:
+        transformed = _transform_tool_result_with_budget(
+            result,
+            tool_name=tool_name,
+            args=args,
+            arguments=arguments,
+            defer_artifact_store=defer_artifact_store,
+            artifact_plans_out=local_plans,
+            **kwargs,
+        )
+        _raise_if_source_alignment_work_exhausted()
+        if transformed is not None and artifact_plans_out is not None and local_plans:
+            artifact_plans_out.extend(local_plans)
+        return transformed
+
+    if _share_alignment_budget:
+        return transform()
+    try:
+        with _source_alignment_work_operation():
+            return transform()
+    except Exception:
+        return None
+
+
+def _transform_tool_result_with_budget(
     result: str,
     *,
     tool_name: str,
@@ -173,7 +239,7 @@ def _transform_tool_result(
                 exit_code=exit_code_override,
             )
             reduce_options = replace(options, artifact_enabled=False)
-            reduced = reduce_text(
+            reduced = _reduce_text_in_operation(
                 parsed,
                 command=command,
                 tool_name=tool_name,
@@ -226,6 +292,7 @@ def _transform_tool_result(
             if options.artifact_enabled and not defer_artifact_store:
                 artifact = metadata.get("artifact")
                 if isinstance(artifact, dict) and artifact.get("stored") is True:
+                    _raise_if_source_alignment_work_exhausted()
                     metadata["artifact"] = _store_artifact(parsed, options)
                     notice_metadata = dict(metadata)
                     notice_metadata["exit_code"] = None
@@ -299,7 +366,7 @@ def _transform_tool_result(
             value = payload.get(field)
             if not isinstance(value, str):
                 continue
-            reduced = reduce_text(
+            reduced = _reduce_text_in_operation(
                 value,
                 command=command,
                 tool_name=tool_name,
@@ -377,6 +444,7 @@ def _transform_tool_result(
                 if isinstance(metadata, dict) and isinstance(reduced_text, str):
                     artifact = metadata.get("artifact")
                     if isinstance(artifact, dict) and artifact.get("stored") is True:
+                        _raise_if_source_alignment_work_exhausted()
                         metadata["artifact"] = _store_artifact(value, options)
                     notice_metadata = dict(metadata)
                     notice_metadata["exit_code"] = None
@@ -412,6 +480,8 @@ def _transform_tool_result(
                     return None
                 artifact_plans_out.append(plan)
         return candidate
+    except _SourceAlignmentWorkExhausted:
+        raise
     except Exception:
         return None
 
@@ -683,6 +753,30 @@ def transform_terminal_output(
     **kwargs: Any,
 ) -> str | None:
     try:
+        with _source_alignment_work_operation():
+            transformed = _transform_terminal_output_with_budget(
+                *positional,
+                command=command,
+                output=output,
+                exit_code=exit_code,
+                returncode=returncode,
+                **kwargs,
+            )
+            _raise_if_source_alignment_work_exhausted()
+            return transformed
+    except Exception:
+        return None
+
+
+def _transform_terminal_output_with_budget(
+    *positional: Any,
+    command: str = "",
+    output: str = "",
+    exit_code: int = 0,
+    returncode: int | None = None,
+    **kwargs: Any,
+) -> str | None:
+    try:
         if positional:
             if len(positional) >= 1 and not command and isinstance(positional[0], str):
                 command = positional[0]
@@ -709,7 +803,7 @@ def transform_terminal_output(
             if isinstance(exit_code, int) and not isinstance(exit_code, bool)
             else None
         )
-        reduced = reduce_text(
+        reduced = _reduce_text_in_operation(
             output,
             command=command,
             tool_name="terminal",

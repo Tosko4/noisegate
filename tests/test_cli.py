@@ -10,12 +10,33 @@ import time
 from pathlib import Path
 
 import noisegate.cli as cli
+import noisegate.engine as engine
 import noisegate.plugin as plugin
 from noisegate.artifacts import ArtifactStore
 
 
 def numbered(prefix: str, count: int) -> str:
     return "\n".join(f"{prefix} {index:03d}" for index in range(1, count + 1))
+
+
+def alignment_exhaustion_text() -> str:
+    return "\n".join(
+        [
+            "[noisegate: omitted 1 lines]",
+            *(["externalized_ref=dup"] * 20),
+            *[f"ValueError: diagnostic-{index}" for index in range(50)],
+        ]
+    )
+
+
+def mixed_nested_exhaustion_payload() -> dict[str, object]:
+    return {
+        "tool_name": "terminal",
+        "command": "pytest -q",
+        "exit_code": 1,
+        "result": json.dumps({"stdout": numbered("simple", 100)}),
+        "stderr": alignment_exhaustion_text(),
+    }
 
 
 def write_hermes_console_script(
@@ -654,6 +675,41 @@ def test_reduce_json_mixed_terminal_like_payload_without_tool_name_compacts_both
     assert "[noisegate: omitted" in parsed["result"]["output"]
     assert parsed["result"]["noisegate"]["compacted"] is True
     assert parsed["_noisegate"]["compacted"] is True
+
+
+def test_reduce_json_nested_success_and_direct_exhaustion_abort_atomically(
+    monkeypatch,
+) -> None:
+    created_budgets: list[engine._SourceAlignmentWorkBudget] = []
+
+    def new_budget() -> engine._SourceAlignmentWorkBudget:
+        budget = engine._SourceAlignmentWorkBudget(500)
+        created_budgets.append(budget)
+        return budget
+
+    monkeypatch.setattr(engine, "_new_source_alignment_work_budget", new_budget)
+    payload = mixed_nested_exhaustion_payload()
+    raw = json.dumps(payload, separators=(",", ":"))
+    metadata: dict[str, object] = {}
+
+    output = cli._reduce_json_value(
+        payload,
+        raw,
+        engine.NoisegateOptions(
+            max_chars=500,
+            max_lines=22,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+        metadata_out=metadata,
+    )
+
+    assert output == raw
+    assert metadata == {}
+    assert len(created_budgets) == 1
+    assert created_budgets[0].exhausted is True
+    assert engine._SOURCE_ALIGNMENT_WORK_BUDGET.get() is None
 
 
 def test_reduce_json_nested_result_object_without_tool_name_compacts_from_command() -> None:
@@ -1598,6 +1654,134 @@ def test_reduce_json_preview_does_not_export_plan_when_plain_result_notice_drops
     assert output != raw
     assert "ng_" not in output
     assert plans == []
+
+
+def test_reduce_json_preview_discards_sibling_plan_on_alignment_exhaustion(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    created_budgets: list[engine._SourceAlignmentWorkBudget] = []
+
+    def new_budget() -> engine._SourceAlignmentWorkBudget:
+        budget = engine._SourceAlignmentWorkBudget(500)
+        created_budgets.append(budget)
+        return budget
+
+    monkeypatch.setattr(engine, "_new_source_alignment_work_budget", new_budget)
+    payload = mixed_nested_exhaustion_payload()
+    raw = json.dumps(payload, separators=(",", ":"))
+    metadata: dict[str, object] = {}
+    plans: list[plugin._ArtifactPreviewPlan] = []
+
+    output = cli._reduce_json_value(
+        payload,
+        raw,
+        engine.NoisegateOptions(
+            max_chars=500,
+            max_lines=22,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+            artifact_enabled=True,
+            artifact_dir=tmp_path / "artifacts",
+        ),
+        metadata_out=metadata,
+        defer_artifact_store=True,
+        artifact_plans_out=plans,
+    )
+
+    assert output == raw
+    assert metadata == {}
+    assert plans == []
+    assert len(created_budgets) == 1
+    assert created_budgets[0].exhausted is True
+    assert not (tmp_path / "artifacts").exists()
+
+
+def test_reduce_json_command_never_stores_preview_plan_after_sibling_exhaustion(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    payload = mixed_nested_exhaustion_payload()
+    payload["noisegate"] = {
+        "max_chars": 500,
+        "max_lines": 22,
+        "head_lines": 0,
+        "tail_lines": 0,
+        "important_context_lines": 0,
+    }
+    raw = json.dumps(payload, separators=(",", ":"))
+    store_calls: list[plugin._ArtifactPreviewPlan] = []
+
+    def new_budget() -> engine._SourceAlignmentWorkBudget:
+        return engine._SourceAlignmentWorkBudget(500)
+
+    def unexpected_store(
+        plan: plugin._ArtifactPreviewPlan,
+        _options: engine.NoisegateOptions,
+    ) -> bool:
+        store_calls.append(plan)
+        return True
+
+    monkeypatch.setattr(engine, "_new_source_alignment_work_budget", new_budget)
+    monkeypatch.setattr(cli, "_store_artifact_preview_plan", unexpected_store)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(raw))
+
+    return_code = cli.main(
+        [
+            "reduce-json",
+            "--store-artifact",
+            "--artifact-dir",
+            str(artifact_dir),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert return_code == 0
+    assert captured.out == raw
+    assert captured.err == ""
+    assert store_calls == []
+    assert not artifact_dir.exists()
+
+
+def test_reduce_json_exhaustion_creates_no_real_artifact_or_id(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    payload = mixed_nested_exhaustion_payload()
+    payload["noisegate"] = {
+        "max_chars": 500,
+        "max_lines": 22,
+        "head_lines": 0,
+        "tail_lines": 0,
+        "important_context_lines": 0,
+    }
+    raw = json.dumps(payload, separators=(",", ":"))
+
+    def new_budget() -> engine._SourceAlignmentWorkBudget:
+        return engine._SourceAlignmentWorkBudget(500)
+
+    monkeypatch.setattr(engine, "_new_source_alignment_work_budget", new_budget)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(raw))
+
+    return_code = cli.main(
+        [
+            "reduce-json",
+            "--store-artifact",
+            "--artifact-dir",
+            str(artifact_dir),
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert return_code == 0
+    assert output == raw
+    assert "id=ng_" not in output
+    assert not artifact_dir.exists()
 
 
 def test_reduce_json_preview_plans_bind_notices_to_exact_accepted_owners() -> None:

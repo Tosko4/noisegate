@@ -996,7 +996,7 @@ def test_externalization_failure_fallback_fails_open_without_data_loss(monkeypat
     def broken_reduce_text(*_args: object, **_kwargs: object) -> object:
         raise RuntimeError("simulated reducer failure after LCM fallback")
 
-    monkeypatch.setattr(plugin, "reduce_text", broken_reduce_text)
+    monkeypatch.setattr(plugin, "_reduce_text_in_operation", broken_reduce_text)
 
     assert transform_tool_result(raw, tool_name="terminal", noisegate_max_chars=120) is None
 

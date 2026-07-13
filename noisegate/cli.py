@@ -14,9 +14,13 @@ from typing import Any, cast
 from ._version import __version__
 from .artifacts import ArtifactError, ArtifactStore
 from .engine import (
+    _SOURCE_ALIGNMENT_WORK_BUDGET,
     NoisegateOptions,
     _is_compactable_tool_name,
-    _preview_reduce_text,
+    _raise_if_source_alignment_work_exhausted,
+    _reduce_text_in_operation,
+    _source_alignment_work_operation,
+    _SourceAlignmentWorkExhausted,
     env_diagnostics,
     reduce_text,
 )
@@ -29,10 +33,9 @@ from .plugin import (
     _ArtifactNoticeOwnerStep,
     _ArtifactPreviewPlan,
     _extract_exit_code,
-    _preview_tool_result,
     _select_command,
     _store_artifact_preview_plan,
-    transform_tool_result,
+    _transform_tool_result_in_operation,
 )
 from .wrap import DEFAULT_MAX_CAPTURE_BYTES, WrappedCommandInterrupted, run_wrapped_command
 
@@ -145,6 +148,15 @@ def cmd_reduce(args: argparse.Namespace) -> int:
 def cmd_reduce_json(args: argparse.Namespace) -> int:
     raw = sys.stdin.read()
     try:
+        with _source_alignment_work_operation():
+            return _cmd_reduce_json_with_budget(args, raw)
+    except Exception:
+        sys.stdout.write(raw)
+        return 0
+
+
+def _cmd_reduce_json_with_budget(args: argparse.Namespace, raw: str) -> int:
+    try:
         parsed = json.loads(raw)
     except (json.JSONDecodeError, RecursionError, ValueError):
         sys.stdout.write(raw)
@@ -170,6 +182,7 @@ def cmd_reduce_json(args: argparse.Namespace) -> int:
                 defer_artifact_store=True,
                 artifact_plans_out=preview_plans,
             )
+            _raise_if_source_alignment_work_exhausted()
             if preview == raw:
                 output = raw
                 metadata = preview_metadata
@@ -185,6 +198,7 @@ def cmd_reduce_json(args: argparse.Namespace) -> int:
                     metadata_out=metadata,
                 )
             elif len(preview_plans) == 1:
+                _raise_if_source_alignment_work_exhausted()
                 if _store_artifact_preview_plan(preview_plans[0], options):
                     output = preview
                     metadata = preview_metadata
@@ -207,8 +221,12 @@ def cmd_reduce_json(args: argparse.Namespace) -> int:
                 metadata = preview_metadata
         else:
             output = _reduce_json_value(parsed, raw, options, metadata_out=metadata)
+        _raise_if_source_alignment_work_exhausted()
+    except _SourceAlignmentWorkExhausted:
+        raise
     except Exception:
         output = raw
+        metadata = {}
     sys.stdout.write(output)
     if metadata:
         metadata = _json_metadata_with_envelope_metrics(metadata, raw, output, options)
@@ -403,6 +421,45 @@ def _reduce_json_value(
     defer_artifact_store: bool = False,
     artifact_plans_out: list[_ArtifactPreviewPlan] | None = None,
 ) -> str:
+    local_metadata: dict[str, Any] | None = {} if metadata_out is not None else None
+    local_plans: list[_ArtifactPreviewPlan] | None = (
+        [] if artifact_plans_out is not None else None
+    )
+
+    def reduce_value() -> str:
+        output = _reduce_json_value_with_budget(
+            parsed,
+            raw,
+            options,
+            metadata_out=local_metadata,
+            defer_artifact_store=defer_artifact_store,
+            artifact_plans_out=local_plans,
+        )
+        _raise_if_source_alignment_work_exhausted()
+        if metadata_out is not None and local_metadata:
+            metadata_out.update(local_metadata)
+        if artifact_plans_out is not None and local_plans:
+            artifact_plans_out.extend(local_plans)
+        return output
+
+    if _SOURCE_ALIGNMENT_WORK_BUDGET.get() is not None:
+        return reduce_value()
+    try:
+        with _source_alignment_work_operation():
+            return reduce_value()
+    except Exception:
+        return raw
+
+
+def _reduce_json_value_with_budget(
+    parsed: Any,
+    raw: str,
+    options: NoisegateOptions,
+    *,
+    metadata_out: dict[str, Any] | None = None,
+    defer_artifact_store: bool = False,
+    artifact_plans_out: list[_ArtifactPreviewPlan] | None = None,
+) -> str:
     hook_kwargs = _options_to_hook_kwargs(options)
 
     def tool_transform(
@@ -411,13 +468,12 @@ def _reduce_json_value(
         artifact_plans_out: list[_ArtifactPreviewPlan] | None = None,
         **kwargs: Any,
     ) -> str | None:
-        if defer_artifact_store:
-            return _preview_tool_result(
-                result,
-                artifact_plans_out=artifact_plans_out,
-                **kwargs,
-            )
-        return transform_tool_result(result, **kwargs)
+        return _transform_tool_result_in_operation(
+            result,
+            defer_artifact_store=defer_artifact_store,
+            artifact_plans_out=artifact_plans_out,
+            **kwargs,
+        )
 
     call_args: dict[str, Any] = _envelope_call_args(parsed) if isinstance(parsed, dict) else {}
     if isinstance(parsed, dict) and "result" in parsed:
@@ -473,14 +529,14 @@ def _reduce_json_value(
                 and not _is_json_text(result_value)
             ):
                 command = selected_command or _envelope_command(call_args)
-                reducer = _preview_reduce_text if defer_artifact_store else reduce_text
-                reduced = reducer(
+                reduced = _reduce_text_in_operation(
                     result_value,
                     command=command,
                     tool_name=tool_name,
                     source="reduce-json",
                     exit_code=result_exit_code,
                     options=options,
+                    defer_artifact_store=defer_artifact_store,
                 )
                 result_metadata.update(
                     _debug_metadata(reduced.metadata, result_value, reduced.text)
@@ -500,13 +556,14 @@ def _reduce_json_value(
                                 plan,
                                 reduced.text,
                             ):
-                                inline = reducer(
+                                inline = _reduce_text_in_operation(
                                     result_value,
                                     command=command,
                                     tool_name=tool_name,
                                     source="reduce-json",
                                     exit_code=result_exit_code,
                                     options=options.with_mapping({"artifacts": False}),
+                                    defer_artifact_store=defer_artifact_store,
                                 )
                                 result_metadata.clear()
                                 result_metadata.update(

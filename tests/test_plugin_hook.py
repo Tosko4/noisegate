@@ -16,6 +16,16 @@ def numbered(prefix: str, count: int) -> str:
     return "\n".join(f"{prefix} {index:03d}" for index in range(1, count + 1))
 
 
+def alignment_exhaustion_text() -> str:
+    return "\n".join(
+        [
+            "[noisegate: omitted 1 lines]",
+            *(["externalized_ref=dup"] * 20),
+            *[f"ValueError: diagnostic-{index}" for index in range(50)],
+        ]
+    )
+
+
 def source_like_payload() -> str:
     return "\n".join(
         [
@@ -122,6 +132,128 @@ def test_transform_tool_result_preserves_failure_lines_in_stderr() -> None:
     assert "npm ERR! code ELIFECYCLE" in stderr
     assert "Error: build failed" in stderr
     assert payload["exit_code"] == 1
+
+
+def test_transform_tool_result_alignment_exhaustion_aborts_every_field_order(
+    monkeypatch,
+) -> None:
+    simple = numbered("simple", 100)
+    expensive = alignment_exhaustion_text()
+    created_budgets: list[engine._SourceAlignmentWorkBudget] = []
+
+    def new_budget() -> engine._SourceAlignmentWorkBudget:
+        budget = engine._SourceAlignmentWorkBudget(500)
+        created_budgets.append(budget)
+        return budget
+
+    monkeypatch.setattr(engine, "_new_source_alignment_work_budget", new_budget)
+
+    for stdout, stderr in ((simple, expensive), (expensive, simple)):
+        created_budgets.clear()
+        raw = json.dumps(
+            {
+                "command": "pytest -q",
+                "stdout": stdout,
+                "stderr": stderr,
+                "exit_code": 1,
+            }
+        )
+
+        transformed = transform_tool_result(
+            raw,
+            tool_name="terminal",
+            noisegate_max_chars=500,
+            noisegate_max_lines=22,
+            noisegate_head_lines=0,
+            noisegate_tail_lines=0,
+            noisegate_important_context_lines=0,
+        )
+
+        assert transformed is None
+        assert len(created_budgets) == 1
+        assert created_budgets[0].exhausted is True
+        assert engine._SOURCE_ALIGNMENT_WORK_BUDGET.get() is None
+
+
+def test_transform_tool_result_non_exhausted_mixed_fields_share_one_budget(
+    monkeypatch,
+) -> None:
+    created_budgets: list[engine._SourceAlignmentWorkBudget] = []
+
+    def new_budget() -> engine._SourceAlignmentWorkBudget:
+        budget = engine._SourceAlignmentWorkBudget(engine._SOURCE_ALIGNMENT_WORK_LIMIT)
+        created_budgets.append(budget)
+        return budget
+
+    monkeypatch.setattr(engine, "_new_source_alignment_work_budget", new_budget)
+    raw = json.dumps(
+        {
+            "command": "make noisy",
+            "stdout": numbered("stdout", 100),
+            "stderr": numbered("stderr", 100),
+        }
+    )
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        noisegate_max_chars=200,
+        noisegate_max_lines=20,
+    )
+
+    payload = parse_hook_result(transformed)
+    assert set(payload["noisegate"]["fields"]) == {"stdout", "stderr"}
+    assert "[noisegate: omitted" in payload["stdout"]
+    assert "[noisegate: omitted" in payload["stderr"]
+    assert len(created_budgets) == 1
+    assert created_budgets[0].exhausted is False
+    assert engine._SOURCE_ALIGNMENT_WORK_BUDGET.get() is None
+
+
+def test_transform_tool_result_exhaustion_does_not_leak_to_next_call(
+    monkeypatch,
+) -> None:
+    limits = iter((500, engine._SOURCE_ALIGNMENT_WORK_LIMIT))
+    created_budgets: list[engine._SourceAlignmentWorkBudget] = []
+
+    def new_budget() -> engine._SourceAlignmentWorkBudget:
+        budget = engine._SourceAlignmentWorkBudget(next(limits))
+        created_budgets.append(budget)
+        return budget
+
+    monkeypatch.setattr(engine, "_new_source_alignment_work_budget", new_budget)
+    failed_raw = json.dumps(
+        {
+            "command": "pytest -q",
+            "stdout": numbered("simple", 100),
+            "stderr": alignment_exhaustion_text(),
+            "exit_code": 1,
+        }
+    )
+    independent_raw = terminal_result(numbered("independent", 100), command="make noisy")
+
+    failed = transform_tool_result(
+        failed_raw,
+        tool_name="terminal",
+        noisegate_max_chars=500,
+        noisegate_max_lines=22,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_important_context_lines=0,
+    )
+    independent = transform_tool_result(
+        independent_raw,
+        tool_name="terminal",
+        noisegate_max_chars=200,
+        noisegate_max_lines=20,
+    )
+
+    assert failed is None
+    assert independent is not None
+    assert len(created_budgets) == 2
+    assert created_budgets[0].exhausted is True
+    assert created_budgets[1].exhausted is False
+    assert engine._SOURCE_ALIGNMENT_WORK_BUDGET.get() is None
 
 
 def test_execute_code_is_not_touched_by_default() -> None:
@@ -592,7 +724,7 @@ def test_tool_result_hook_fail_open_catches_reducer_exceptions(monkeypatch) -> N
     def boom(*_args, **_kwargs):
         raise RuntimeError("host adapter should never see this")
 
-    monkeypatch.setattr(plugin, "reduce_text", boom)
+    monkeypatch.setattr(plugin, "_reduce_text_in_operation", boom)
     raw = terminal_result(numbered("line", 100), command="pytest")
 
     assert transform_tool_result(raw, tool_name="terminal", noisegate_max_chars=100) is None
