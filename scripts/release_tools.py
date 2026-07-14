@@ -29,6 +29,7 @@ GITHUB_NOREPLY_RE = re.compile(
 
 GH_PR_JSON_FIELDS = "number,title,author,mergedAt,mergeCommit,url,body"
 GH_PR_GRAPHQL_PAGE_SIZE = 100
+RELEASE_PR_DESCRIPTION_MAX_CHARS = 240
 
 CATEGORY_TERMS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Security / Safety", ("security", "safety", "harden", "protect")),
@@ -51,7 +52,7 @@ CATEGORY_TERMS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     ("Internal / CI", ("ci", "workflow", "actionlint", "contributors")),
     ("Documentation", ("readme", "docs", "documentation")),
-    ("Fixed", ("fix", "fixed", "bug", "fail", "failure", "collision")),
+    ("Fixed", ("fix", "fixed", "bug", "fail", "failure", "collision", "preserve")),
     ("Added", ("add", "added", "new", "introduce", "introduced")),
 )
 
@@ -418,15 +419,11 @@ def _format_release_pr_section(summary: ReleasePullRequestSummary) -> str:
             continue
         lines.extend(("", f"### {category}"))
         for pr in prs:
-            lines.append(
-                f"- [#{pr.number}]({pr.url}) {pr.title} — {pr.author_mention}"
-            )
+            lines.append(_format_release_pr_line(pr))
     for category, prs in sorted(grouped.items()):
         lines.extend(("", f"### {category}"))
         for pr in prs:
-            lines.append(
-                f"- [#{pr.number}]({pr.url}) {pr.title} — {pr.author_mention}"
-            )
+            lines.append(_format_release_pr_line(pr))
 
     lines.extend(("", "## New contributors"))
     if summary.new_contributors:
@@ -440,14 +437,80 @@ def _format_release_pr_section(summary: ReleasePullRequestSummary) -> str:
     return "\n".join(lines)
 
 
+def _format_release_pr_line(pr: ReleasePullRequest) -> str:
+    line = f"- [#{pr.number}]({pr.url}) {pr.title} — {pr.author_mention}"
+    description = _release_pr_description(pr.body)
+    return f"{line}. {description}" if description else line
+
+
+def _release_pr_description(body: str) -> str:
+    for raw_line in _release_pr_summary_lines(body):
+        line = re.sub(
+            r"^\s*(?:[-*+](?:\s+|$)|\d+[.)](?:\s+|$))",
+            "",
+            raw_line,
+        ).strip()
+        line = re.sub(r"^\[[ xX]\](?:\s+|$)", "", line).strip()
+        if not line or line.startswith("#"):
+            continue
+        line = re.sub(r"\s+", " ", line)
+        if line[0].islower():
+            line = line[0].upper() + line[1:]
+        visible_text = re.sub(r"[*_~`\s]+$", "", line)
+        needs_punctuation = not visible_text or visible_text[-1] not in ".!?…"
+        if len(line) + int(needs_punctuation) > RELEASE_PR_DESCRIPTION_MAX_CHARS:
+            shortened = line[: RELEASE_PR_DESCRIPTION_MAX_CHARS - 1].rsplit(" ", 1)[0]
+            line = f"{shortened}…"
+        elif needs_punctuation:
+            line = f"{line}."
+        return line
+    return ""
+
+
+def _release_pr_summary_text(body: str) -> str:
+    summary_match = re.search(
+        r"(?ims)^##\s+Summary\s*$\n(?P<summary>.*?)(?=^##\s+|\Z)",
+        body,
+    )
+    if summary_match:
+        return summary_match.group("summary")
+    return re.split(r"(?m)^##\s+", body, maxsplit=1)[0]
+
+
+def _release_pr_summary_lines(body: str) -> list[str]:
+    summary = re.sub(
+        r"(?s)<!--.*?(?:-->|\Z)",
+        "",
+        _release_pr_summary_text(body),
+    )
+    lines: list[str] = []
+    fence_marker: tuple[str, int] | None = None
+    for line in summary.splitlines():
+        fence_match = re.match(r"^\s*(`{3,}|~{3,})", line)
+        if fence_match:
+            marker_text = fence_match.group(1)
+            marker = (marker_text[0], len(marker_text))
+            if fence_marker is None:
+                fence_marker = marker
+            elif marker[0] == fence_marker[0] and marker[1] >= fence_marker[1]:
+                fence_marker = None
+            continue
+        if fence_marker is None:
+            lines.append(line)
+    return lines
+
+
 def _release_pr_category(pr: ReleasePullRequest) -> str:
     title = pr.title.lower()
-    body = pr.body.lower()
     for category, terms in CATEGORY_TERMS:
         if _contains_category_term(title, terms):
             return category
+
+    summary = _release_pr_description(pr.body).lower()
+    if re.match(r"^(?:add|adds|added|introduce|introduces|introduced)\b", summary):
+        return "Added"
     for category, terms in CATEGORY_TERMS:
-        if _contains_category_term(body, terms):
+        if _contains_category_term(summary, terms):
             return category
     return "Changed"
 
