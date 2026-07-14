@@ -495,7 +495,10 @@ def _reduce_json_value_with_budget(
             wrapper_alias = wrapper_alias.strip()
             if explicit_tool_name and wrapper_alias != explicit_tool_name:
                 return raw
-            explicit_tool_name = wrapper_alias
+            if explicit_tool_name or wrapper_alias in WRAPPER_TOOL_NAMES:
+                explicit_tool_name = wrapper_alias
+            else:
+                return raw
         if explicit_tool_name in WRAPPER_TOOL_NAMES:
             resolved_wrapper = _resolve_wrapped_call(parsed)
             if resolved_wrapper is None:

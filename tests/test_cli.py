@@ -1593,6 +1593,21 @@ def test_reduce_json_top_level_name_wrapper_preserves_protected_tool() -> None:
     assert proc.stdout == raw
 
 
+def test_reduce_json_does_not_promote_ordinary_top_level_name_to_tool_identity() -> None:
+    for name in ("terminal", "browser_console"):
+        envelope = {
+            "name": name,
+            "output": numbered("exact payload", 100),
+            "noisegate": {"max_chars": 120},
+        }
+        raw = json.dumps(envelope)
+
+        proc = run_cli("reduce-json", input_text=raw)
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == raw
+
+
 def test_reduce_json_top_level_name_wrapper_propagates_nested_exact_command() -> None:
     envelope = {
         "name": "tool_call",
