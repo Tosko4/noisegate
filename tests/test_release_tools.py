@@ -8,6 +8,9 @@ from typing import Any
 
 from scripts.release_tools import (
     ReleaseError,
+    ReleasePullRequest,
+    _release_pr_category,
+    _release_pr_description,
     changelog_notes_for_version,
     check_contributors_file,
     git_contributor_names,
@@ -17,6 +20,53 @@ from scripts.release_tools import (
     release_pull_request_summary,
     validate_release_state,
 )
+
+
+def test_release_pr_description_skips_template_comments_and_fenced_examples() -> None:
+    body = (
+        "## Summary\n"
+        "<!-- Replace this comment with a summary. -->\n"
+        "````markdown\n```text\nnot the release description\n```\n````\n"
+        "- preserve the actual recovery handle\n\n"
+        "## Validation\n- pytest"
+    )
+
+    assert _release_pr_description(body) == "Preserve the actual recovery handle."
+
+
+def test_release_pr_description_skips_empty_markdown_placeholders() -> None:
+    body = "## Summary\n-\n- [ ]\n- actual summary"
+
+    assert _release_pr_description(body) == "Actual summary."
+
+
+def test_release_pr_description_honors_max_length_including_punctuation() -> None:
+    for length in (239, 240, 241):
+        description = _release_pr_description(f"## Summary\n- {'x' * length}")
+
+        assert len(description) <= 240
+        assert description.endswith((".", "…"))
+
+
+def test_release_pr_description_respects_visible_markdown_punctuation() -> None:
+    assert (
+        _release_pr_description("## Summary\n- **Preserves exact reads.**")
+        == "**Preserves exact reads.**"
+    )
+
+
+def test_release_pr_category_does_not_treat_generic_prevention_as_security() -> None:
+    pr = ReleasePullRequest(
+        number=10,
+        title="Prevent duplicate summaries",
+        author="Alice",
+        merged_at="2026-07-07T13:00:00Z",
+        merge_commit="summary-sha",
+        url="https://github.com/Tosko4/noisegate/pull/10",
+        body="## Summary\n- avoid duplicate output",
+    )
+
+    assert _release_pr_category(pr) == "Changed"
 
 
 def write_project(root: Path, version: str = "0.1.0") -> None:
@@ -239,6 +289,18 @@ def test_release_notes_include_categorized_prs_and_new_contributors(
             "url": "https://github.com/Tosko4/noisegate/pull/9",
             "body": "README polish",
         },
+        {
+            "number": 10,
+            "title": "Improve reducer diagnostics",
+            "author": {"login": "Alice"},
+            "mergedAt": "2026-07-07T13:00:00Z",
+            "mergeCommit": {"oid": "diagnostics-sha"},
+            "url": "https://github.com/Tosko4/noisegate/pull/10",
+            "body": (
+                "## Summary\n- add reducer diagnostics without changing stdout\n\n"
+                "## Validation\n- npm pack --dry-run\n- package smoke tests"
+            ),
+        },
     ]
 
     def fake_which(name: str) -> str:
@@ -251,7 +313,7 @@ def test_release_notes_include_categorized_prs_and_new_contributors(
             return subprocess.CompletedProcess(
                 argv,
                 0,
-                stdout="release-sha\nsecurity-sha\ndocs-sha\n",
+                stdout="release-sha\nsecurity-sha\ndocs-sha\ndiagnostics-sha\n",
                 stderr="",
             )
         if argv[:3] == ["/usr/bin/gh", "api", "graphql"]:
@@ -295,18 +357,24 @@ def test_release_notes_include_categorized_prs_and_new_contributors(
     assert "### Release / Packaging" in notes
     assert (
         "[#7](https://github.com/Tosko4/noisegate/pull/7) "
-        "Add npm installer packaging — @Bob"
+        "Add npm installer packaging — @Bob. Add npm package and PyPI release notes."
     ) in notes
     assert "### Security / Safety" in notes
     assert (
         "[#8](https://github.com/Tosko4/noisegate/pull/8) "
-        "Harden artifact writes — @Alice"
+        "Harden artifact writes — @Alice. Protect artifact writes under concurrency."
     ) in notes
     assert "### Documentation" in notes
     assert (
         "[#9](https://github.com/Tosko4/noisegate/pull/9) "
-        "Docs: clarify install flow — @Charlie"
+        "Docs: clarify install flow — @Charlie. README polish."
     ) in notes
+    assert (
+        "[#10](https://github.com/Tosko4/noisegate/pull/10) "
+        "Improve reducer diagnostics — @Alice. Add reducer diagnostics without changing stdout."
+    ) in notes
+    included_section = notes.split("## Included pull requests", 1)[1]
+    assert "### Added\n- [#10]" in included_section
     assert "https://github.com/Tosko4/noisegate/pull/7\n" not in notes
     assert "https://github.com/Tosko4/noisegate/pull/8\n" not in notes
     assert "https://github.com/Tosko4/noisegate/pull/9\n" not in notes
@@ -314,7 +382,7 @@ def test_release_notes_include_categorized_prs_and_new_contributors(
     assert "@Bob made their first merged Noisegate PR in #7" in notes
     assert "@Charlie made their first merged Noisegate PR in #9" in notes
     assert "@Alice made their first" not in notes
-    assert [pr.number for pr in summary.included] == [7, 8, 9]
+    assert [pr.number for pr in summary.included] == [7, 8, 9, 10]
     assert [pr.number for pr in summary.new_contributors] == [7, 9]
 
 

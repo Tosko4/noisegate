@@ -4,26 +4,43 @@ All notable changes to Noisegate are documented here. Release notes are generate
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-14
+
+Noisegate 0.2.0 is a safety and signal-quality release. Compacted output keeps more of the details that help an agent recover from a failure, while source, patches, retrieval results, and other exact evidence are handled more conservatively. The goal is not simply shorter output; it is smaller output that remains trustworthy.
+
+This release also hardens the boundary between Noisegate and Hermes. Installer target detection, JSON envelopes, command aliases, exit hints, and artifact decisions now have stricter regression coverage. No config migration is required, the noisy-tool allowlist has not been broadened, and raw artifact storage remains opt-in.
+
+### Highlights
+
+- **More useful failure output.** Tight budgets now favor assertion messages, tracebacks, chained exceptions, `BaseExceptionGroup` headers, concrete dependency-resolution errors, and other actionable anchors over repetitive progress lines.
+- **Exact context stays exact.** Direct source reads, V4A patches, `git show REV:path`, attached `fd`/`fdfind` read consumers, protected `execute_code` output, and Hermes-LCM recovery references are preserved instead of being mistaken for noisy logs.
+- **A safer Hermes boundary.** `reduce-json` now handles mixed and nested host envelopes, conflicting command aliases, structured `argv`, exit-status precedence, metadata-key collisions, and artifact no-gain paths without corrupting valid JSON or claiming recovery data that was not stored.
+- **Better operator visibility.** Diagnostic metadata can be sent to stderr without changing stdout, and `noisegate doctor` exposes the effective runtime configuration and artifact limits more clearly.
+
 ### Added
-- `noisegate reduce`, `reduce-json`, and `wrap` now accept `--metadata`/`--debug` to print diagnostic JSON to stderr without changing stdout.
-- Regression coverage now defines the `execute_code` print-output boundary across JSON, source, config, diff, test, web excerpt, dependency, package-manager, and invalid-text payloads.
+
+- `noisegate reduce`, `reduce-json`, and `wrap` accept `--metadata` / `--debug` for out-of-band diagnostic JSON on stderr.
+- Regression contracts define why `execute_code` remains protected by default and how command-aware routes can deliberately compact known terminal-style output instead.
+- Product-contract and adversarial tests cover exact-output ownership, shell and package-runner wrappers, Docker/build noise, dependency failures, malformed host payloads, and recovery-handle preservation.
 
 ### Changed
-- `noisegate install-hermes --dry-run` now explicitly states that install/enable/doctor commands are not run and no Hermes restart/reload is performed.
-- Unchanged reduction metadata now reports more specific reason codes and the attempted reducer when a reducer could not produce a safe smaller output.
-- `noisegate doctor` now prints the effective runtime config, artifact directory, and artifact size cap alongside environment warnings.
+
+- `noisegate install-hermes` now accepts only a real Hermes console script or supported Hermes shim inside a virtual environment. Ambiguous or unrelated Python launchers fail closed.
+- `install-hermes --dry-run` explicitly reports that install, enable, doctor, and Hermes restart/reload actions are not performed.
+- Plugin enablement is idempotent and removes a stale `noisegate` entry from `plugins.disabled` without rewriting an already-correct configuration.
+- Unchanged reductions report more precise reason codes and attempted reducers; `noisegate doctor` now shows effective config, artifact location, size limits, and environment fallback warnings.
 
 ### Fixed
-- Preserve Hermes-LCM externalized payload placeholders and `externalized_ref` metadata while compacting noisy terminal-style output, without requiring Noisegate artifacts.
-- `install-hermes` now rejects non-Hermes Python launchers instead of trusting any virtualenv Python shebang, and it validates shell shims that exec Python are actually invoking `hermes_cli`.
-- The Hermes config helper now avoids rewriting an already-correct plugin config while still removing stale `noisegate` entries from `plugins.disabled`.
-- Pytest compaction now prefers assertion/traceback detail over progress lines when tight budgets force a single failure excerpt.
-- Tight-budget compaction now preserves Python task/chained exception headers, `BaseExceptionGroup` detail, and LCM externalized refs ahead of diagnostics.
-- Tight-budget LCM compaction now tries shorter ranked or reducer-specific failure anchors that fit alongside every externalized ref, and ranks actual `BaseExceptionGroup` headers ahead of pytest summaries.
-- Preserve source-like exact output for direct terminal file-display commands, V4A patches, and `reduce-json` command aliases even when the content resembles noisy failures.
-- Preserve uv dependency-resolution failures that occur before `uv run pytest` starts instead of routing them through the pytest reducer.
-- Preserve exact file output from attached `fd` / `fdfind` `--exec=cat` and `--exec-batch=cat` forms without protecting non-read consumers or swallowing diagnostics from later compactable commands.
-- Harden `reduce-json` host-adapter handling for mixed direct/envelope terminal payloads, metadata key collisions, command aliases, actionable exit-hint precedence, positional terminal-hook calls, side-effect-free envelope no-gain decisions, and conservative inline-only handling when one envelope would require multiple raw artifacts.
+
+- Pytest and Python diagnostics retain the assertion, traceback, task, chained-exception, and exception-group details most likely to explain the failure under tight line or character budgets.
+- `uv run pytest` distinguishes resolver failures that happen before pytest starts from resolver-like text printed by a real test run.
+- Source-like content remains exact even when it contains strings such as `FAILED`, `ERROR`, `Traceback`, or `npm ERR!`; exact passthrough no longer depends on whether the content happens to resemble a log.
+- Hermes-LCM `externalized_ref` values and recovery placeholders survive compaction without requiring Noisegate artifacts. If every distinct recovery handle cannot be retained, Noisegate fails open.
+- Complete JSON envelopes make artifact decisions transactionally: no-gain paths write nothing, accepted recovery IDs resolve to the stored raw text, and multi-artifact envelopes avoid partial or orphaned writes.
+
+### Documentation
+
+- Clarified Noisegate's ground-up Hermes positioning and corrected the Tokenjuice attribution link used for background context.
 
 ## [0.1.2] - 2026-07-07
 
