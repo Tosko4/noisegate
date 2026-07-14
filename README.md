@@ -297,7 +297,7 @@ Noisegate is intentionally conservative. Paranoid, even. That is a feature.
 
 Compacted output is kept within the configured `max_chars` and `max_lines` caps. If a readable omission marker plus preserved content cannot fit, Noisegate leaves the original output unchanged instead of emitting marker fragments or dropping important failure text.
 
-For Hermes hook traffic, it compacts only this explicit allowlist:
+For Hermes hook traffic, full-result compaction is limited to this explicit allowlist:
 
 ```text
 terminal
@@ -306,13 +306,35 @@ read_terminal
 browser_console
 ```
 
+There is one strict field-level exception for Hermes write/patch-like results. For
+`write_file`, `patch`, `apply_patch`, `edit_file`, and `replace_in_file`, Noisegate may
+compact only string values under these known diagnostic keys:
+
+```text
+lsp_diagnostics  diagnostics  lint  lint_output  lint_errors
+typecheck  typecheck_output  pyright  mypy  tsc  eslint  errors  warnings
+```
+
+Every other value in those results remains exact, including `content`, `source`,
+`diff`, `patch`, `result`, `output`, `text`, generated file content, unrelated
+metadata, and future unknown fields. Direct string results, short/no-gain
+diagnostics, malformed or duplicate-key JSON, nested JSON diagnostic strings,
+unsupported diagnostic value types, non-finite parsed numbers, non-UTF-8-encodable
+candidates, and ambiguous tool identities stay unchanged.
+This exception is inline-only: diagnostic fields never create raw
+artifacts, even when artifact mode is enabled. Here, exact means the parsed field
+value: when a sibling diagnostic compacts, Noisegate reserializes the outer JSON
+and adds collision-safe metadata, so the complete JSON byte stream may differ.
+`noisegate reduce-json` applies the same field-level contract when a Hermes-like
+envelope resolves directly, or through an unambiguous `tool_call` wrapper, to one
+of the supported write/patch-like tools.
+
 Protected surfaces include:
 
 ```text
 read_file
-write_file
-patch
-apply_patch
+write_file (except the diagnostic fields above)
+patch / apply_patch (except the diagnostic fields above)
 skill_view
 skill_manage
 session_search
@@ -334,7 +356,7 @@ unknown future tools
 
 MCP is intentionally boring by default: `mcp_*` and `mcp__*` results are exact evidence, not compaction fodder. This includes GitHub source and file content, resources, database rows, Playwright snapshots, Sentry stack traces, prompt/tool schemas, dynamic tool-discovery metadata, and MCP error/log output. A future explicit allowlist may opt in specific large listing shapes without weakening those exact-evidence defaults.
 
-When a host emits a generic `tool_call` wrapper, Noisegate uses the wrapped tool name when the wrapper supplies one. A wrapper around `terminal` follows terminal compaction behavior; a wrapper around `mcp_github_list_issues` remains protected. Missing or unknown wrapped names fail closed and stay exact. Duplicate or conflicting identities, detached argument maps, conflicting command hints, malformed JSON, cyclic/shared structures, and over-budget nesting also stay exact.
+When a host emits a generic `tool_call` wrapper, Noisegate uses the wrapped tool name when the wrapper supplies one. A wrapper around `terminal` follows terminal compaction behavior; an unambiguous wrapper around a supported write/patch-like tool gets only the diagnostic-field exception above; and a wrapper around `mcp_github_list_issues` remains protected. Missing or unknown wrapped names fail closed and stay exact. Duplicate or conflicting identities, detached argument maps, conflicting command hints, malformed JSON, cyclic/shared structures, and over-budget nesting also stay exact.
 
 Bypass controls:
 
@@ -356,7 +378,7 @@ NOISEGATE_ARTIFACT_SIZE_CAP=1000000  # max stored raw-output bytes per artifact
 
 `noisegate doctor` reports ignored or fallback environment values, so typos like `NOISEGATE_ARTIFACTS=maybe` do not fail silently.
 
-Hermes calls `transform_terminal_output` before its built-in terminal redaction pass. Noisegate still compacts inline terminal output there, but it disables raw artifact storage on that early hook so pre-redaction output is not persisted.
+Hermes calls `transform_terminal_output` before its built-in terminal redaction pass. Noisegate still compacts inline terminal output there, but it disables raw artifact storage on that early hook so pre-redaction output is not persisted. Field-level write/patch diagnostics are also always inline-only because they can contain source snippets and private paths.
 
 ## Artifacts
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -457,6 +459,899 @@ def test_read_file_and_write_file_are_not_touched() -> None:
 
     assert transform_tool_result(raw, tool_name="read_file", noisegate_max_chars=100) is None
     assert transform_tool_result(raw, tool_name="write_file", noisegate_max_chars=100) is None
+
+
+def test_write_file_short_diagnostics_and_direct_string_results_stay_exact() -> None:
+    raw = json.dumps({"bytes_written": 18, "lint": "ok"})
+    direct = json.dumps(numbered("direct write result", 100))
+
+    assert transform_tool_result(raw, tool_name="write_file", noisegate_max_chars=120) is None
+    for tool_name in ("write_file", "patch", "apply_patch", "edit_file", "replace_in_file"):
+        assert (
+            transform_tool_result(direct, tool_name=tool_name, noisegate_max_chars=120)
+            is None
+        )
+
+
+def test_write_diagnostic_field_allowlist_is_explicit_and_complete() -> None:
+    diagnostic = numbered("src/file.py:10:2: error E100 useful diagnostic", 120)
+
+    for field in (
+        "lsp_diagnostics",
+        "diagnostics",
+        "lint",
+        "lint_output",
+        "lint_errors",
+        "typecheck",
+        "typecheck_output",
+        "pyright",
+        "mypy",
+        "tsc",
+        "eslint",
+        "errors",
+        "warnings",
+    ):
+        transformed = transform_tool_result(
+            json.dumps({field: diagnostic}),
+            tool_name="write_file",
+            noisegate_max_chars=240,
+            noisegate_max_lines=7,
+        )
+
+        payload = parse_hook_result(transformed)
+        assert payload[field] != diagnostic, field
+
+
+def test_write_file_compacts_only_lsp_diagnostics_and_preserves_content() -> None:
+    content = "def generated():\n    return 'exact ä\nsource'\n"
+    target = (
+        '/workspace/src/service_000.py:42:17 - error: Argument of type "str" cannot be '
+        'assigned to parameter "count" of type "int" (reportArgumentType)'
+    )
+    diagnostics = "\n".join(
+        [
+            target,
+            *(
+                f"/workspace/src/service_{index:03d}.py:{42 + index}:17 - error: "
+                'Argument of type "str" cannot be assigned to parameter "count" '
+                'of type "int" (reportArgumentType)'
+                for index in range(1, 120)
+            ),
+        ]
+    )
+    raw_payload = {
+        "content": content,
+        "lsp_diagnostics": diagnostics,
+        "bytes_written": len(content.encode()),
+        "path": "src/generated.py",
+        "request_id": "write-123",
+    }
+
+    transformed = transform_tool_result(
+        json.dumps(raw_payload, ensure_ascii=False),
+        tool_name="write_file",
+        noisegate_max_chars=300,
+        noisegate_max_lines=8,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_important_context_lines=2,
+    )
+
+    payload = parse_hook_result(transformed)
+    assert payload["content"] == content
+    assert payload["bytes_written"] == raw_payload["bytes_written"]
+    assert payload["path"] == "src/generated.py"
+    assert payload["request_id"] == "write-123"
+    assert payload["lsp_diagnostics"] != diagnostics
+    assert "/workspace/src/service_000.py:42:17" in payload["lsp_diagnostics"]
+    assert "error" in payload["lsp_diagnostics"]
+    assert "reportArgumentType" in payload["lsp_diagnostics"]
+    assert "cannot be assigned" in payload["lsp_diagnostics"]
+    assert "[noisegate: omitted" in payload["lsp_diagnostics"]
+    assert payload["noisegate"]["fields"]["lsp_diagnostics"]["tool_name"] == "write_file"
+
+
+def test_write_diagnostics_keep_realistic_tool_anchors() -> None:
+    cases = {
+        "pyright": (
+            "src/service.py:42:17 - error: Argument of type \"str\" cannot be assigned "
+            'to parameter "count" of type "int" (reportArgumentType)',
+            ("src/service.py:42:17", "error", "reportArgumentType"),
+        ),
+        "mypy": (
+            "src/service.py:42:17: error: Incompatible types in assignment "
+            '(expression has type "str", variable has type "int")  [assignment]',
+            ("src/service.py:42:17", "error", "[assignment]"),
+        ),
+        "tsc": (
+            "src/service.ts(42,17): error TS2322: Type 'string' is not assignable "
+            "to type 'number'.",
+            ("src/service.ts(42,17)", "error TS2322", "not assignable"),
+        ),
+        "eslint": (
+            "  42:17  error  Unexpected any. Specify a different type  "
+            "@typescript-eslint/no-explicit-any",
+            ("42:17", "error", "@typescript-eslint/no-explicit-any"),
+        ),
+        "lint_output": (
+            "src/service.py:42:17: F401 [*] `os` imported but unused",
+            ("src/service.py:42:17", "F401", "imported but unused"),
+        ),
+        "diagnostics": (
+            "src/service.py:42:17 [warning] W0611: Unused import os",
+            ("src/service.py:42:17", "warning", "W0611", "Unused import"),
+        ),
+    }
+
+    for field, (anchor, expected_parts) in cases.items():
+        diagnostic = "\n".join(
+            [
+                *(f"analyzing project unit {index:03d}" for index in range(60)),
+                anchor,
+                *(f"analyzing project unit {index:03d}" for index in range(60, 120)),
+            ]
+        )
+        transformed = transform_tool_result(
+            json.dumps({field: diagnostic, "content": "exact source\n"}),
+            tool_name="edit_file",
+            noisegate_max_chars=260,
+            noisegate_max_lines=7,
+            noisegate_head_lines=0,
+            noisegate_tail_lines=0,
+            noisegate_important_context_lines=1,
+        )
+
+        payload = parse_hook_result(transformed)
+        assert payload["content"] == "exact source\n", field
+        assert payload[field] != diagnostic, field
+        for part in expected_parts:
+            assert part in payload[field], (field, part, payload[field])
+
+
+def test_write_diagnostics_keep_nearby_codeframe_and_caret() -> None:
+    diagnostic = "\n".join(
+        [
+            *(f"checking module {index:03d}" for index in range(60)),
+            "src/service.py:42:17: error: Undefined name `value` [name-defined]",
+            "   42 |     result = value + 1",
+            "      |              ^^^^^",
+            *(f"checking module {index:03d}" for index in range(60, 120)),
+        ]
+    )
+
+    transformed = transform_tool_result(
+        json.dumps({"mypy": diagnostic}),
+        tool_name="replace_in_file",
+        noisegate_max_chars=260,
+        noisegate_max_lines=8,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_important_context_lines=2,
+    )
+
+    payload = parse_hook_result(transformed)
+    assert "src/service.py:42:17" in payload["mypy"]
+    assert "42 |     result = value + 1" in payload["mypy"]
+    assert "|              ^^^^^" in payload["mypy"]
+
+
+def test_write_diagnostics_prioritize_real_tool_formats_over_generic_errors() -> None:
+    cases = {
+        "ruff": (
+            "lint_output",
+            [
+                "F401 [*] `os` imported but unused",
+                " --> src/app.py:1:8",
+                "  |",
+                "1 | import os",
+                "  |        ^^",
+                "  |",
+                "help: Remove unused import: `os`",
+            ],
+            ("F401", "src/app.py:1:8", "1 | import os", "|        ^^"),
+        ),
+        "pyright": (
+            "pyright",
+            [
+                "src/service.py:42:17 - error: Argument of type \"str\" cannot be "
+                'assigned to parameter "count" of type "int" (reportArgumentType)'
+            ],
+            ("src/service.py:42:17", "error", "reportArgumentType"),
+        ),
+        "mypy": (
+            "mypy",
+            [
+                "src/service.py:42:17: error: Incompatible types in assignment "
+                '(expression has type "str", variable has type "int")  [assignment]'
+            ],
+            ("src/service.py:42:17", "error", "[assignment]"),
+        ),
+        "tsc": (
+            "tsc",
+            [
+                "src/service.ts(42,17): error TS2322: Type 'string' is not assignable "
+                "to type 'number'."
+            ],
+            ("src/service.ts(42,17)", "error TS2322", "not assignable"),
+        ),
+        "eslint": (
+            "eslint",
+            [
+                "/workspace/src/service.ts",
+                "  42:17  error  Unexpected any. Specify a different type  "
+                "@typescript-eslint/no-explicit-any",
+            ],
+            ("/workspace/src/service.ts", "42:17", "@typescript-eslint/no-explicit-any"),
+        ),
+    }
+
+    for case, (field, anchor_lines, expected_parts) in cases.items():
+        diagnostic = "\n".join(
+            [
+                *(f"ERROR: wrapper noise {index:03d}" for index in range(40)),
+                *(f"checking nearby module {index:03d}" for index in range(6)),
+                *anchor_lines,
+                *(f"checking remaining module {index:03d}" for index in range(40)),
+            ]
+        )
+
+        transformed = transform_tool_result(
+            json.dumps({field: diagnostic, "content": "exact source\n"}),
+            tool_name="edit_file",
+            noisegate_max_chars=420,
+            noisegate_max_lines=10,
+            noisegate_head_lines=0,
+            noisegate_tail_lines=0,
+            noisegate_important_context_lines=3,
+            noisegate_max_important_lines=2,
+        )
+
+        payload = parse_hook_result(transformed)
+        assert payload["content"] == "exact source\n", case
+        for part in expected_parts:
+            assert part in payload[field], (case, part, payload[field])
+        assert "ERROR: wrapper noise 000" not in payload[field], case
+
+
+def test_write_diagnostics_keep_scoped_priority_in_tight_character_fallback() -> None:
+    location = "src/service.py:42:17: error: Undefined name `value` [name-defined]"
+    frame = "   42 |     result = value + 1"
+    caret = "      |              ^^^^^"
+    diagnostic = "\n".join(
+        [
+            "ERROR: wrapper failed" + (" x" * 45),
+            *(f"checking module {index:02d}" for index in range(25)),
+            location,
+            frame,
+            caret,
+        ]
+    )
+    complete_excerpt = "\n".join(
+        [
+            "[noisegate: omitted 26 lines]",
+            location,
+            frame,
+            caret,
+        ]
+    )
+    assert len(complete_excerpt) <= 200
+
+    transformed = transform_tool_result(
+        json.dumps({"mypy": diagnostic, "content": "exact source\n"}),
+        tool_name="edit_file",
+        noisegate_max_chars=200,
+        noisegate_max_lines=40,
+        noisegate_important_context_lines=2,
+    )
+
+    payload = parse_hook_result(transformed)
+    assert payload["content"] == "exact source\n"
+    assert location in payload["mypy"]
+    assert frame in payload["mypy"]
+    assert caret in payload["mypy"]
+    assert "ERROR: wrapper failed" not in payload["mypy"]
+
+
+def test_write_diagnostics_keep_scoped_priority_after_upstream_omission_remap() -> None:
+    location = "src/a.py:42:17: error: Undefined name `value` [name-defined]"
+    frame = "42 | result = value + 1"
+    caret = "   |          ^^^^^"
+    refs = ("externalized_ref=lcm_a", "externalized_ref=lcm_b")
+    diagnostic = "\n".join(
+        [
+            *(f"ERROR ValueError: generic wrapper noise {index:02d}" for index in range(8)),
+            "[noisegate: omitted 20 lines]",
+            *refs,
+            *(
+                f"ERROR ValueError: generic wrapper noise {index:02d}"
+                for index in range(8, 16)
+            ),
+            location,
+            frame,
+            caret,
+            *(f"checking trailing module {index:02d}" for index in range(8)),
+        ]
+    )
+    complete_excerpt = "\n".join(
+        [
+            "[noisegate: omitted 28 lines]",
+            *refs,
+            "[noisegate: omitted 8 lines]",
+            location,
+            frame,
+            caret,
+            "[noisegate: omitted 8 lines]",
+        ]
+    )
+    assert len(complete_excerpt) <= 250
+
+    transformed = transform_tool_result(
+        json.dumps({"mypy": diagnostic, "source": "exact source"}),
+        tool_name="write_file",
+        noisegate_max_chars=250,
+        noisegate_max_lines=10,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_important_context_lines=2,
+        noisegate_max_important_lines=2,
+    )
+
+    payload = parse_hook_result(transformed)
+    assert payload["source"] == "exact source"
+    assert location in payload["mypy"]
+    assert frame in payload["mypy"]
+    assert caret in payload["mypy"]
+    for ref in refs:
+        assert ref in payload["mypy"]
+
+
+def test_write_diagnostic_patterns_are_line_local_on_many_blank_lines() -> None:
+    for pattern in engine.DIAGNOSTIC_LOCATION_PATTERNS:
+        assert pattern.flags & re.MULTILINE
+        assert pattern.pattern.startswith("^")
+        assert r"\s*" not in pattern.pattern
+        assert r"\s+" not in pattern.pattern
+
+    location = "src/service.py:42:17: error: Undefined name `value` [name-defined]"
+
+    def transform_blank_lines(count: int) -> float:
+        diagnostic = (" \n" * count) + location + "\n" + numbered("checking module", 80)
+        started = time.perf_counter()
+        transformed = transform_tool_result(
+            json.dumps({"diagnostics": diagnostic, "source": "exact source"}),
+            tool_name="write_file",
+            noisegate_max_chars=220,
+            noisegate_max_lines=7,
+            noisegate_head_lines=0,
+            noisegate_tail_lines=0,
+            noisegate_important_context_lines=1,
+        )
+        elapsed = time.perf_counter() - started
+        payload = parse_hook_result(transformed)
+        assert payload["source"] == "exact source"
+        assert location in payload["diagnostics"]
+        return elapsed
+
+    small_elapsed = transform_blank_lines(1_000)
+    large_elapsed = transform_blank_lines(8_000)
+    assert large_elapsed < 1.0
+    assert large_elapsed < (small_elapsed * 12) + 0.05
+
+
+def test_write_diagnostics_override_git_boundary_reducers_when_passthrough_is_off() -> None:
+    location = (
+        "src/service.py:42:17: error: Incompatible types in assignment [assignment]"
+    )
+    diagnostic = "\n".join(
+        [
+            *(f"ERROR: boundary wrapper {index:03d}" for index in range(60)),
+            location,
+            *(f"ERROR: trailing wrapper {index:03d}" for index in range(60)),
+        ]
+    )
+
+    cases = (
+        ("git log --oneline", True),
+        ("git diff -- src/service.py", False),
+    )
+    for command, preserve_diffs in cases:
+        transformed = transform_tool_result(
+            json.dumps(
+                {
+                    "diagnostics": diagnostic,
+                    "command": command,
+                    "source": "exact source\n",
+                }
+            ),
+            tool_name="write_file",
+            noisegate_max_chars=240,
+            noisegate_max_lines=7,
+            noisegate_head_lines=1,
+            noisegate_tail_lines=1,
+            noisegate_important_context_lines=1,
+            noisegate_max_important_lines=2,
+            noisegate_preserve_diffs=preserve_diffs,
+        )
+
+        payload = parse_hook_result(transformed)
+        assert payload["command"] == command
+        assert payload["source"] == "exact source\n"
+        assert location in payload["diagnostics"], command
+        assert "[assignment]" in payload["diagnostics"], command
+        assert "ERROR: boundary wrapper 000" not in payload["diagnostics"], command
+
+
+def test_write_diagnostics_use_scoped_reduction_in_auto_and_head_tail_modes() -> None:
+    diagnostic = "\n".join(
+        [
+            *(f"checking module {index:03d}" for index in range(60)),
+            "src/service.py:42:17: error: Undefined name `value` [name-defined]",
+            "   42 |     result = value + 1",
+            "      |              ^^^^^",
+            *(f"checking module {index:03d}" for index in range(60, 120)),
+        ]
+    )
+
+    for mode in ("auto", "head_tail"):
+        transformed = transform_tool_result(
+            json.dumps({"diagnostics": diagnostic}),
+            tool_name="write_file",
+            noisegate_mode=mode,
+            noisegate_max_chars=280,
+            noisegate_max_lines=8,
+            noisegate_head_lines=1,
+            noisegate_tail_lines=1,
+            noisegate_important_context_lines=2,
+        )
+
+        payload = parse_hook_result(transformed)
+        assert "src/service.py:42:17" in payload["diagnostics"], mode
+        assert "42 |     result = value + 1" in payload["diagnostics"], mode
+        assert "|              ^^^^^" in payload["diagnostics"], mode
+
+
+def test_write_diagnostics_off_mode_is_noop() -> None:
+    raw = json.dumps(
+        {"diagnostics": numbered("src/file.py:10:2: error E100 useful diagnostic", 120)}
+    )
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="write_file",
+            noisegate_mode="off",
+            noisegate_max_chars=240,
+        )
+        is None
+    )
+
+
+def test_patch_like_results_preserve_all_source_bearing_fields() -> None:
+    source_values = {
+        "content": "new content\nERROR is source here\n",
+        "source": "old source\nwarning is source here\n",
+        "diff": "--- a/file.py\n+++ b/file.py\n@@ -1 +1 @@\n-old\n+new\n",
+        "patch": "*** Begin Patch\n*** Update File: file.py\n-old\n+new\n*** End Patch",
+    }
+    diagnostic = "\n".join(
+        f"src/file.py:{index}:3: error: E{index:04d} diagnostic message {index}"
+        for index in range(1, 121)
+    )
+
+    for tool_name in ("patch", "apply_patch", "edit_file", "replace_in_file"):
+        transformed = transform_tool_result(
+            json.dumps({**source_values, "errors": diagnostic, "applied": True}),
+            tool_name=tool_name,
+            noisegate_max_chars=300,
+            noisegate_max_lines=8,
+            noisegate_head_lines=1,
+            noisegate_tail_lines=1,
+        )
+
+        payload = parse_hook_result(transformed)
+        for field, value in source_values.items():
+            assert payload[field] == value, (tool_name, field)
+        assert payload["applied"] is True
+        assert payload["errors"] != diagnostic
+        assert "error" in payload["errors"]
+
+
+def test_write_diagnostic_metadata_collisions_and_unknown_fields_survive() -> None:
+    diagnostic = numbered("src/file.py:10:2: error E100 useful diagnostic", 120)
+    raw_payload = {
+        "diagnostics": diagnostic,
+        "unknown_diagnostic_text": numbered("must remain exact", 120),
+        "noisegate": {"owned": "by tool"},
+        "_noisegate": {"also": "owned"},
+        "__noisegate": {"still": "owned"},
+    }
+
+    transformed = transform_tool_result(
+        json.dumps(raw_payload),
+        tool_name="apply_patch",
+        noisegate_max_chars=240,
+        noisegate_max_lines=7,
+    )
+
+    payload = parse_hook_result(transformed)
+    assert payload["diagnostics"] != diagnostic
+    assert payload["unknown_diagnostic_text"] == raw_payload["unknown_diagnostic_text"]
+    assert payload["noisegate"] == {"owned": "by tool"}
+    assert payload["_noisegate"] == {"also": "owned"}
+    assert payload["__noisegate"] == {"still": "owned"}
+    metadata_keys = set(payload) - set(raw_payload)
+    assert len(metadata_keys) == 1
+    assert payload[metadata_keys.pop()]["compacted"] is True
+
+
+def test_write_diagnostics_never_plan_or_store_artifacts_in_direct_or_preview_wrapper(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    diagnostic = numbered("src/file.py:10:2: error E100 useful diagnostic", 120)
+    artifact_dir = tmp_path / "artifacts"
+
+    def unexpected_artifact_call(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("write diagnostics must not plan or store artifacts")
+
+    monkeypatch.setattr(plugin, "_plan_artifact", unexpected_artifact_call)
+    monkeypatch.setattr(plugin, "_store_artifact", unexpected_artifact_call)
+    monkeypatch.setattr(plugin, "_artifact_preview_plan", unexpected_artifact_call)
+    monkeypatch.setattr(engine, "_plan_artifact", unexpected_artifact_call)
+    monkeypatch.setattr(engine, "_store_artifact", unexpected_artifact_call)
+    raw = json.dumps({"diagnostics": diagnostic, "content": "exact source"})
+    transformed = transform_tool_result(
+        raw,
+        tool_name="write_file",
+        noisegate_max_chars=240,
+        noisegate_max_lines=7,
+        noisegate_artifacts=True,
+        noisegate_artifact_dir=str(artifact_dir),
+    )
+
+    payload = parse_hook_result(transformed)
+    assert "artifact" not in payload["noisegate"]["fields"]["diagnostics"]
+
+    preview_plans: list[plugin._ArtifactPreviewPlan] = []
+    preview = plugin._preview_tool_result(
+        raw,
+        tool_name="tool_call",
+        args={"name": "apply_patch", "arguments": {"path": "src/file.py"}},
+        artifact_plans_out=preview_plans,
+        noisegate_max_chars=240,
+        noisegate_max_lines=7,
+        noisegate_artifacts=True,
+        noisegate_artifact_dir=str(artifact_dir),
+    )
+
+    preview_payload = parse_hook_result(preview)
+    assert "artifact" not in preview_payload["noisegate"]["fields"]["diagnostics"]
+    assert preview_plans == []
+    assert not artifact_dir.exists()
+
+
+def test_write_diagnostic_alignment_exhaustion_aborts_complete_envelope(
+    monkeypatch,
+) -> None:
+    simple = numbered("src/simple.py:10:2: error E100 useful diagnostic", 100)
+    expensive = alignment_exhaustion_text()
+    created_budgets: list[engine._SourceAlignmentWorkBudget] = []
+
+    def new_budget() -> engine._SourceAlignmentWorkBudget:
+        budget = engine._SourceAlignmentWorkBudget(500)
+        created_budgets.append(budget)
+        return budget
+
+    monkeypatch.setattr(engine, "_new_source_alignment_work_budget", new_budget)
+
+    for diagnostics, lint in ((simple, expensive), (expensive, simple)):
+        created_budgets.clear()
+        raw = json.dumps(
+            {
+                "content": "exact source",
+                "diagnostics": diagnostics,
+                "lint": lint,
+            }
+        )
+
+        transformed = transform_tool_result(
+            raw,
+            tool_name="write_file",
+            noisegate_max_chars=500,
+            noisegate_max_lines=22,
+            noisegate_head_lines=0,
+            noisegate_tail_lines=0,
+            noisegate_important_context_lines=0,
+            noisegate_artifacts=True,
+        )
+
+        assert transformed is None
+        assert len(created_budgets) == 1
+        assert created_budgets[0].exhausted is True
+        assert engine._SOURCE_ALIGNMENT_WORK_BUDGET.get() is None
+
+
+def test_nested_json_string_diagnostic_aborts_complete_envelope() -> None:
+    nested = json.dumps(
+        {
+            "errors": numbered("inner.py:7:3: error E700 nested diagnostic", 80),
+            "content": "exact nested source ä",
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    warnings = numbered("outer.py:10:2: warning W100 useful diagnostic", 120)
+    raw = json.dumps(
+        {
+            "diagnostics": nested,
+            "warnings": warnings,
+            "content": "exact outer source ä",
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="edit_file",
+            noisegate_max_chars=240,
+            noisegate_max_lines=7,
+        )
+        is None
+    )
+
+
+def test_unsupported_diagnostic_value_aborts_complete_envelope() -> None:
+    warnings = numbered("outer.py:10:2: warning W100 useful diagnostic", 120)
+
+    for unsupported in (None, True, 7, ["error"], {"message": "error"}):
+        raw = json.dumps(
+            {
+                "diagnostics": unsupported,
+                "warnings": warnings,
+                "content": "exact outer source",
+            }
+        )
+
+        assert (
+            transform_tool_result(
+                raw,
+                tool_name="edit_file",
+                noisegate_max_chars=240,
+                noisegate_max_lines=7,
+            )
+            is None
+        )
+
+
+def test_invalid_field_reduction_aborts_complete_envelope(monkeypatch) -> None:
+    diagnostics = numbered("first.py:10:2: error E100 useful diagnostic", 120)
+    warnings = numbered("second.py:10:2: warning W100 useful diagnostic", 120)
+    validate = plugin._valid_transformed_text
+
+    def reject_first_field(
+        *,
+        original: str,
+        transformed: str,
+        metadata: dict[str, Any],
+        options: engine.NoisegateOptions,
+    ) -> bool:
+        if original == diagnostics:
+            return False
+        return validate(
+            original=original,
+            transformed=transformed,
+            metadata=metadata,
+            options=options,
+        )
+
+    monkeypatch.setattr(plugin, "_valid_transformed_text", reject_first_field)
+    raw = json.dumps(
+        {
+            "diagnostics": diagnostics,
+            "warnings": warnings,
+            "content": "exact source",
+        }
+    )
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="write_file",
+            noisegate_max_chars=240,
+            noisegate_max_lines=7,
+        )
+        is None
+    )
+
+
+def test_same_object_no_gain_write_diagnostic_aborts_all_siblings() -> None:
+    warnings = numbered("src/file.py:10:2: warning W100 useful diagnostic", 120)
+    raw = json.dumps(
+        {
+            "diagnostics": "ok",
+            "warnings": warnings,
+            "content": "exact source",
+        }
+    )
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="write_file",
+            noisegate_max_chars=240,
+            noisegate_max_lines=7,
+        )
+        is None
+    )
+
+    diagnostics = numbered("src/file.py:20:3: error E200 useful diagnostic", 120)
+    transformed = transform_tool_result(
+        json.dumps({"diagnostics": diagnostics, "warnings": warnings}),
+        tool_name="write_file",
+        noisegate_max_chars=240,
+        noisegate_max_lines=7,
+    )
+    payload = parse_hook_result(transformed)
+    assert payload["diagnostics"] != diagnostics
+    assert payload["warnings"] != warnings
+    assert set(payload["noisegate"]["fields"]) == {"diagnostics", "warnings"}
+
+
+def test_write_diagnostics_preserve_nonzero_exit_hints() -> None:
+    diagnostics = numbered("src/file.py:20:3: error E200 useful diagnostic", 120)
+    cases = (
+        ({"exit_code": 7}, None, 7),
+        ({"status": "failed"}, None, 1),
+        ({}, 9, 9),
+    )
+
+    for payload_fields, exit_override, expected_exit_code in cases:
+        transformed = transform_tool_result(
+            json.dumps({"diagnostics": diagnostics, **payload_fields}),
+            tool_name="write_file",
+            noisegate_max_chars=240,
+            noisegate_max_lines=7,
+            noisegate_exit_code=exit_override,
+        )
+
+        payload = parse_hook_result(transformed)
+        assert f"[noisegate: exit_code={expected_exit_code}]" in payload["diagnostics"]
+        assert (
+            payload["noisegate"]["fields"]["diagnostics"]["exit_code"]
+            == expected_exit_code
+        )
+
+
+def test_write_diagnostic_invalid_and_duplicate_json_fail_open() -> None:
+    duplicate = (
+        '{"diagnostics":"'
+        + numbered("first diagnostic", 80).replace("\n", "\\n")
+        + '","diagnostics":"'
+        + numbered("second diagnostic", 80).replace("\n", "\\n")
+        + '"}'
+    )
+
+    assert transform_tool_result("{malformed", tool_name="write_file") is None
+    assert transform_tool_result(duplicate, tool_name="apply_patch") is None
+
+    noisy_sibling = numbered("outer.py:10:2: warning W100 useful diagnostic", 120)
+    for nested in (
+        '{"errors":"unterminated}',
+        '{"errors":"first","errors":"second"}',
+    ):
+        assert (
+            transform_tool_result(
+                json.dumps({"diagnostics": nested, "warnings": noisy_sibling}),
+                tool_name="edit_file",
+                noisegate_max_chars=240,
+                noisegate_max_lines=7,
+            )
+            is None
+        )
+
+
+def test_write_diagnostic_nonfinite_json_aborts_complete_envelope() -> None:
+    diagnostic = numbered("src/file.py:10:2: error E100 useful diagnostic", 120)
+
+    for constant in ("1e400", "-1e400", "NaN"):
+        raw = f'{{"diagnostics":{json.dumps(diagnostic)},"unknown":{constant}}}'
+
+        assert (
+            transform_tool_result(
+                raw,
+                tool_name="write_file",
+                noisegate_max_chars=240,
+                noisegate_max_lines=7,
+            )
+            is None
+        ), constant
+
+
+def test_write_diagnostic_lone_surrogates_fail_open_before_utf8_encoding() -> None:
+    diagnostic = numbered("src/file.py:10:2: error E100 useful diagnostic", 120)
+
+    for escaped_surrogate in (r"\ud800", r"\udfff"):
+        raw = (
+            '{"diagnostics":'
+            f'{json.dumps(diagnostic)},"source":"{escaped_surrogate}"}}'
+        )
+
+        assert (
+            transform_tool_result(
+                raw,
+                tool_name="write_file",
+                noisegate_max_chars=240,
+                noisegate_max_lines=7,
+            )
+            is None
+        ), escaped_surrogate
+
+
+def test_write_diagnostic_valid_non_bmp_unicode_stays_exact_and_utf8_encodable() -> None:
+    diagnostic = numbered("src/file.py:10:2: error E100 useful diagnostic", 120)
+    source = "exact source with non-BMP Unicode: 🧪\n"
+    raw = json.dumps(
+        {"diagnostics": diagnostic, "source": source},
+        ensure_ascii=False,
+    )
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="write_file",
+        noisegate_max_chars=240,
+        noisegate_max_lines=7,
+    )
+
+    payload = parse_hook_result(transformed)
+    assert payload["source"] == source
+    assert isinstance(transformed, str)
+    transformed.encode("utf-8")
+
+
+def test_tool_call_wrapper_requires_unambiguous_write_identity() -> None:
+    diagnostic = numbered("src/file.py:10:2: error E100 useful diagnostic", 120)
+    raw = json.dumps({"diagnostics": diagnostic, "content": "exact source"})
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="tool_call",
+        args={"name": "write_file", "arguments": {"path": "src/file.py"}},
+        noisegate_max_chars=240,
+        noisegate_max_lines=7,
+    )
+    payload = parse_hook_result(transformed)
+    assert payload["content"] == "exact source"
+    assert payload["diagnostics"] != diagnostic
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={
+                "name": "write_file",
+                "tool": "apply_patch",
+                "arguments": {"path": "src/file.py"},
+            },
+            noisegate_max_chars=240,
+        )
+        is None
+    )
+
+
+def test_named_write_tool_rejects_conflicting_embedded_identity() -> None:
+    raw = json.dumps(
+        {
+            "tool_name": "apply_patch",
+            "diagnostics": numbered("src/file.py:10:2: error E100 useful diagnostic", 120),
+        }
+    )
+
+    assert (
+        transform_tool_result(raw, tool_name="write_file", noisegate_max_chars=240)
+        is None
+    )
 
 
 def test_skill_view_is_not_touched() -> None:
@@ -1992,6 +2887,53 @@ def test_terminal_json_artifact_rewrite_fails_open_with_upstream_marker(
     )
 
     assert transformed is None
+    assert not artifact_dir.exists()
+
+
+def test_terminal_json_rejects_non_utf8_candidate_before_artifact_exposure(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    stdout = numbered("FAILED tests/test_example.py::test_case - AssertionError", 120)
+    raw = (
+        '{"command":"pytest","stdout":'
+        f'{json.dumps(stdout)},"source":"\\ud800"}}'
+    )
+    store_calls: list[str] = []
+
+    def record_store(
+        text: str,
+        options: engine.NoisegateOptions,
+    ) -> dict[str, engine.JsonValue]:
+        store_calls.append(text)
+        return engine._plan_artifact(text, options)
+
+    monkeypatch.setattr(plugin, "_store_artifact", record_store)
+    artifact_dir = tmp_path / "artifacts"
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        noisegate_max_chars=500,
+        noisegate_max_lines=10,
+        noisegate_artifacts=True,
+        noisegate_artifact_dir=str(artifact_dir),
+    )
+    plans: list[plugin._ArtifactPreviewPlan] = []
+    preview = plugin._preview_tool_result(
+        raw,
+        tool_name="terminal",
+        artifact_plans_out=plans,
+        noisegate_max_chars=500,
+        noisegate_max_lines=10,
+        noisegate_artifacts=True,
+        noisegate_artifact_dir=str(artifact_dir),
+    )
+
+    assert transformed is None
+    assert preview is None
+    assert store_calls == []
+    assert plans == []
     assert not artifact_dir.exists()
 
 
