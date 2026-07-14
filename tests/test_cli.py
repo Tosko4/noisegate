@@ -422,6 +422,55 @@ def test_reduce_json_same_object_no_gain_diagnostic_aborts_all_siblings() -> Non
     assert proc.stdout == raw
 
 
+def test_reduce_json_write_diagnostics_preserve_exit_hints() -> None:
+    diagnostics = numbered("src/file.py:10:2: error E100 useful diagnostic", 120)
+    envelopes = (
+        (
+            {
+                "tool_name": "write_file",
+                "diagnostics": diagnostics,
+                "exit_code": 4,
+                "source": "exact root source",
+                "noisegate": {"max_chars": 240, "max_lines": 7},
+            },
+            4,
+            False,
+        ),
+        (
+            {
+                "tool_name": "write_file",
+                "status": "failed",
+                "result": {
+                    "diagnostics": diagnostics,
+                    "source": "exact nested source",
+                },
+                "noisegate": {"max_chars": 240, "max_lines": 7},
+            },
+            1,
+            True,
+        ),
+    )
+
+    for envelope, expected_exit_code, nested in envelopes:
+        raw = json.dumps(envelope)
+        proc = run_cli("reduce-json", input_text=raw)
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout != raw
+        payload = json.loads(proc.stdout)
+        diagnostic_payload = payload["result"] if nested else payload
+        assert (
+            f"[noisegate: exit_code={expected_exit_code}]"
+            in diagnostic_payload["diagnostics"]
+        )
+        metadata_key = "noisegate" if nested else "_noisegate"
+        assert (
+            diagnostic_payload[metadata_key]["fields"]["diagnostics"]["exit_code"]
+            == expected_exit_code
+        )
+        assert diagnostic_payload["source"].startswith("exact ")
+
+
 def test_reduce_json_write_diagnostics_never_plan_or_store_artifacts(tmp_path: Path) -> None:
     diagnostic = numbered("src/file.py:10:2: error E100 useful diagnostic", 120)
     nested = {"diagnostics": diagnostic, "content": "exact source\n"}

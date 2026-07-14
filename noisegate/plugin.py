@@ -344,6 +344,9 @@ def _transform_tool_result_with_budget(
         if tool_name in FIELD_AWARE_WRITE_TOOL_NAMES:
             if not isinstance(parsed, dict):
                 return None
+            write_exit_code = _extract_exit_code(parsed, tool_name)
+            if write_exit_code is None:
+                write_exit_code = exit_code_override
             return _transform_write_diagnostic_fields(
                 result,
                 parsed,
@@ -351,6 +354,7 @@ def _transform_tool_result_with_budget(
                 call_args=call_args,
                 args_map=args_map,
                 arguments_map=arguments_map,
+                exit_code=write_exit_code,
                 options=options,
             )
 
@@ -1063,6 +1067,7 @@ def _transform_write_diagnostic_fields(
     call_args: Mapping[str, Any],
     args_map: Mapping[str, Any],
     arguments_map: Mapping[str, Any],
+    exit_code: int | None,
     options: NoisegateOptions,
 ) -> str | None:
     """Compact only allowlisted diagnostic strings from write-like results."""
@@ -1090,7 +1095,7 @@ def _transform_write_diagnostic_fields(
         args_map,
         arguments_map,
         parsed,
-        exit_code=None,
+        exit_code=exit_code,
     )
     payload: dict[str, JsonValue] = dict(parsed)
     field_metadata: dict[str, JsonValue] = {}
@@ -1104,7 +1109,7 @@ def _transform_write_diagnostic_fields(
             # plugin path has already selected one diagnostic string field.
             tool_name=None,
             source=f"json_field:{field}",
-            exit_code=None,
+            exit_code=exit_code,
             options=reduce_options,
             extra_preserve_patterns=DIAGNOSTIC_LOCATION_PATTERNS,
         )
@@ -1820,7 +1825,7 @@ def _extract_exit_code(payload: Mapping[str, JsonValue], tool_name: str) -> int 
             return value
     status = payload.get("status")
     if (
-        tool_name in TERMINAL_TOOL_NAMES
+        tool_name in TERMINAL_TOOL_NAMES | FIELD_AWARE_WRITE_TOOL_NAMES
         and isinstance(status, str)
         and status.lower() in {"failed", "failure", "error", "errored"}
     ):

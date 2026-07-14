@@ -1199,6 +1199,31 @@ def test_same_object_no_gain_write_diagnostic_aborts_all_siblings() -> None:
     assert set(payload["noisegate"]["fields"]) == {"diagnostics", "warnings"}
 
 
+def test_write_diagnostics_preserve_nonzero_exit_hints() -> None:
+    diagnostics = numbered("src/file.py:20:3: error E200 useful diagnostic", 120)
+    cases = (
+        ({"exit_code": 7}, None, 7),
+        ({"status": "failed"}, None, 1),
+        ({}, 9, 9),
+    )
+
+    for payload_fields, exit_override, expected_exit_code in cases:
+        transformed = transform_tool_result(
+            json.dumps({"diagnostics": diagnostics, **payload_fields}),
+            tool_name="write_file",
+            noisegate_max_chars=240,
+            noisegate_max_lines=7,
+            noisegate_exit_code=exit_override,
+        )
+
+        payload = parse_hook_result(transformed)
+        assert f"[noisegate: exit_code={expected_exit_code}]" in payload["diagnostics"]
+        assert (
+            payload["noisegate"]["fields"]["diagnostics"]["exit_code"]
+            == expected_exit_code
+        )
+
+
 def test_write_diagnostic_invalid_and_duplicate_json_fail_open() -> None:
     duplicate = (
         '{"diagnostics":"'
