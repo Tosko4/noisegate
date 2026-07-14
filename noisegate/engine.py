@@ -5829,15 +5829,29 @@ def _looks_like_docker_build_output(sample: str) -> bool:
         "failed to solve" in sample
         or "did not complete successfully" in sample
         or ("dockerfile" in sample and re.search(r"(?m)^(#\d+|=>)", sample))
-        or re.search(r"(?im)(?:^|\|)\s*#\d+\s+.*\bdockerfile\b", sample)
-        or re.search(r"(?im)(?:^|\|)\s*=>\s+.*\bdockerfile\b", sample)
         or re.search(
-            r"(?im)(?:^|\|)\s*(?:#\d+|=>)\s+.*\b"
+            r"(?im)(?:^|\|)[^\S\r\n]*#\d+[^\S\r\n]+[^\r\n]*\bdockerfile\b",
+            sample,
+        )
+        or re.search(
+            r"(?im)(?:^|\|)[^\S\r\n]*=>[^\S\r\n]+[^\r\n]*\bdockerfile\b",
+            sample,
+        )
+        or re.search(
+            r"(?im)(?:^|\|)[^\S\r\n]*(?:#\d+|=>)[^\S\r\n]+[^\r\n]*\b"
             r"(?:load metadata|load \.dockerignore|exporting|writing image)\b",
             sample,
         )
-        or re.search(r"(?im)(?:^|\|)\s*(?:#\d+|=>)\s+(?:done|cached)\b", sample)
-        or re.search(r"(?im)(?:^|\|)\s*(?:#\d+|=>)\s+.*\b(?:done|cached)\b", sample)
+        or re.search(
+            r"(?im)(?:^|\|)[^\S\r\n]*(?:#\d+|=>)[^\S\r\n]+"
+            r"(?:done|cached)\b",
+            sample,
+        )
+        or re.search(
+            r"(?im)(?:^|\|)[^\S\r\n]*(?:#\d+|=>)[^\S\r\n]+"
+            r"[^\r\n]*\b(?:done|cached)\b",
+            sample,
+        )
     )
 
 

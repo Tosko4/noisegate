@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -812,21 +813,29 @@ def test_write_diagnostic_patterns_are_line_local_on_many_blank_lines() -> None:
         assert r"\s+" not in pattern.pattern
 
     location = "src/service.py:42:17: error: Undefined name `value` [name-defined]"
-    diagnostic = (" \n" * 4_000) + location + "\n" + numbered("checking module", 80)
 
-    transformed = transform_tool_result(
-        json.dumps({"diagnostics": diagnostic, "source": "exact source"}),
-        tool_name="write_file",
-        noisegate_max_chars=220,
-        noisegate_max_lines=7,
-        noisegate_head_lines=0,
-        noisegate_tail_lines=0,
-        noisegate_important_context_lines=1,
-    )
+    def transform_blank_lines(count: int) -> float:
+        diagnostic = (" \n" * count) + location + "\n" + numbered("checking module", 80)
+        started = time.perf_counter()
+        transformed = transform_tool_result(
+            json.dumps({"diagnostics": diagnostic, "source": "exact source"}),
+            tool_name="write_file",
+            noisegate_max_chars=220,
+            noisegate_max_lines=7,
+            noisegate_head_lines=0,
+            noisegate_tail_lines=0,
+            noisegate_important_context_lines=1,
+        )
+        elapsed = time.perf_counter() - started
+        payload = parse_hook_result(transformed)
+        assert payload["source"] == "exact source"
+        assert location in payload["diagnostics"]
+        return elapsed
 
-    payload = parse_hook_result(transformed)
-    assert payload["source"] == "exact source"
-    assert location in payload["diagnostics"]
+    small_elapsed = transform_blank_lines(1_000)
+    large_elapsed = transform_blank_lines(8_000)
+    assert large_elapsed < 1.0
+    assert large_elapsed < (small_elapsed * 12) + 0.05
 
 
 def test_write_diagnostics_override_git_boundary_reducers_when_passthrough_is_off() -> None:
