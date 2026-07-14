@@ -183,6 +183,10 @@ def test_reduce_text_scans_full_artifact_for_late_secret(tmp_path: Path) -> None
 @pytest.mark.parametrize(
     "secret_line",
     [
+        "API Key: fake-value",
+        "api key = fake-value",
+        '"API Key": "fake-value"',
+        "'api key': 'fake-value'",
         "token: not-a-real-value",
         '"credentials": "not-a-real-value"',
         "-----BEGIN " + "OPENSSH PRIVATE KEY-----",

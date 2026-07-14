@@ -65,6 +65,7 @@ And it refuses to touch things that should stay exact:
 - source/code search output from `rg`, `grep`, `ag`, and `ack`
 - skill documents
 - memory, LCM, Hindsight, MCP, search, and web extraction results
+- terminal retrieval output from LCM, Hindsight, memory, and session-search commands, including path-qualified retrieval helpers
 - unknown future tools unless explicitly allowed
 
 That last bit matters. A compactor that damages retrieved context is worse than no compactor.
@@ -258,6 +259,8 @@ Operational rules:
 1. Use Noisegate for noisy terminal/tool output, not for exact source material.
 2. Do not compact file reads, patches, diffs, retrieved context, skill docs, memory results, MCP results, or web extraction output.
    Treat code-search output (`rg`, `grep`, `ag`, `ack`) as source context and leave it exact.
+   LCM/Hindsight/memory/session retrieval commands also stay exact when invoked through `hermes` or a retrieval helper such as `lcm_expand` or `session_search`.
+   Maintenance output such as `hermes lcm import`, `hermes lcm doctor --reindex`, embedding/index progress, and API retry logs remains compactable.
 3. Keep MCP stdio/HTTP outputs protected by default. Huge listings only become compactable through a future explicit allowlist; exact source, resources, schemas, rows, snapshots, stack traces, discovery metadata, and error/log output stay protected.
 4. For generic `tool_call` wrappers, classify by the real wrapped tool name when one is available; otherwise fail closed and keep the output exact.
 5. Do not treat Noisegate as a raw-output archive. Raw artifacts are off by default, and secret/header-looking output is refused even when artifacts are enabled.
@@ -366,7 +369,7 @@ When artifact mode is enabled, Noisegate writes the original output to a private
 - default size cap of 1,000,000 bytes
 - content-addressed IDs shaped like `ng_<sha256-prefix>`
 - path containment and symlink traversal checks
-- refusal of secret-, credential-, cookie-, authorization-header-, and API-key-looking raw output, scanning the complete payload before storage
+- refusal of secret-, credential-, cookie-, authorization-header-, and API-key-looking raw output (including spaced labels such as `API Key:`), scanning the complete payload before storage
 
 Retrieve an artifact:
 

@@ -101,6 +101,163 @@ def test_transform_tool_result_compacts_terminal_json() -> None:
     assert payload["noisegate"]["fields"]["stdout"]["reducer"] == "pytest"
 
 
+def test_hermes_terminal_hooks_preserve_retrieval_output_exactly() -> None:
+    output = numbered("expanded raw memory payload", 100)
+
+    assert (
+        transform_terminal_output(
+            command="hermes lcm expand 123",
+            output=output,
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+    raw = terminal_result(
+        output,
+        command="/opt/venv/bin/session_search retrieval",
+    )
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="terminal",
+            args={"command": "hermes lcm import archive.jsonl"},
+            noisegate_max_chars=120,
+        )
+        is None
+    )
+
+
+def test_tool_result_payload_retrieval_beats_stale_pytest_args_and_diff_output() -> None:
+    outputs = (
+        "\n".join(
+            f"tests/test_memory_{index}.py::test_recalled_{index} PASSED"
+            for index in range(180)
+        ),
+        "\n".join(
+            [
+                "diff --git a/recalled.py b/recalled.py",
+                "--- a/recalled.py",
+                "+++ b/recalled.py",
+                "@@ -1 +1 @@",
+                "-old recalled evidence",
+                "+new recalled evidence",
+                *[f"+exact recalled diff line {index:03d}" for index in range(180)],
+            ]
+        ),
+    )
+
+    for output in outputs:
+        raw = terminal_result(output, command="session_search git diff")
+        assert (
+            transform_tool_result(
+                raw,
+                tool_name="terminal",
+                args={"command": "pytest -q"},
+                noisegate_max_chars=160,
+                noisegate_max_lines=20,
+                noisegate_preserve_diffs=False,
+            )
+            is None
+        )
+
+
+def test_hermes_hooks_preserve_executed_retrieval_shell_forms_exactly() -> None:
+    output = numbered("exact retrieved pytest-looking evidence PASSED", 180)
+    commands = (
+        "hermes 2>/dev/null lcm expand 123",
+        "hermes lcm expand 123 <<<ignored",
+        "exec /opt/bin/lcm_expand 123",
+        "exec -a hermes /opt/hermes/bin/hermes --profile work lcm expand 123",
+        "exec -aretrieval /opt/bin/lcm_expand 123",
+        "exec -l /opt/bin/lcm_expand 123",
+        "echo `echo \\`/opt/bin/session_search q\\``",
+        "printf '%s' \"$(hermes lcm expand 123)\"",
+        "printf '%s' \"$(value=`hermes lcm expand 123`; printf '%s' \"$value\")\"",
+    )
+
+    for command in commands:
+        assert (
+            transform_terminal_output(
+                command=command,
+                output=output,
+                noisegate_max_chars=160,
+            )
+            is None
+        ), command
+        assert (
+            transform_tool_result(
+                terminal_result(output, command=command),
+                tool_name="terminal",
+                noisegate_max_chars=160,
+            )
+            is None
+        ), command
+
+
+def test_hermes_hooks_preserve_profiled_retrieval_output_exactly() -> None:
+    output = numbered("exact profiled retrieval evidence PASSED", 180)
+    commands = (
+        "hermes --profile work lcm expand 123",
+        "hermes --profile=work lcm expand 123",
+        "hermes -p work lcm expand 123",
+        "hermes -pwork lcm expand 123",
+        "hermes --yolo --profile work lcm expand 123",
+        "hermes --pass-session-id lcm expand 123",
+        "hermes --ignore-user-config lcm expand 123",
+        "hermes --ignore-rules lcm expand 123",
+        "hermes --tui lcm expand 123",
+        "hermes --resume=session-123 lcm expand 123",
+        "hermes --continue --yolo lcm expand 123",
+        "exec /opt/hermes/bin/hermes --profile work 2>/dev/null lcm expand 123 <<<ignored",
+        "printf '%s' \"$(hermes --profile work lcm expand 123)\"",
+    )
+
+    for command in commands:
+        assert (
+            transform_terminal_output(
+                command=command,
+                output=output,
+                noisegate_max_chars=160,
+            )
+            is None
+        ), command
+        assert (
+            transform_tool_result(
+                terminal_result(output, command=command),
+                tool_name="terminal",
+                noisegate_max_chars=160,
+            )
+            is None
+        ), command
+
+
+def test_hermes_hooks_keep_profiled_maintenance_output_compactable() -> None:
+    output = numbered("Hermes maintenance progress", 180)
+
+    for command in (
+        "hermes --profile work lcm import archive.jsonl",
+        "hermes -p work lcm doctor --reindex",
+        "hermes --ignore-rules lcm import archive.jsonl",
+        "hermes --pass-session-id lcm doctor --reindex",
+    ):
+        terminal_output = transform_terminal_output(
+            command=command,
+            output=output,
+            noisegate_max_chars=160,
+        )
+        assert isinstance(terminal_output, str), command
+        assert "[noisegate: omitted" in terminal_output, command
+
+        tool_output = transform_tool_result(
+            terminal_result(output, command=command),
+            tool_name="terminal",
+            noisegate_max_chars=160,
+        )
+        payload = parse_hook_result(tool_output)
+        assert payload["noisegate"]["compacted"] is True, command
+        assert "[noisegate: omitted" in payload["stdout"], command
+
+
 def test_explicit_terminal_tool_preserves_ordinary_payload_name_label() -> None:
     raw = json.dumps(
         {

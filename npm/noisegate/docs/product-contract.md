@@ -14,6 +14,7 @@ Noisegate exists to improve agent context value, not to make output shorter at a
 
 - [ ] File reads and source-like terminal commands stay byte-for-byte unchanged.
 - [ ] Diffs, patches, code-search output, retrieved context, skills, memory, Hindsight, LCM, MCP, web extraction, and unknown future tools remain protected by default.
+- [ ] Terminal LCM/Hindsight/memory/session retrieval commands stay exact, while maintenance, indexing, and retry progress remains eligible for compaction.
 - [ ] If a command mixes source inspection with words like `ERROR` or `failed`, Noisegate does not reinterpret that source as a build/test failure.
 
 ### 3. Slop reducers stay deterministic and scoped
@@ -32,6 +33,7 @@ Noisegate exists to improve agent context value, not to make output shorter at a
 
 - [ ] Raw artifacts stay off by default.
 - [ ] Artifact mode remains explicit, private filesystem only, size-capped, path-contained, symlink-safe, and permissioned `0700`/`0600`.
+- [ ] Artifact planning scans the complete payload and refuses obvious secret labels, including spaced forms such as `API Key:`.
 - [ ] `transform_terminal_output` never stores pre-redaction raw output.
 - [ ] Docs describe artifact privacy honestly and do not imply Noisegate is a log archive.
 

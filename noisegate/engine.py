@@ -60,9 +60,14 @@ BYPASS_MARKERS = (
 SECRET_ARTIFACT_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE | re.MULTILINE)
     for pattern in (
-        r"\b(?:api[_-]?key|access[_-]?token|token|secret|password|passwd|private[_-]?key|client[_-]?secret|credentials?|authorization|cookie|session(?:id)?)\s*[:=]",
+        r"\b(?:api(?:[ \t]+|[_-]?)key|access[_-]?token|token|secret|password|passwd|"
+        r"private[_-]?key|client[_-]?secret|credentials?|authorization|cookie|"
+        r"session(?:id)?)\s*[:=]",
         r"^\s*(?:[<>*]\s*)?(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-access-token|x-amz-security-token|x-goog-api-key)\s*[:=]",
-        r"[\"'](?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-access-token|x-amz-security-token|x-goog-api-key|api[_-]?key|access[_-]?token|token|secret|password|passwd|private[_-]?key|client[_-]?secret|credentials?)[\"']\s*:",
+        r"[\"'](?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|"
+        r"x-auth-token|x-access-token|x-amz-security-token|x-goog-api-key|"
+        r"api(?:[ \t]+|[_-]?)key|access[_-]?token|token|secret|password|passwd|"
+        r"private[_-]?key|client[_-]?secret|credentials?)[\"']\s*:",
         r"^[ \t]*(?:(?:>[ \t]*)|(?:[-+*][ \t]+)|(?:\d+[.)][ \t]+))*"
         r"[\"']?-{5}BEGIN "
         r"(?:(?:[A-Z0-9]+ )*PRIVATE KEY|PGP PRIVATE KEY BLOCK)-{5}[\"']?[ \t]*\r?$",
@@ -113,6 +118,54 @@ PROTECTED_TOOL_NAMES = frozenset(
 )
 PROTECTED_TOOL_PREFIXES = ("hindsight_", "lcm_", "mcp_", "mcp__")
 COMPACTABLE_TOOL_NAMES = frozenset({"terminal", "process", "read_terminal", "browser_console"})
+MEMORY_RETRIEVAL_HELPERS = frozenset(
+    {
+        "hindsight_recall",
+        "hindsight_reflect",
+        "lcm_describe",
+        "lcm_expand",
+        "lcm_expand_query",
+        "lcm_grep",
+        "lcm_load_session",
+        "session_search",
+    }
+)
+HERMES_VALUELESS_GLOBAL_OPTIONS = frozenset(
+    {
+        "--accept-hooks",
+        "--cli",
+        "--dev",
+        "--ignore-rules",
+        "--ignore-user-config",
+        "--no-restore-cwd",
+        "--pass-session-id",
+        "--safe-mode",
+        "--tui",
+        "--worktree",
+        "--yolo",
+        "-w",
+    }
+)
+HERMES_REQUIRED_VALUE_GLOBAL_OPTIONS = frozenset(
+    {
+        "--model",
+        "--provider",
+        "--resume",
+        "--skills",
+        "--toolsets",
+        "--usage-file",
+        "-m",
+        "-r",
+        "-s",
+        "-t",
+    }
+)
+HERMES_OPTIONAL_VALUE_GLOBAL_OPTIONS = frozenset({"--continue", "-c"})
+HERMES_ATTACHED_SHORT_VALUE_OPTIONS = ("-m", "-r", "-s", "-t")
+HERMES_PROFILE_ID_PATTERN = re.compile(
+    r"[a-z0-9][a-z0-9_-]{0,63}",
+    re.IGNORECASE | re.ASCII,
+)
 LCM_EXTERNALIZED_PATTERNS = tuple(
     re.compile(pattern)
     for pattern in (
@@ -129,6 +182,7 @@ LINE_OMISSION_NOTICE_PATTERN = re.compile(r"^\[noisegate: omitted (\d+) lines\]$
 CHAR_OMISSION_NOTICE_PATTERN = re.compile(r"^\[noisegate: omitted \d+ chars\]$")
 _SOURCE_ALIGNMENT_WORK_LIMIT = 50_000
 _SOURCE_ALIGNMENT_MAX_DEPTH = 512
+_MEMORY_RETRIEVAL_SUBSTITUTION_LIMIT = 16
 
 
 @dataclass(frozen=True)
@@ -597,6 +651,13 @@ def _reduce_text(
         return _unchanged(text, "protected_tool", command_class, reason="protected_tool")
     if command_class == "git_diff" and options.preserve_diffs:
         return _unchanged(text, "protected_diff", command_class, reason="diff_passthrough")
+    if command_class == "memory_retrieval":
+        return _unchanged(
+            text,
+            "protected_memory_retrieval",
+            command_class,
+            reason="memory_retrieval_passthrough",
+        )
     if command_class == "patch":
         return _unchanged(text, "protected_patch", command_class, reason="patch_passthrough")
     if command_class == "file_read":
@@ -851,6 +912,8 @@ def classify_command(command: str | None, text: str, *, exit_code: int | None = 
     text_l = text.lower()
     command_variants = _command_intent_variants(command_s)
 
+    if _looks_like_memory_retrieval_command(command_s):
+        return "memory_retrieval"
     if _is_source_search_command(
         command_s,
         sample=sample_l,
@@ -3881,6 +3944,217 @@ def _contains_command(command: str, names: tuple[str, ...]) -> bool:
     return any(name in tokens for name in names)
 
 
+def _looks_like_memory_retrieval_command(command: str) -> bool:
+    token_groups = _command_segments_after_wrappers(command)
+    substitutions = _memory_retrieval_substitutions(command)
+    if substitutions is None:
+        return True
+    for _kind, body in substitutions:
+        substitution_tokens = _proven_reachable_substitution_tokens(body)
+        token_groups.extend(
+            substitution_tokens
+            if substitution_tokens is not None
+            else _command_segments_after_wrappers(body)
+        )
+
+    for tokens in token_groups:
+        tokens = _memory_retrieval_execution_tokens(tokens)
+        if not tokens:
+            continue
+        executable = Path(tokens[0]).name.lower()
+        if executable in MEMORY_RETRIEVAL_HELPERS:
+            return True
+        if executable != "hermes":
+            continue
+
+        hermes_command = _hermes_top_level_command_tokens(tokens)
+        if hermes_command is None or len(hermes_command) < 2:
+            continue
+        group = hermes_command[0].lower()
+        action = hermes_command[1].lower()
+        if group == "lcm":
+            if action in {"grep", "load-session", "describe", "expand", "expand-query"}:
+                return True
+            if len(hermes_command) >= 3 and (action, hermes_command[2].lower()) in {
+                ("load", "session"),
+                ("expand", "query"),
+            }:
+                return True
+        if (
+            (group == "hindsight" and action in {"recall", "reflect"})
+            or (
+                group == "memory"
+                and action
+                in {"search", "recall", "reflect", "get", "read", "show", "list"}
+            )
+            or (group == "session" and action == "search")
+        ):
+            return True
+    return False
+
+
+def _hermes_top_level_command_tokens(tokens: list[str]) -> list[str] | None:
+    """Return the Hermes command after the narrow set of recognized global options."""
+
+    if not tokens or Path(tokens[0]).name.lower() != "hermes":
+        return None
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            index += 1
+            return tokens[index:] or None
+        if token in HERMES_VALUELESS_GLOBAL_OPTIONS:
+            index += 1
+            continue
+        if token in {"--profile", "-p"}:
+            if (
+                index + 1 >= len(tokens)
+                or HERMES_PROFILE_ID_PATTERN.fullmatch(tokens[index + 1]) is None
+            ):
+                return None
+            index += 2
+            continue
+        if token.startswith("--profile="):
+            if (
+                HERMES_PROFILE_ID_PATTERN.fullmatch(token.removeprefix("--profile="))
+                is None
+            ):
+                return None
+            index += 1
+            continue
+        if token.startswith("-p") and token != "-p":
+            if HERMES_PROFILE_ID_PATTERN.fullmatch(token[2:]) is None:
+                return None
+            index += 1
+            continue
+        if token in HERMES_REQUIRED_VALUE_GLOBAL_OPTIONS:
+            if index + 1 >= len(tokens) or tokens[index + 1].startswith("-"):
+                return None
+            index += 2
+            continue
+        long_value_option = next(
+            (
+                option
+                for option in HERMES_REQUIRED_VALUE_GLOBAL_OPTIONS
+                if option.startswith("--") and token.startswith(f"{option}=")
+            ),
+            None,
+        )
+        if long_value_option is not None:
+            if not token.removeprefix(f"{long_value_option}="):
+                return None
+            index += 1
+            continue
+        attached_short_option = next(
+            (
+                option
+                for option in HERMES_ATTACHED_SHORT_VALUE_OPTIONS
+                if token.startswith(option) and token != option
+            ),
+            None,
+        )
+        if attached_short_option is not None:
+            index += 1
+            continue
+        if token in HERMES_OPTIONAL_VALUE_GLOBAL_OPTIONS:
+            index += 1
+            if index < len(tokens) and not tokens[index].startswith("-"):
+                index += 1
+            continue
+        if token.startswith("--continue="):
+            if not token.removeprefix("--continue="):
+                return None
+            index += 1
+            continue
+        if token.startswith("-c") and token != "-c":
+            index += 1
+            continue
+        if token.startswith("-"):
+            return None
+        return tokens[index:]
+    return None
+
+
+def _memory_retrieval_substitutions(command: str) -> list[tuple[str, str]] | None:
+    """Collect executable nested substitutions within a bounded, deduplicated walk."""
+
+    pending = [command]
+    seen: set[str] = set()
+    substitutions: list[tuple[str, str]] = []
+    while pending:
+        current = pending.pop()
+        for kind, body in _command_substitutions(current):
+            if kind == "arithmetic" or body in seen:
+                continue
+            if len(seen) >= _MEMORY_RETRIEVAL_SUBSTITUTION_LIMIT:
+                return None
+            seen.add(body)
+            substitutions.append((kind, body))
+            pending.append(body)
+    return substitutions
+
+
+def _memory_retrieval_redirection(
+    tokens: list[str],
+    index: int,
+) -> tuple[int, bool] | None:
+    """Extend simple redirects with an unquoted here-string for retrieval only."""
+
+    if index < len(tokens):
+        token = tokens[index]
+        if not getattr(token, "redirection_operator_was_quoted", False):
+            match = re.fullmatch(r"[0-9]*<<<(.*)", token)
+            if match is not None:
+                target = match.group(1)
+                if target:
+                    return 1, False
+                if index + 1 >= len(tokens) or _is_unquoted_shell_separator(
+                    tokens[index + 1]
+                ):
+                    return 0, False
+                return 2, False
+    return _simple_shell_redirection(tokens, index)
+
+
+def _memory_retrieval_execution_tokens(tokens: list[str]) -> list[str]:
+    normalized: list[str] = []
+    index = 0
+    while index < len(tokens):
+        redirection = _memory_retrieval_redirection(tokens, index)
+        if redirection is None:
+            normalized.append(tokens[index])
+            index += 1
+            continue
+        consumed, _supplies_stdin = redirection
+        if not consumed:
+            return []
+        index += consumed
+
+    normalized = _strip_command_wrappers(normalized)
+    if not normalized or normalized[0] != "exec":
+        return normalized
+    index = 1
+    while index < len(normalized):
+        token = normalized[index]
+        if token == "--":
+            index += 1
+            break
+        if not token.startswith("-") or token == "-":
+            break
+        cluster = token[1:]
+        argv0_index = cluster.find("a")
+        option_cluster = cluster if argv0_index < 0 else cluster[:argv0_index]
+        if not cluster or any(option not in {"c", "l"} for option in option_cluster):
+            return []
+        if argv0_index >= 0 and not cluster[argv0_index + 1 :]:
+            index += 1
+            if index >= len(normalized):
+                return []
+        index += 1
+    return _strip_command_wrappers(normalized[index:])
+
+
 def _is_pytest_command(command: str) -> bool:
     if _starts_command_name(command, {"pytest", "py.test"}):
         return True
@@ -3972,6 +4246,10 @@ def _command_substitutions(command: str) -> list[tuple[str, str]]:
                     scan += 1
                     continue
                 if current == "\\":
+                    if scan + 1 < len(command) and command[scan + 1] == "`":
+                        body_chars.append("`")
+                        scan += 2
+                        continue
                     body_chars.append(current)
                     inner_escaped = True
                     scan += 1
