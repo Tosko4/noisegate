@@ -580,7 +580,12 @@ def _reduce_text(
     defer_artifact_store: bool = False,
 ) -> ReducedOutput:
     options = options or NoisegateOptions.from_env()
-    command_class = classify_command(command, text, exit_code=exit_code)
+    command_class = _reduction_command_class(
+        command,
+        text,
+        tool_name=tool_name,
+        exit_code=exit_code,
+    )
 
     if not options.enabled or options.mode == "off":
         return _unchanged(text, "disabled", command_class, reason="disabled")
@@ -607,6 +612,13 @@ def _reduce_text(
             "protected_source_search",
             command_class,
             reason="source_search_passthrough",
+        )
+    if command_class == "systemctl_show":
+        return _unchanged(
+            text,
+            "protected_systemctl_show",
+            command_class,
+            reason="systemctl_show_passthrough",
         )
     if not _should_reduce(text, options):
         return _unchanged(text, "below_threshold", command_class, reason="below_threshold")
@@ -846,6 +858,8 @@ def classify_command(command: str | None, text: str, *, exit_code: int | None = 
         exit_code=exit_code,
     ):
         return "source_search"
+    if _is_patch_command(command_s):
+        return "patch"
     if _looks_like_file_read_command(
         command_s,
         sample=sample_l,
@@ -890,6 +904,8 @@ def classify_command(command: str | None, text: str, *, exit_code: int | None = 
         return "python_package"
     if any(_is_python_package_command(variant) for variant in command_variants):
         return "python_package"
+    if any(_is_systemctl_show_command(variant) for variant in command_variants):
+        return "systemctl_show"
     if (
         any(_is_pytest_command(variant) for variant in command_variants)
         or _contains_process_substitution_pytest(command_l)
@@ -903,6 +919,8 @@ def classify_command(command: str | None, text: str, *, exit_code: int | None = 
         return "unittest"
     if any(_is_docker_log_command(variant) for variant in command_variants):
         return "docker_logs"
+    if any(_is_log_stream_command(variant) for variant in command_variants):
+        return "log_stream"
     if any(_is_docker_build_command(variant) for variant in command_variants) or (
         _looks_like_docker_build_output(text_l)
         and any(_can_infer_docker_build_from_output(variant) for variant in command_variants)
@@ -911,6 +929,23 @@ def classify_command(command: str | None, text: str, *, exit_code: int | None = 
     if any(_is_node_command(variant, sample_l) for variant in command_variants):
         return "node"
     return "generic"
+
+
+def _reduction_command_class(
+    command: str | None,
+    text: str,
+    *,
+    tool_name: str | None,
+    exit_code: int | None = None,
+) -> str:
+    command_class = classify_command(command, text, exit_code=exit_code)
+    if (
+        tool_name == "process"
+        and command_class == "generic"
+        and _first_pattern_match(text, LOG_STREAM_PATTERNS)
+    ):
+        return "log_stream"
+    return command_class
 
 
 def _compactable_command_output_class(command: str, text: str) -> str | None:
@@ -1013,8 +1048,9 @@ def _preserve_patterns_for_output(
             DOCKER_BUILD_PRESERVATION_PATTERNS,
             DOCKER_BUILD_HIGH_SIGNAL_PRIORITY_PATTERNS,
         )
-    elif command_class == "docker_logs":
-        preserve_patterns = _preservation_patterns(text, DOCKER_LOG_PATTERNS)
+    elif command_class in {"docker_logs", "log_stream"}:
+        patterns = DOCKER_LOG_PATTERNS if command_class == "docker_logs" else LOG_STREAM_PATTERNS
+        preserve_patterns = _preservation_patterns(text, patterns)
     elif command_class == "generic" and _first_pattern_match(text, CRITICAL_PATTERNS):
         preserve_patterns = _preservation_patterns(text, CRITICAL_PATTERNS)
 
@@ -1089,6 +1125,13 @@ def _apply_reducer(
         )
     if command_class == "docker_logs":
         return "docker_logs", _important_lines(
+            text,
+            options,
+            reducer_patterns + lcm_patterns,
+            exit_code=exit_code,
+        )
+    if command_class == "log_stream":
+        return "log_stream", _important_lines(
             text,
             options,
             reducer_patterns + lcm_patterns,
@@ -1224,8 +1267,17 @@ DOCKER_LOG_PATTERNS = tuple(
         r"traceback|exception|fatal|critical|panic|segmentation fault|segfault",
         r"valueerror|typeerror|referenceerror|runtimeerror|assertionerror",
         r"\b[a-z_]+(?:error|exception)\b(?=:|$)",
-        r"unable to|denied|not found|permission denied",
+        r"unable to|denied|refused|timed?\s*out|timeout|unreachable|not found|permission denied",
     )
+)
+
+LOG_STREAM_PATTERNS = (
+    *DOCKER_LOG_PATTERNS,
+    re.compile(
+        r"npm err!|pnpm err!|yarn.*error|err_pnpm|elifecycle|"
+        r"\bwarn(?:ing)?\b|exit code\s+\d+|exited with",
+        re.IGNORECASE,
+    ),
 )
 
 HIGH_SIGNAL_PATTERNS = tuple(
@@ -1269,6 +1321,9 @@ HIGH_SIGNAL_PRIORITY_PATTERNS = tuple(
         (
             r"fatal|critical|panic|segmentation fault|segfault",
             r"permission denied|access denied",
+        ),
+        (
+            r"\b(?:refused|timed?\s*out|timeout|unreachable)\b",
         ),
         (
             r"denied|not found",
@@ -1364,6 +1419,7 @@ REDUCER_ANCHOR_PATTERNS_BY_COMMAND_CLASS = {
     "node": NODE_PRESERVATION_PATTERNS,
     "docker_build": DOCKER_BUILD_PRESERVATION_PATTERNS,
     "docker_logs": DOCKER_LOG_PATTERNS,
+    "log_stream": LOG_STREAM_PATTERNS,
     "git_status": GIT_STATUS_PATTERNS,
 }
 
@@ -2763,6 +2819,8 @@ def _store_artifact(text: str, options: NoisegateOptions) -> dict[str, JsonValue
 def _concrete_failure_excerpt_for_notices(
     text: str,
     options: NoisegateOptions,
+    *,
+    preserve_patterns: tuple[re.Pattern[str], ...] | None = None,
 ) -> str | None:
     lines = text.splitlines()
     if options.max_lines < 2:
@@ -2798,6 +2856,8 @@ def _concrete_failure_excerpt_for_notices(
         return None
 
     rich_keep: set[int] = set()
+    if preserve_patterns is not None:
+        rich_keep.update(_ranked_diagnostic_line_indices(text, preserve_patterns)[:2])
     for index in concrete_indices[:2]:
         if index > 0 and re.search(
             r"\btraceback\b|\bunhandled\s+exception\b|Externalized tool output",
@@ -3452,6 +3512,7 @@ def _append_recovery_notices(
     reserved_tight_excerpt = _concrete_failure_excerpt_for_notices(
         text,
         reserved_options,
+        preserve_patterns=preserve_patterns,
     )
     if reserved_tight_excerpt is None and reserved_options.max_lines < 2 and re.search(
         r"\bunhandled\s+exception\b",
@@ -4120,6 +4181,7 @@ def _proven_reachable_substitution_tokens(body: str) -> list[list[str]] | None:
 
 
 def _process_substitution_compactable_class(command: str, sample: str, text: str) -> str | None:
+    fallback_class: str | None = None
     for kind, body in _command_substitutions(command):
         token_groups = (
             _proven_reachable_substitution_tokens(body) if kind == "command" else None
@@ -4127,7 +4189,9 @@ def _process_substitution_compactable_class(command: str, sample: str, text: str
         if token_groups is None:
             nested_class = _process_substitution_compactable_class(body, sample, text)
             if nested_class is not None:
-                return nested_class
+                if nested_class != "log_stream":
+                    return nested_class
+                fallback_class = nested_class
             token_groups = [_shell_tokens(body)]
             token_groups.extend(
                 tokens
@@ -4137,11 +4201,15 @@ def _process_substitution_compactable_class(command: str, sample: str, text: str
         for tokens in token_groups:
             command_class = _compactable_output_class_for_tokens(tokens, sample, text)
             if command_class is not None:
-                return command_class
+                if command_class != "log_stream":
+                    return command_class
+                fallback_class = command_class
             command_class = _compactable_class_for_tokens(tokens, sample, text)
             if command_class is not None:
-                return command_class
-    return None
+                if command_class != "log_stream":
+                    return command_class
+                fallback_class = command_class
+    return fallback_class
 
 
 def _substitutions_are_ordinary(command: str) -> bool:
@@ -5037,6 +5105,160 @@ def _is_apt_command(command: str) -> bool:
     return False
 
 
+def _is_patch_command(command: str) -> bool:
+    return any(
+        tokens and Path(tokens[0]).name in {"apply_patch", "patch"}
+        for tokens in _command_segments_after_wrappers(command)
+    )
+
+
+def _tail_follows(tokens: list[str]) -> bool:
+    for token in tokens:
+        if token == "--":
+            return False
+        if token == "--follow" or token.startswith("--follow="):
+            return True
+        if token.startswith("-") and not token.startswith("--") and "f" in token[1:].lower():
+            return True
+    return False
+
+
+def _tail_operand_tokens(tokens: list[str]) -> list[str] | None:
+    value_options = {
+        "-c",
+        "--bytes",
+        "-n",
+        "--lines",
+        "--max-unchanged-stats",
+        "--pid",
+        "-s",
+        "--sleep-interval",
+    }
+    flag_options = {"-f", "-F", "-q", "-v", "-z", "--follow", "--retry", "--zero-terminated"}
+    operands: list[str] = []
+    index = 0
+    options_done = False
+    while index < len(tokens):
+        token = tokens[index]
+        if _is_unquoted_shell_separator(token):
+            return None
+        redirection = _simple_shell_redirection(tokens, index)
+        if redirection is not None:
+            consumed, _ = redirection
+            if not consumed:
+                return None
+            index += consumed
+            continue
+        if options_done or not token.startswith("-") or token == "-":
+            operands.append(token)
+            index += 1
+            continue
+        if token == "--":
+            options_done = True
+            index += 1
+            continue
+        option, separator, value = token.partition("=")
+        if option in value_options and separator:
+            if not value:
+                return None
+            index += 1
+            continue
+        if token in value_options:
+            if index + 1 >= len(tokens) or not tokens[index + 1]:
+                return None
+            index += 2
+            continue
+        if token in flag_options or (token.startswith("--follow=") and token != "--follow="):
+            index += 1
+            continue
+        if token.startswith("--"):
+            return None
+        position = 1
+        consumes_next = False
+        while position < len(token):
+            short_option = token[position]
+            if short_option in {"f", "F", "q", "v", "z"}:
+                position += 1
+                continue
+            if short_option in {"c", "n", "s"}:
+                consumes_next = position + 1 == len(token)
+                break
+            return None
+        if consumes_next:
+            if index + 1 >= len(tokens) or not tokens[index + 1]:
+                return None
+            index += 2
+        else:
+            index += 1
+    return operands
+
+
+def _tail_follow_targets_are_log_like(tokens: list[str]) -> bool:
+    operands = _tail_operand_tokens(tokens)
+    if operands is None:
+        return False
+    if not operands:
+        return True
+    known_log_names = {"syslog", "messages"}
+    known_log_suffixes = {".err", ".log", ".out"}
+    for operand in operands:
+        if operand == "-":
+            continue
+        normalized = operand.replace("\\", "/").lower()
+        path = Path(normalized)
+        if (
+            normalized.startswith("/var/log/")
+            or "/var/log/" in normalized
+            or path.name in known_log_names
+            or path.suffix in known_log_suffixes
+        ):
+            continue
+        return False
+    return True
+
+
+def _is_systemctl_show_command(command: str) -> bool:
+    for tokens in _command_segments_after_wrappers(command):
+        if not tokens or Path(tokens[0]).name.lower() != "systemctl":
+            continue
+        action = _skip_option_tokens(tokens[1:])
+        if action and action[0].lower() == "show":
+            return True
+    return False
+
+
+def _is_log_stream_command(command: str) -> bool:
+    if any(
+        token in {"|", "|&"} and not getattr(token, "was_quoted", False)
+        for token in _shell_tokens(command)
+    ):
+        return False
+    for tokens in _command_segments_after_wrappers(command):
+        if not tokens:
+            continue
+        command_name = Path(tokens[0]).name.lower()
+        rest = tokens[1:]
+        if command_name == "process":
+            action = _skip_option_tokens(rest)
+            if action and action[0].lower() in {"log", "poll", "wait"}:
+                return True
+            continue
+        if command_name in {"dmesg", "journalctl"}:
+            return True
+        if command_name == "systemctl":
+            action = _skip_option_tokens(rest)
+            if action and action[0].lower() == "status":
+                return True
+            continue
+        if (
+            command_name == "tail"
+            and _tail_follows(rest)
+            and _tail_follow_targets_are_log_like(rest)
+        ):
+            return True
+    return False
+
+
 def _is_docker_build_command(command: str) -> bool:
     for tokens in _command_segments_after_wrappers(command):
         if not tokens or Path(tokens[0]).name != "docker":
@@ -5079,6 +5301,11 @@ def _is_docker_log_command(command: str) -> bool:
         if rest[0] == "container":
             container_rest = _skip_option_tokens(rest[1:])
             if container_rest and container_rest[0] == "logs":
+                return True
+            continue
+        if rest[0] == "service":
+            service_rest = _skip_option_tokens(rest[1:])
+            if service_rest and service_rest[0] == "logs":
                 return True
             continue
         if rest[0] == "compose":
@@ -6801,6 +7028,8 @@ def _compactable_class_for_tokens(
         return "unittest"
     if any(_is_docker_log_command(variant) for variant in command_variants):
         return "docker_logs"
+    if any(_is_log_stream_command(variant) for variant in command_variants):
+        return "log_stream"
     if any(_is_docker_build_command(variant) for variant in command_variants) or (
         _looks_like_docker_build_output(text)
         and any(_can_infer_docker_build_from_output(variant) for variant in command_variants)
@@ -6848,8 +7077,9 @@ def _compactable_output_class_for_tokens(
         ) or _looks_like_docker_build_output(output):
             return command_class
         return None
-    if command_class == "docker_logs":
-        if _first_pattern_match(output, DOCKER_LOG_PATTERNS) or _first_pattern_match(
+    if command_class in {"docker_logs", "log_stream"}:
+        patterns = DOCKER_LOG_PATTERNS if command_class == "docker_logs" else LOG_STREAM_PATTERNS
+        if _first_pattern_match(output, patterns) or _first_pattern_match(
             output,
             CRITICAL_PATTERNS,
         ):
@@ -8101,6 +8331,8 @@ def _tokens_start_file_read(tokens: list[str]) -> bool:
         return _looks_like_sed_file_read_tokens(tokens)
     if token_name in {"jq", "yq"}:
         return _looks_like_jq_file_read_tokens(tokens)
+    if token_name == "tail" and _tail_follows(tokens[1:]):
+        return not _tail_follow_targets_are_log_like(tokens[1:])
     return token_name in SOURCE_READ_COMMANDS
 
 
@@ -8254,6 +8486,8 @@ def _tokens_start_compactable_command(tokens: list[str]) -> bool:
     tokens = _strip_command_wrappers(tokens)
     if not tokens:
         return False
+    if _is_log_stream_command(shlex.join(tokens)):
+        return True
     runner_tokens = _command_runner_payload(tokens)
     if runner_tokens is not None:
         return _tokens_start_compactable_command(runner_tokens)
@@ -8479,6 +8713,63 @@ def _strip_leading_redirections(tokens: list[str]) -> list[str]:
     return tokens[index:]
 
 
+def _is_gnu_timeout_duration(value: str) -> bool:
+    return bool(re.fullmatch(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[smhd])?", value, re.IGNORECASE))
+
+
+def _timeout_short_option_span(tokens: list[str], index: int) -> int:
+    token = tokens[index]
+    if not token.startswith("-") or token.startswith("--") or len(token) < 3:
+        return 0
+    position = 1
+    while position < len(token):
+        option = token[position]
+        if option == "v":
+            position += 1
+            continue
+        if option in {"k", "s"}:
+            if position + 1 < len(token):
+                return 1
+            return 2 if index + 1 < len(tokens) and tokens[index + 1] else 0
+        return 0
+    return 1
+
+
+def _timeout_child_tokens(tokens: list[str]) -> list[str]:
+    index = 0
+    value_options = {"-k", "--kill-after", "-s", "--signal"}
+    flag_options = {"-v", "--foreground", "--preserve-status", "--verbose"}
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            index += 1
+            break
+        if token in flag_options:
+            index += 1
+            continue
+        option, separator, value = token.partition("=")
+        if option in value_options and separator:
+            if not value:
+                return []
+            index += 1
+            continue
+        if token in value_options:
+            if index + 1 >= len(tokens) or not tokens[index + 1]:
+                return []
+            index += 2
+            continue
+        short_option_span = _timeout_short_option_span(tokens, index)
+        if short_option_span:
+            index += short_option_span
+            continue
+        if token.startswith("-"):
+            return []
+        break
+    if index >= len(tokens) or not _is_gnu_timeout_duration(tokens[index]):
+        return []
+    return tokens[index + 1 :]
+
+
 def _strip_command_wrappers(tokens: list[str]) -> list[str]:
     tokens = _strip_assignment_tokens(_strip_grouping_tokens(tokens))
     while tokens:
@@ -8492,6 +8783,9 @@ def _strip_command_wrappers(tokens: list[str]) -> list[str]:
             continue
         if command_name == "env":
             tokens = _strip_env_assignment_tokens(_skip_env_options(tokens[1:]))
+            continue
+        if command_name == "timeout":
+            tokens = _timeout_child_tokens(tokens[1:])
             continue
         if command_name in {"time", "gtime", "command"}:
             tokens = _strip_assignment_tokens(

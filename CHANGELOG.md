@@ -13,6 +13,10 @@ All notable changes to Noisegate are documented here. Release notes are generate
 - Generic `tool_call` wrappers now use the wrapped tool name when it is unambiguous, allowing wrapped terminal noise to compact while wrapped MCP/source tools and ambiguous ownership stay exact.
 - Secret/header-looking raw output is refused for artifact storage even when artifact mode is enabled.
 
+### Fixed
+
+- Hermes background `process` poll/log/wait payloads now preserve process metadata while safely compacting command- or content-identified Docker, journalctl, `systemctl status`, dmesg, and follow-mode tail streams from known log targets; commandless non-diagnostic previews, followed source/config files, `systemctl show` properties, source, diff, and patch payloads remain exact.
+
 ## [0.2.0] - 2026-07-14
 
 Noisegate 0.2.0 is a safety and signal-quality release. Compacted output keeps more of the details that help an agent recover from a failure, while source, patches, retrieval results, and other exact evidence are handled more conservatively. The goal is not simply shorter output; it is smaller output that remains trustworthy.

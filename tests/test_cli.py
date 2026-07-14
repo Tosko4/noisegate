@@ -285,18 +285,25 @@ def test_reduce_json_nested_and_direct_results_prefer_actionable_exit_hint() -> 
     )
 
     for exit_hints, expected_notice in hint_cases:
-        nested = {**exit_hints, "output": numbered("nested", 100)}
+        nested = {**exit_hints, "output": numbered("ERROR nested", 100)}
         payloads = (
-            {"tool_name": "process", "result": nested, "noisegate": {"max_chars": 120}},
             {
                 "tool_name": "process",
+                "args": {"action": "wait"},
+                "result": nested,
+                "noisegate": {"max_chars": 120},
+            },
+            {
+                "tool_name": "process",
+                "args": {"action": "wait"},
                 "result": json.dumps(nested),
                 "noisegate": {"max_chars": 120},
             },
             {
                 "tool_name": "process",
+                "args": {"action": "wait"},
                 **exit_hints,
-                "output": numbered("direct", 100),
+                "output": numbered("ERROR direct", 100),
                 "noisegate": {"max_chars": 120},
             },
         )
@@ -370,8 +377,9 @@ def test_reduce_json_rewrites_result_dict_payload() -> None:
 def test_reduce_json_nested_result_object_uses_envelope_status() -> None:
     payload = {
         "tool_name": "process",
+        "args": {"action": "wait"},
         "status": "failed",
-        "result": {"output": numbered("inner", 100)},
+        "result": {"output": numbered("ERROR inner", 100)},
         "noisegate": {"max_chars": 120},
     }
     proc = run_cli("reduce-json", input_text=json.dumps(payload))
@@ -385,9 +393,10 @@ def test_reduce_json_nested_result_object_uses_envelope_status() -> None:
 
 
 def test_reduce_json_nested_json_string_uses_envelope_status() -> None:
-    nested = {"output": numbered("inner", 100)}
+    nested = {"output": numbered("ERROR inner", 100)}
     payload = {
         "tool_name": "process",
+        "args": {"action": "wait"},
         "status": "failed",
         "result": json.dumps(nested),
         "noisegate": {"max_chars": 120},
@@ -406,9 +415,10 @@ def test_reduce_json_nested_json_string_uses_envelope_status() -> None:
 def test_reduce_json_nested_result_object_prefers_envelope_failed_status_over_exit_zero() -> None:
     payload = {
         "tool_name": "process",
+        "args": {"action": "wait"},
         "status": "failed",
         "exit_code": 0,
-        "result": {"output": numbered("inner", 100)},
+        "result": {"output": numbered("ERROR inner", 100)},
         "noisegate": {"max_chars": 120},
     }
     proc = run_cli("reduce-json", input_text=json.dumps(payload))
@@ -425,9 +435,10 @@ def test_reduce_json_nested_result_object_prefers_envelope_failed_status_over_ex
 def test_reduce_json_nested_result_object_prefers_nonzero_envelope_exit_over_status() -> None:
     payload = {
         "tool_name": "process",
+        "args": {"action": "wait"},
         "status": "failed",
         "returncode": 7,
-        "result": {"output": numbered("inner", 100)},
+        "result": {"output": numbered("ERROR inner", 100)},
         "noisegate": {"max_chars": 120},
     }
     proc = run_cli("reduce-json", input_text=json.dumps(payload))
@@ -444,8 +455,9 @@ def test_reduce_json_nested_result_object_prefers_nonzero_envelope_exit_over_sta
 def test_reduce_json_nested_result_object_keeps_nested_status_over_envelope_exit_code() -> None:
     payload = {
         "tool_name": "process",
+        "args": {"action": "wait"},
         "exit_code": 0,
-        "result": {"status": "failed", "output": numbered("inner", 100)},
+        "result": {"status": "failed", "output": numbered("ERROR inner", 100)},
         "noisegate": {"max_chars": 120},
     }
     proc = run_cli("reduce-json", input_text=json.dumps(payload))
@@ -459,9 +471,10 @@ def test_reduce_json_nested_result_object_keeps_nested_status_over_envelope_exit
 
 
 def test_reduce_json_nested_json_string_keeps_nested_status_over_envelope_exit_code() -> None:
-    nested = {"status": "failed", "output": numbered("inner", 100)}
+    nested = {"status": "failed", "output": numbered("ERROR inner", 100)}
     payload = {
         "tool_name": "process",
+        "args": {"action": "wait"},
         "exit_code": 0,
         "result": json.dumps(nested),
         "noisegate": {"max_chars": 120},
