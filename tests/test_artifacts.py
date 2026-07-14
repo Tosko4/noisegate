@@ -221,6 +221,13 @@ def test_reduce_text_scans_full_artifact_for_late_secret(tmp_path: Path) -> None
         "Authoriz\x00ation: Basic not-a-real-value",
         "\x1b[31mordinary colored output\x1b[0m",
         "\x1b]52;c;bm90LWEtcmVhbC12YWx1ZQ==\x07",
+        '<input type="password" value="not-a-real-value">',
+        '<input value="not-a-real-value" type=password>',
+        'Content-Disposition: form-data; name="password"\r\n\r\nnot-a-real-value',
+        'Content-Disposition: form-data; name=client_secret\r\n\r\nnot-a-real-value',
+        'Content-Disposition: form-data; name="user[password]"\r\n\r\nnot-a-real-value',
+        '<input name="client_secret" value="not-a-real-value">',
+        '<input value="not-a-real-value" name=refresh_token>',
     ],
 )
 def test_reduce_text_refuses_additional_secret_artifact_shapes(

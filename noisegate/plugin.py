@@ -32,13 +32,15 @@ from .engine import (
     _store_artifact,
     classify_command,
 )
-from .json_utils import strict_json_loads
+from .json_utils import DuplicateJSONKeyError, strict_json_loads
 
 HookCallback: TypeAlias = Callable[..., str | None]
 
 TERMINAL_TOOL_NAMES = frozenset({"terminal", "process", "read_terminal"})
 WRAPPER_TOOL_NAMES = frozenset({"tool_call"})
 MAX_WRAPPER_JSON_CHARS = 65_536
+MAX_NESTED_JSON_DEPTH = 8
+MAX_NESTED_JSON_NODES = 512
 TERMINAL_TEXT_FIELDS = ("stdout", "stderr", "output")
 ALWAYS_PROTECTED_COMMAND_CLASSES = frozenset({"file_read", "source_search", "patch"})
 CONDITIONALLY_PROTECTED_COMMAND_CLASSES = frozenset({"git_diff"})
@@ -406,6 +408,8 @@ def _transform_tool_result_with_budget(
         for field in fields:
             value = payload.get(field)
             if not isinstance(value, str):
+                continue
+            if _nested_json_text_requires_exact(value):
                 continue
             reduced = _reduce_text_in_operation(
                 value,
@@ -860,6 +864,88 @@ def _transform_terminal_output_with_budget(
 def _candidate_fields(tool_name: str, payload: Mapping[str, JsonValue]) -> tuple[str, ...]:
     candidates = TERMINAL_TEXT_FIELDS if tool_name in TERMINAL_TOOL_NAMES else GENERIC_TEXT_FIELDS
     return tuple(field for field in candidates if field in payload)
+
+
+def _nested_json_text_requires_exact(value: str) -> bool:
+    """Validate JSON-encoded text recursively and keep the complete field exact."""
+
+    remaining = MAX_NESTED_JSON_NODES
+
+    def looks_structural(text: str) -> bool:
+        sample = text if len(text) <= MAX_WRAPPER_JSON_CHARS else text[:256]
+        stripped = sample.lstrip()
+        if not stripped:
+            return len(sample) < len(text)
+        if stripped.startswith('"'):
+            return True
+        tail = stripped[1:].lstrip()
+        if stripped.startswith("{"):
+            return not tail or tail.startswith(('"', "}"))
+        if stripped.startswith("["):
+            return (
+                not tail
+                or tail.startswith(('"', "{", "[", "]", "-"))
+                or tail[:1].isdigit()
+                or tail.startswith(("true", "false", "null"))
+            )
+        if stripped.rstrip() in {"true", "false", "null"}:
+            return True
+        return stripped.startswith("-") or stripped[:1].isdigit()
+
+    def looks_nested_json_candidate(text: str) -> bool:
+        sample = text if len(text) <= MAX_WRAPPER_JSON_CHARS else text[:256]
+        stripped = sample.lstrip()
+        return (
+            looks_structural(text)
+            or stripped.startswith(("{", "["))
+            or stripped.rstrip() in {"NaN", "Infinity", "-Infinity"}
+        )
+
+    def inspect(node: Any, depth: int) -> None:
+        nonlocal remaining
+        if depth > MAX_NESTED_JSON_DEPTH or remaining <= 0:
+            raise ValueError("nested JSON validation budget exhausted")
+        remaining -= 1
+        if isinstance(node, Mapping):
+            for child in node.values():
+                inspect(child, depth + 1)
+            return
+        if isinstance(node, list):
+            for child in node:
+                inspect(child, depth + 1)
+            return
+        if not isinstance(node, str):
+            return
+        json_like = looks_nested_json_candidate(node)
+        if len(node) > MAX_WRAPPER_JSON_CHARS:
+            if json_like:
+                raise ValueError("nested JSON text exceeds size limit")
+            return
+        if not json_like:
+            return
+        try:
+            decoded = strict_json_loads(node)
+        except DuplicateJSONKeyError:
+            raise
+        except json.JSONDecodeError as exc:
+            raise ValueError("malformed nested JSON text") from exc
+        inspect(decoded, depth + 1)
+
+    json_like = looks_structural(value)
+    if len(value) > MAX_WRAPPER_JSON_CHARS:
+        if json_like:
+            raise ValueError("nested JSON text exceeds size limit")
+        return False
+    if not json_like:
+        return False
+    try:
+        decoded = strict_json_loads(value)
+    except DuplicateJSONKeyError:
+        raise
+    except json.JSONDecodeError:
+        return False
+    inspect(decoded, 0)
+    return True
 
 
 @dataclass(frozen=True, slots=True)

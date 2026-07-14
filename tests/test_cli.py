@@ -1223,6 +1223,91 @@ def test_reduce_json_tool_call_preserves_mcp_plain_result() -> None:
     assert json.loads(proc.stdout) == envelope
 
 
+def test_reduce_json_tool_call_preserves_json_encoded_mcp_result() -> None:
+    nested = json.dumps(
+        {"tool_name": "mcp_github_get_file", "content": numbered("source", 100)}
+    )
+    envelope = {
+        "tool_name": "tool_call",
+        "args": {"name": "browser_console", "arguments": {}},
+        "result": nested,
+        "logs": numbered("browser noise", 100),
+        "noisegate": {"max_chars": 600},
+    }
+    raw = json.dumps(envelope)
+
+    proc = run_cli("reduce-json", input_text=raw)
+
+    assert proc.returncode == 0, proc.stderr
+    outer = json.loads(proc.stdout)
+    assert outer["result"] == nested
+    assert json.loads(outer["result"])["tool_name"].startswith("mcp_")
+    assert "[noisegate: omitted" in outer["logs"]
+
+
+def test_reduce_json_tool_call_preserves_generic_json_result_with_noisy_sibling() -> None:
+    nested = json.dumps({"items": [f"value {index:03d}" for index in range(100)]})
+    envelope = {
+        "tool_name": "tool_call",
+        "args": {"name": "browser_console", "arguments": {}},
+        "result": nested,
+        "logs": numbered("browser noise", 100),
+        "noisegate": {"max_chars": 600},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+    assert proc.returncode == 0, proc.stderr
+    outer = json.loads(proc.stdout)
+    assert outer["result"] == nested
+    assert "[noisegate: omitted" in outer["logs"]
+
+
+def test_reduce_json_tool_call_preserves_scalar_json_results() -> None:
+    for nested in ("null   ", "false\n", "123.5e-2\t"):
+        envelope = {
+            "tool_name": "tool_call",
+            "args": {"name": "browser_console", "arguments": {}},
+            "result": nested,
+            "logs": numbered("browser noise", 100),
+            "noisegate": {"max_chars": 600},
+        }
+
+        proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+        assert proc.returncode == 0, proc.stderr
+        outer = json.loads(proc.stdout)
+        assert outer["result"] == nested
+        assert "[noisegate: omitted" in outer["logs"]
+
+
+def test_reduce_json_tool_call_rejects_invalid_deep_json_result() -> None:
+    duplicate = (
+        '{"tool_name":"mcp_github_get_file",'
+        '"tool_name":"browser_console",'
+        f'"content":{json.dumps(numbered("source", 100))}}}'
+    )
+    malformed = json.dumps('{"tool_name":"mcp_github_get_file"')
+    nonstandard = tuple(
+        json.dumps(value)
+        for value in ("NaN", "Infinity", "{foo: 1}", "['x']", "[undefined]")
+    )
+    for result in (json.dumps(duplicate), malformed, *nonstandard):
+        envelope = {
+            "tool_name": "tool_call",
+            "args": {"name": "browser_console", "arguments": {}},
+            "result": result,
+            "logs": numbered("browser noise", 100),
+            "noisegate": {"max_chars": 600},
+        }
+        raw = json.dumps(envelope)
+
+        proc = run_cli("reduce-json", input_text=raw)
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == raw
+
+
 def test_reduce_json_tool_call_preserves_unwrapped_exact_command() -> None:
     envelope = {
         "tool_name": "tool_call",

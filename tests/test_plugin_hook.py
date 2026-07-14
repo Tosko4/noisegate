@@ -571,6 +571,78 @@ def test_tool_call_wrapper_rejects_duplicate_result_keys() -> None:
     )
 
 
+def test_tool_call_wrapper_preserves_json_encoded_result_fields() -> None:
+    nested = json.dumps(
+        {"tool_name": "mcp_github_get_file", "content": numbered("source", 180)}
+    )
+    raw = json.dumps({"result": nested, "logs": numbered("browser noise", 180)})
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="tool_call",
+        args={"name": "browser_console", "arguments": {}},
+        noisegate_max_chars=600,
+    )
+
+    assert transformed is not None
+    payload = json.loads(transformed)
+    assert payload["result"] == nested
+    assert json.loads(payload["result"])["tool_name"] == "mcp_github_get_file"
+    assert "[noisegate: omitted" in payload["logs"]
+
+
+def test_tool_call_wrapper_preserves_scalar_json_result_fields() -> None:
+    for nested in ("null   ", "true\n", "-12.5e3\t"):
+        raw = json.dumps({"result": nested, "logs": numbered("browser noise", 180)})
+
+        transformed = transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={"name": "browser_console", "arguments": {}},
+            noisegate_max_chars=600,
+        )
+
+        assert transformed is not None
+        payload = json.loads(transformed)
+        assert payload["result"] == nested
+        assert "[noisegate: omitted" in payload["logs"]
+
+
+def test_nested_json_detection_bounds_oversized_text_before_parsing() -> None:
+    assert plugin._nested_json_text_requires_exact("plain " * 20_000) is False
+    try:
+        plugin._nested_json_text_requires_exact(" " * 70_000 + '{"value": 1}')
+    except ValueError as exc:
+        assert "size limit" in str(exc)
+    else:
+        raise AssertionError("oversized JSON-like text should fail closed")
+
+
+def test_tool_call_wrapper_rejects_duplicate_keys_in_nested_json_strings() -> None:
+    duplicate = (
+        '{"tool_name":"mcp_github_get_file",'
+        '"tool_name":"browser_console",'
+        f'"content":{json.dumps(numbered("source", 180))}}}'
+    )
+
+    malformed = json.dumps('{"tool_name":"mcp_github_get_file"')
+    nonstandard = tuple(
+        json.dumps(value)
+        for value in ("NaN", "Infinity", "{foo: 1}", "['x']", "[undefined]")
+    )
+    for nested in (duplicate, json.dumps(duplicate), malformed, *nonstandard):
+        raw = json.dumps({"result": nested, "logs": numbered("browser noise", 180)})
+        assert (
+            transform_tool_result(
+                raw,
+                tool_name="tool_call",
+                args={"name": "browser_console", "arguments": {}},
+                noisegate_max_chars=600,
+            )
+            is None
+        )
+
+
 def test_tool_call_wrapper_rejects_protected_embedded_result_identity() -> None:
     raw = json.dumps(
         {

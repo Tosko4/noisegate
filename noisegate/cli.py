@@ -37,6 +37,7 @@ from .plugin import (
     _command_sources_from_payload,
     _commands_from_source,
     _extract_exit_code,
+    _nested_json_text_requires_exact,
     _resolve_wrapped_call,
     _select_command,
     _store_artifact_preview_plan,
@@ -522,15 +523,20 @@ def _reduce_json_value_with_budget(
             return raw
     if isinstance(parsed, dict) and "result" in parsed:
         result_value = parsed["result"]
+        json_encoded_result = False
         if isinstance(result_value, str):
             try:
-                strict_json_loads(result_value)
-            except DuplicateJSONKeyError:
+                json_encoded_result = _nested_json_text_requires_exact(result_value)
+            except (DuplicateJSONKeyError, json.JSONDecodeError, ValueError, RecursionError):
                 return raw
-            except json.JSONDecodeError:
-                pass
         nested_tool_name = _embedded_result_tool_name(result_value)
-        if nested_tool_name and tool_name and nested_tool_name != tool_name:
+        preserve_wrapped_json_result = resolved_wrapper_identity and json_encoded_result
+        if (
+            nested_tool_name
+            and tool_name
+            and nested_tool_name != tool_name
+            and not preserve_wrapped_json_result
+        ):
             return raw
         nested_transform_tool_name = tool_name
         transformed: str | None = None
@@ -540,7 +546,7 @@ def _reduce_json_value_with_budget(
         local_result_plans: list[_ArtifactPreviewPlan] = []
         result_metadata: dict[str, Any] = {}
 
-        if isinstance(result_value, str):
+        if isinstance(result_value, str) and not preserve_wrapped_json_result:
             result_input, injected_exit_keys = _result_transform_input(result_value, parsed)
             result_call_args = _merge_wrapper_and_result_call_args(
                 call_args,

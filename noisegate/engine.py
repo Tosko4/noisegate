@@ -66,6 +66,8 @@ SECRET_ARTIFACT_PATTERNS = tuple(
         r"^[ \t]*(?:(?:>[ \t]*)|(?:[-+*][ \t]+)|(?:\d+[.)][ \t]+))*"
         r"[\"']?-{5}BEGIN "
         r"(?:(?:[A-Z0-9]+ )*PRIVATE KEY|PGP PRIVATE KEY BLOCK)-{5}[\"']?[ \t]*\r?$",
+        r"\btype\s*=\s*[\"']?password[\"']?(?=[\s/>]|$)",
+        r"\bname\s*=\s*[\"']?(?:[A-Za-z0-9_.-]+\[)?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|token|secret|password|passwd|private[_-]?key|client[_-]?secret|credentials?|session(?:id)?)(?:\])?[\"']?(?=[\s;/>]|$)",
         r"\bbearer\s+[A-Za-z0-9._~+/=-]{12,}",
         r"(?:^|\s)--?(?:api[_-]?key|access[_-]?token|token|secret|password|passwd|private[_-]?key|client[_-]?secret|credentials?|authorization|cookie)\s+\S+",
         r"\b(?:password|passwd|authorization|cookie)\s+\S+",
