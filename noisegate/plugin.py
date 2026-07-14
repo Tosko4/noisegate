@@ -412,7 +412,7 @@ def _transform_tool_result_with_budget(
             ):
                 return None
             candidate = json.dumps(text, ensure_ascii=False)
-            if len(candidate) >= len(result):
+            if len(candidate) >= len(result) or not is_utf8_encodable(candidate):
                 return None
             if options.artifact_enabled and not defer_artifact_store:
                 artifact = metadata.get("artifact")
@@ -652,7 +652,7 @@ def _transform_tool_result_with_budget(
             separators=(",", ":"),
             allow_nan=False,
         )
-        if len(candidate) >= len(result):
+        if len(candidate) >= len(result) or not is_utf8_encodable(candidate):
             return None
 
         if options.artifact_enabled and not defer_artifact_store:
@@ -1109,7 +1109,7 @@ def _transform_write_diagnostic_fields(
             extra_preserve_patterns=DIAGNOSTIC_LOCATION_PATTERNS,
         )
         if not reduced.changed:
-            continue
+            return None
         metadata = dict(reduced.metadata)
         metadata["tool_name"] = tool_name
         if not _valid_transformed_text(

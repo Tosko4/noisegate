@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -750,6 +751,84 @@ def test_write_diagnostics_keep_scoped_priority_in_tight_character_fallback() ->
     assert "ERROR: wrapper failed" not in payload["mypy"]
 
 
+def test_write_diagnostics_keep_scoped_priority_after_upstream_omission_remap() -> None:
+    location = "src/a.py:42:17: error: Undefined name `value` [name-defined]"
+    frame = "42 | result = value + 1"
+    caret = "   |          ^^^^^"
+    refs = ("externalized_ref=lcm_a", "externalized_ref=lcm_b")
+    diagnostic = "\n".join(
+        [
+            *(f"ERROR ValueError: generic wrapper noise {index:02d}" for index in range(8)),
+            "[noisegate: omitted 20 lines]",
+            *refs,
+            *(
+                f"ERROR ValueError: generic wrapper noise {index:02d}"
+                for index in range(8, 16)
+            ),
+            location,
+            frame,
+            caret,
+            *(f"checking trailing module {index:02d}" for index in range(8)),
+        ]
+    )
+    complete_excerpt = "\n".join(
+        [
+            "[noisegate: omitted 28 lines]",
+            *refs,
+            "[noisegate: omitted 8 lines]",
+            location,
+            frame,
+            caret,
+            "[noisegate: omitted 8 lines]",
+        ]
+    )
+    assert len(complete_excerpt) <= 250
+
+    transformed = transform_tool_result(
+        json.dumps({"mypy": diagnostic, "source": "exact source"}),
+        tool_name="write_file",
+        noisegate_max_chars=250,
+        noisegate_max_lines=10,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_important_context_lines=2,
+        noisegate_max_important_lines=2,
+    )
+
+    payload = parse_hook_result(transformed)
+    assert payload["source"] == "exact source"
+    assert location in payload["mypy"]
+    assert frame in payload["mypy"]
+    assert caret in payload["mypy"]
+    for ref in refs:
+        assert ref in payload["mypy"]
+
+
+def test_write_diagnostic_patterns_are_line_local_on_many_blank_lines() -> None:
+    for pattern in engine.DIAGNOSTIC_LOCATION_PATTERNS:
+        assert pattern.flags & re.MULTILINE
+        assert pattern.pattern.startswith("^")
+        assert r"\s*" not in pattern.pattern
+        assert r"\s+" not in pattern.pattern
+
+    location = "src/service.py:42:17: error: Undefined name `value` [name-defined]"
+    diagnostic = (" \n" * 4_000) + location + "\n" + numbered("checking module", 80)
+
+    transformed = transform_tool_result(
+        json.dumps({"diagnostics": diagnostic, "source": "exact source"}),
+        tool_name="write_file",
+        noisegate_max_chars=220,
+        noisegate_max_lines=7,
+        noisegate_head_lines=0,
+        noisegate_tail_lines=0,
+        noisegate_important_context_lines=1,
+    )
+
+    payload = parse_hook_result(transformed)
+    assert payload["source"] == "exact source"
+    assert location in payload["diagnostics"]
+
+
 def test_write_diagnostics_override_git_boundary_reducers_when_passthrough_is_off() -> None:
     location = (
         "src/service.py:42:17: error: Incompatible types in assignment [assignment]"
@@ -1076,6 +1155,39 @@ def test_invalid_field_reduction_aborts_complete_envelope(monkeypatch) -> None:
         )
         is None
     )
+
+
+def test_same_object_no_gain_write_diagnostic_aborts_all_siblings() -> None:
+    warnings = numbered("src/file.py:10:2: warning W100 useful diagnostic", 120)
+    raw = json.dumps(
+        {
+            "diagnostics": "ok",
+            "warnings": warnings,
+            "content": "exact source",
+        }
+    )
+
+    assert (
+        transform_tool_result(
+            raw,
+            tool_name="write_file",
+            noisegate_max_chars=240,
+            noisegate_max_lines=7,
+        )
+        is None
+    )
+
+    diagnostics = numbered("src/file.py:20:3: error E200 useful diagnostic", 120)
+    transformed = transform_tool_result(
+        json.dumps({"diagnostics": diagnostics, "warnings": warnings}),
+        tool_name="write_file",
+        noisegate_max_chars=240,
+        noisegate_max_lines=7,
+    )
+    payload = parse_hook_result(transformed)
+    assert payload["diagnostics"] != diagnostics
+    assert payload["warnings"] != warnings
+    assert set(payload["noisegate"]["fields"]) == {"diagnostics", "warnings"}
 
 
 def test_write_diagnostic_invalid_and_duplicate_json_fail_open() -> None:
@@ -2741,6 +2853,53 @@ def test_terminal_json_artifact_rewrite_fails_open_with_upstream_marker(
     )
 
     assert transformed is None
+    assert not artifact_dir.exists()
+
+
+def test_terminal_json_rejects_non_utf8_candidate_before_artifact_exposure(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    stdout = numbered("FAILED tests/test_example.py::test_case - AssertionError", 120)
+    raw = (
+        '{"command":"pytest","stdout":'
+        f'{json.dumps(stdout)},"source":"\\ud800"}}'
+    )
+    store_calls: list[str] = []
+
+    def record_store(
+        text: str,
+        options: engine.NoisegateOptions,
+    ) -> dict[str, engine.JsonValue]:
+        store_calls.append(text)
+        return engine._plan_artifact(text, options)
+
+    monkeypatch.setattr(plugin, "_store_artifact", record_store)
+    artifact_dir = tmp_path / "artifacts"
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        noisegate_max_chars=500,
+        noisegate_max_lines=10,
+        noisegate_artifacts=True,
+        noisegate_artifact_dir=str(artifact_dir),
+    )
+    plans: list[plugin._ArtifactPreviewPlan] = []
+    preview = plugin._preview_tool_result(
+        raw,
+        tool_name="terminal",
+        artifact_plans_out=plans,
+        noisegate_max_chars=500,
+        noisegate_max_lines=10,
+        noisegate_artifacts=True,
+        noisegate_artifact_dir=str(artifact_dir),
+    )
+
+    assert transformed is None
+    assert preview is None
+    assert store_calls == []
+    assert plans == []
     assert not artifact_dir.exists()
 
 

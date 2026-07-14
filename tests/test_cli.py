@@ -264,6 +264,99 @@ def test_reduce_json_compacts_direct_and_wrapped_write_diagnostics() -> None:
         assert "src/file.py:10:2" in result["diagnostics"], index
 
 
+def test_reduce_json_validates_root_and_nested_write_scopes_atomically() -> None:
+    root_diagnostic = numbered("root.py:10:2: error E100 root diagnostic", 120)
+    nested_diagnostic = numbered("nested.py:20:3: warning W200 nested diagnostic", 120)
+
+    def envelopes(
+        result: dict[str, object],
+        root_fields: dict[str, object],
+    ) -> list[tuple[str, dict[str, object], object]]:
+        cases: list[tuple[str, dict[str, object], object]] = []
+        for identity, identity_fields in (
+            ("direct", {"tool_name": "write_file"}),
+            (
+                "wrapper",
+                {
+                    "tool_name": "tool_call",
+                    "args": {
+                        "name": "write_file",
+                        "arguments": {"path": "src/file.py"},
+                    },
+                },
+            ),
+        ):
+            for result_form, result_value in (
+                ("object", result),
+                ("json-string", json.dumps(result, separators=(",", ":"))),
+            ):
+                envelope = {
+                    **identity_fields,
+                    **root_fields,
+                    "result": result_value,
+                    "noisegate": {"max_chars": 240, "max_lines": 7},
+                }
+                cases.append((f"{identity}-{result_form}", envelope, result_value))
+        return cases
+
+    nested_valid = {
+        "diagnostics": nested_diagnostic,
+        "source": "exact nested source",
+    }
+    for invalid_root in ("ok", ["unsupported"]):
+        for label, envelope, _ in envelopes(
+            nested_valid,
+            {"diagnostics": invalid_root, "source": "exact root source"},
+        ):
+            raw = json.dumps(envelope)
+            proc = run_cli("reduce-json", input_text=raw)
+
+            assert proc.returncode == 0, proc.stderr
+            assert proc.stdout == raw, (label, invalid_root)
+
+    scenarios = (
+        (
+            "root-only",
+            {"source": "exact nested source"},
+            {"diagnostics": root_diagnostic, "source": "exact root source"},
+            True,
+            False,
+        ),
+        (
+            "nested-only",
+            nested_valid,
+            {"source": "exact root source"},
+            False,
+            True,
+        ),
+        (
+            "both",
+            nested_valid,
+            {"diagnostics": root_diagnostic, "source": "exact root source"},
+            True,
+            True,
+        ),
+    )
+    for scenario, result, root_fields, root_changes, nested_changes in scenarios:
+        for label, envelope, original_result in envelopes(result, root_fields):
+            raw = json.dumps(envelope)
+            proc = run_cli("reduce-json", input_text=raw)
+
+            assert proc.returncode == 0, proc.stderr
+            assert proc.stdout != raw, (scenario, label)
+            payload = json.loads(proc.stdout)
+            if root_changes:
+                assert payload["diagnostics"] != root_diagnostic, (scenario, label)
+            if not nested_changes:
+                assert payload["result"] == original_result, (scenario, label)
+                continue
+            nested = payload["result"]
+            if isinstance(nested, str):
+                nested = json.loads(nested)
+            assert nested["diagnostics"] != nested_diagnostic, (scenario, label)
+            assert nested["source"] == "exact nested source", (scenario, label)
+
+
 def test_reduce_json_unsafe_nested_write_diagnostic_aborts_direct_compaction() -> None:
     diagnostic = numbered("outer.py:10:2: error E100 useful diagnostic", 120)
     nested = {"warnings": ["unsupported"], "content": "exact nested source\n"}
@@ -310,6 +403,23 @@ def test_reduce_json_write_diagnostics_keep_direct_strings_and_no_gain_exact() -
 
         assert proc.returncode == 0, proc.stderr
         assert proc.stdout == raw
+
+
+def test_reduce_json_same_object_no_gain_diagnostic_aborts_all_siblings() -> None:
+    warnings = numbered("src/file.py:10:2: warning W100 useful diagnostic", 120)
+    envelope = {
+        "tool_name": "write_file",
+        "diagnostics": "ok",
+        "warnings": warnings,
+        "content": "exact source\n",
+        "noisegate": {"max_chars": 240, "max_lines": 7},
+    }
+    raw = json.dumps(envelope)
+
+    proc = run_cli("reduce-json", input_text=raw)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == raw
 
 
 def test_reduce_json_write_diagnostics_never_plan_or_store_artifacts(tmp_path: Path) -> None:

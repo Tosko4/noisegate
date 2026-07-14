@@ -542,6 +542,10 @@ def _reduce_json_value_with_budget(
             and not _is_compactable_tool_name(tool_name)
         ):
             return raw
+    root_write_diagnostic_scope = bool(
+        isinstance(parsed, dict)
+        and _has_write_diagnostic_scope(parsed, tool_name=tool_name)
+    )
     if isinstance(parsed, dict) and "result" in parsed:
         result_value = parsed["result"]
         json_encoded_result = False
@@ -552,9 +556,8 @@ def _reduce_json_value_with_budget(
                 return raw
         result_mapping = _result_mapping(result_value)
         nested_write_diagnostic_scope = bool(
-            tool_name in FIELD_AWARE_WRITE_TOOL_NAMES
-            and isinstance(result_mapping, dict)
-            and any(field in result_mapping for field in WRITE_DIAGNOSTIC_FIELDS)
+            isinstance(result_mapping, dict)
+            and _has_write_diagnostic_scope(result_mapping, tool_name=tool_name)
         )
         result_has_explicit_identity = bool(
             isinstance(result_mapping, dict) and _envelope_tool_name(result_mapping)
@@ -737,7 +740,7 @@ def _reduce_json_value_with_budget(
                 separators=(",", ":"),
                 allow_nan=False,
             )
-            if _has_direct_text_payload(parsed):
+            if root_write_diagnostic_scope or _has_direct_text_payload(parsed):
                 direct_plans: list[_ArtifactPreviewPlan] = []
                 direct_transformed = _transform_direct_payload_preserving_json_result(
                     parsed,
@@ -761,6 +764,8 @@ def _reduce_json_value_with_budget(
                     if artifact_plans_out is not None:
                         artifact_plans_out.extend(accepted_plans)
                     return direct_transformed
+                if root_write_diagnostic_scope:
+                    return raw
             if len(candidate) >= len(raw):
                 if metadata_out is not None:
                     metadata_out.update(result_metadata)
@@ -777,7 +782,7 @@ def _reduce_json_value_with_budget(
             return candidate
         if nested_write_diagnostic_scope:
             return raw
-        if not _has_direct_text_payload(parsed):
+        if not root_write_diagnostic_scope and not _has_direct_text_payload(parsed):
             if metadata_out is not None:
                 metadata_out.update(result_metadata)
             return raw
@@ -846,7 +851,10 @@ def _transform_direct_payload_preserving_json_result(
     result_value = payload.get("result")
     if isinstance(result_value, str) and _is_json_text(result_value):
         direct_payload.pop("result", None)
-        if not _has_direct_text_payload(direct_payload):
+        if not (
+            _has_direct_text_payload(direct_payload)
+            or _has_write_diagnostic_scope(direct_payload, tool_name=tool_name)
+        ):
             return None
         direct_raw = json.dumps(direct_payload, ensure_ascii=False, separators=(",", ":"))
         transformed = tool_transform(
@@ -1188,6 +1196,12 @@ def _has_direct_text_payload(payload: dict[Any, Any]) -> bool:
     return any(
         isinstance(payload.get(key), str)
         for key in ("stdout", "stderr", "output", "logs", "text", "content", "message")
+    )
+
+
+def _has_write_diagnostic_scope(payload: dict[Any, Any], *, tool_name: str) -> bool:
+    return tool_name in FIELD_AWARE_WRITE_TOOL_NAMES and any(
+        field in payload for field in WRITE_DIAGNOSTIC_FIELDS
     )
 
 
