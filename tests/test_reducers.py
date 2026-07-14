@@ -109,6 +109,21 @@ def test_generic_long_output_uses_deterministic_head_tail() -> None:
     assert result.metadata["omitted_chars"] > 0
 
 
+def test_write_diagnostic_location_patterns_are_line_anchored() -> None:
+    assert all(
+        pattern.pattern.startswith("^") for pattern in engine.DIAGNOSTIC_LOCATION_PATTERNS
+    )
+
+
+def test_write_diagnostic_location_patterns_reject_long_nonmatching_line() -> None:
+    long_noise = "x" * 8_192
+
+    assert all(
+        pattern.search(long_noise) is None
+        for pattern in engine.DIAGNOSTIC_LOCATION_PATTERNS
+    )
+
+
 def test_generic_head_tail_remaps_colliding_upstream_line_omission_by_coverage() -> None:
     raw = "\n".join(
         [
@@ -951,6 +966,60 @@ def test_named_non_noisy_tools_are_protected_by_default() -> None:
         assert result.changed is False
         assert result.text == raw
         assert result.metadata["reducer"] == "protected_tool"
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_class"),
+    (
+        ("pytest -q --diagnostics lint", "pytest"),
+        ("npm run lint -- --diagnostics", "node"),
+        ("uv pip install diagnostics-lint", "python_package"),
+    ),
+)
+def test_diagnostic_words_do_not_steal_existing_classifier_precedence(
+    command: str,
+    expected_class: str,
+) -> None:
+    output = "\n".join(
+        [
+            "diagnostics lint started",
+            *(f"progress {index:03d}" for index in range(100)),
+            "ERROR: diagnostics lint failed",
+        ]
+    )
+
+    result = reduce_text(output, command=command, options=options(max_chars=180))
+
+    assert result.metadata["command_class"] == expected_class
+    assert result.metadata["reducer"] == expected_class
+
+
+def test_diagnostic_locations_do_not_change_unscoped_generic_reduction() -> None:
+    output = "\n".join(
+        [
+            "generic head",
+            *(f"progress {index:03d}" for index in range(80)),
+            "src/service.py:42:17: F401 imported but unused",
+            *(f"progress {index:03d}" for index in range(80, 160)),
+            "generic tail",
+        ]
+    )
+
+    result = reduce_text(
+        output,
+        command="make noisy",
+        exit_code=1,
+        options=options(
+            max_chars=180,
+            max_lines=6,
+            head_lines=1,
+            tail_lines=1,
+        ),
+    )
+
+    assert result.metadata["command_class"] == "generic"
+    assert result.metadata["reducer"] == "generic_head_tail"
+    assert "src/service.py:42:17" not in result.text
 
 
 @pytest.mark.parametrize(

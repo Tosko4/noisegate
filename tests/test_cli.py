@@ -225,6 +225,316 @@ def test_reduce_json_rewrites_result_field() -> None:
     assert inner["noisegate"]["compacted"] is True
 
 
+def test_reduce_json_compacts_direct_and_wrapped_write_diagnostics() -> None:
+    diagnostic = numbered("src/file.py:10:2: error E100 useful diagnostic", 120)
+    write_result = {"diagnostics": diagnostic, "content": "exact source\n"}
+    envelopes = (
+        {
+            "tool_name": "write_file",
+            **write_result,
+            "noisegate": {"max_chars": 240, "max_lines": 7},
+        },
+        {
+            "tool_name": "tool_call",
+            "args": {"name": "apply_patch", "arguments": {"path": "src/file.py"}},
+            "result": write_result,
+            "noisegate": {"max_chars": 240, "max_lines": 7},
+        },
+        {
+            "tool_name": "tool_call",
+            "args": {"name": "edit_file", "arguments": {"path": "src/file.py"}},
+            "result": json.dumps(write_result),
+            "noisegate": {"max_chars": 240, "max_lines": 7},
+        },
+    )
+
+    for index, envelope in enumerate(envelopes):
+        raw = json.dumps(envelope)
+
+        proc = run_cli("reduce-json", input_text=raw)
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout != raw, index
+        payload = json.loads(proc.stdout)
+        result = payload.get("result", payload)
+        if isinstance(result, str):
+            result = json.loads(result)
+        assert result["content"] == "exact source\n", index
+        assert result["diagnostics"] != diagnostic, index
+        assert "src/file.py:10:2" in result["diagnostics"], index
+
+
+def test_reduce_json_validates_root_and_nested_write_scopes_atomically() -> None:
+    root_diagnostic = numbered("root.py:10:2: error E100 root diagnostic", 120)
+    nested_diagnostic = numbered("nested.py:20:3: warning W200 nested diagnostic", 120)
+
+    def envelopes(
+        result: dict[str, object],
+        root_fields: dict[str, object],
+    ) -> list[tuple[str, dict[str, object], object]]:
+        cases: list[tuple[str, dict[str, object], object]] = []
+        for identity, identity_fields in (
+            ("direct", {"tool_name": "write_file"}),
+            (
+                "wrapper",
+                {
+                    "tool_name": "tool_call",
+                    "args": {
+                        "name": "write_file",
+                        "arguments": {"path": "src/file.py"},
+                    },
+                },
+            ),
+        ):
+            for result_form, result_value in (
+                ("object", result),
+                ("json-string", json.dumps(result, separators=(",", ":"))),
+            ):
+                envelope = {
+                    **identity_fields,
+                    **root_fields,
+                    "result": result_value,
+                    "noisegate": {"max_chars": 240, "max_lines": 7},
+                }
+                cases.append((f"{identity}-{result_form}", envelope, result_value))
+        return cases
+
+    nested_valid = {
+        "diagnostics": nested_diagnostic,
+        "source": "exact nested source",
+    }
+    for invalid_root in ("ok", ["unsupported"]):
+        for label, envelope, _ in envelopes(
+            nested_valid,
+            {"diagnostics": invalid_root, "source": "exact root source"},
+        ):
+            raw = json.dumps(envelope)
+            proc = run_cli("reduce-json", input_text=raw)
+
+            assert proc.returncode == 0, proc.stderr
+            assert proc.stdout == raw, (label, invalid_root)
+
+    scenarios = (
+        (
+            "root-only",
+            {"source": "exact nested source"},
+            {"diagnostics": root_diagnostic, "source": "exact root source"},
+            True,
+            False,
+        ),
+        (
+            "nested-only",
+            nested_valid,
+            {"source": "exact root source"},
+            False,
+            True,
+        ),
+        (
+            "both",
+            nested_valid,
+            {"diagnostics": root_diagnostic, "source": "exact root source"},
+            True,
+            True,
+        ),
+    )
+    for scenario, result, root_fields, root_changes, nested_changes in scenarios:
+        for label, envelope, original_result in envelopes(result, root_fields):
+            raw = json.dumps(envelope)
+            proc = run_cli("reduce-json", input_text=raw)
+
+            assert proc.returncode == 0, proc.stderr
+            assert proc.stdout != raw, (scenario, label)
+            payload = json.loads(proc.stdout)
+            if root_changes:
+                assert payload["diagnostics"] != root_diagnostic, (scenario, label)
+            if not nested_changes:
+                assert payload["result"] == original_result, (scenario, label)
+                continue
+            nested = payload["result"]
+            if isinstance(nested, str):
+                nested = json.loads(nested)
+            assert nested["diagnostics"] != nested_diagnostic, (scenario, label)
+            assert nested["source"] == "exact nested source", (scenario, label)
+
+
+def test_reduce_json_unsafe_nested_write_diagnostic_aborts_direct_compaction() -> None:
+    diagnostic = numbered("outer.py:10:2: error E100 useful diagnostic", 120)
+    nested = {"warnings": ["unsupported"], "content": "exact nested source\n"}
+
+    for result in (nested, json.dumps(nested)):
+        envelope = {
+            "tool_name": "tool_call",
+            "args": {
+                "name": "write_file",
+                "arguments": {"path": "src/file.py"},
+            },
+            "result": result,
+            "diagnostics": diagnostic,
+            "content": "exact outer source\n",
+            "noisegate": {"max_chars": 240, "max_lines": 7},
+        }
+        raw = json.dumps(envelope)
+
+        proc = run_cli("reduce-json", input_text=raw)
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == raw, type(result).__name__
+
+
+def test_reduce_json_write_diagnostics_keep_direct_strings_and_no_gain_exact() -> None:
+    envelopes = (
+        {
+            "tool_name": "write_file",
+            "result": numbered("exact direct write result", 100),
+            "noisegate": {"max_chars": 120},
+        },
+        {
+            "tool_name": "write_file",
+            "diagnostics": "ok",
+            "content": "exact source\n",
+            "noisegate": {"max_chars": 120},
+        },
+    )
+
+    for envelope in envelopes:
+        raw = json.dumps(envelope)
+
+        proc = run_cli("reduce-json", input_text=raw)
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == raw
+
+
+def test_reduce_json_same_object_no_gain_diagnostic_aborts_all_siblings() -> None:
+    warnings = numbered("src/file.py:10:2: warning W100 useful diagnostic", 120)
+    envelope = {
+        "tool_name": "write_file",
+        "diagnostics": "ok",
+        "warnings": warnings,
+        "content": "exact source\n",
+        "noisegate": {"max_chars": 240, "max_lines": 7},
+    }
+    raw = json.dumps(envelope)
+
+    proc = run_cli("reduce-json", input_text=raw)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == raw
+
+
+def test_reduce_json_write_diagnostics_preserve_exit_hints() -> None:
+    diagnostics = numbered("src/file.py:10:2: error E100 useful diagnostic", 120)
+    envelopes = (
+        (
+            {
+                "tool_name": "write_file",
+                "diagnostics": diagnostics,
+                "exit_code": 4,
+                "source": "exact root source",
+                "noisegate": {"max_chars": 240, "max_lines": 7},
+            },
+            4,
+            False,
+        ),
+        (
+            {
+                "tool_name": "write_file",
+                "status": "failed",
+                "result": {
+                    "diagnostics": diagnostics,
+                    "source": "exact nested source",
+                },
+                "noisegate": {"max_chars": 240, "max_lines": 7},
+            },
+            1,
+            True,
+        ),
+    )
+
+    for envelope, expected_exit_code, nested in envelopes:
+        raw = json.dumps(envelope)
+        proc = run_cli("reduce-json", input_text=raw)
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout != raw
+        payload = json.loads(proc.stdout)
+        diagnostic_payload = payload["result"] if nested else payload
+        assert (
+            f"[noisegate: exit_code={expected_exit_code}]"
+            in diagnostic_payload["diagnostics"]
+        )
+        metadata_key = "noisegate" if nested else "_noisegate"
+        assert (
+            diagnostic_payload[metadata_key]["fields"]["diagnostics"]["exit_code"]
+            == expected_exit_code
+        )
+        assert diagnostic_payload["source"].startswith("exact ")
+
+
+def test_reduce_json_write_diagnostics_never_plan_or_store_artifacts(tmp_path: Path) -> None:
+    diagnostic = numbered("src/file.py:10:2: error E100 useful diagnostic", 120)
+    nested = {"diagnostics": diagnostic, "content": "exact source\n"}
+    envelope = {
+        "tool_name": "tool_call",
+        "args": {"name": "apply_patch", "arguments": {"path": "src/file.py"}},
+        "result": json.dumps(nested),
+        "noisegate": {"max_chars": 240, "max_lines": 7},
+    }
+    raw = json.dumps(envelope)
+    artifact_dir = tmp_path / "artifacts"
+    options = engine.NoisegateOptions(
+        max_chars=240,
+        max_lines=7,
+        artifact_enabled=True,
+        artifact_dir=artifact_dir,
+    )
+    plans: list[plugin._ArtifactPreviewPlan] = []
+
+    output = cli._reduce_json_value(
+        envelope,
+        raw,
+        options,
+        defer_artifact_store=True,
+        artifact_plans_out=plans,
+    )
+
+    assert output != raw
+    assert plans == []
+    assert not artifact_dir.exists()
+
+
+def test_reduce_json_write_diagnostic_nonfinite_values_fail_open_exactly() -> None:
+    diagnostic = numbered("src/file.py:10:2: error E100 useful diagnostic", 120)
+
+    for constant in ("1e400", "-1e400", "NaN"):
+        raw = (
+            '{"tool_name":"write_file","diagnostics":'
+            f'{json.dumps(diagnostic)},"unknown":{constant},'
+            '"noisegate":{"max_chars":240,"max_lines":7}}'
+        )
+
+        proc = run_cli("reduce-json", input_text=raw)
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == raw
+
+
+def test_reduce_json_write_diagnostic_lone_surrogates_fail_open_exactly() -> None:
+    diagnostic = numbered("src/file.py:10:2: error E100 useful diagnostic", 120)
+
+    for escaped_surrogate in (r"\ud800", r"\udfff"):
+        raw = (
+            '{"tool_name":"write_file","diagnostics":'
+            f'{json.dumps(diagnostic)},"source":"{escaped_surrogate}",'
+            '"noisegate":{"max_chars":240,"max_lines":7}}'
+        )
+
+        proc = run_cli("reduce-json", input_text=raw)
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == raw
+
+
 def test_reduce_json_rewrites_plain_result_string() -> None:
     envelope = {
         "tool_name": "terminal",

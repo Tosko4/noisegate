@@ -568,6 +568,7 @@ def _reduce_text_in_operation(
     exit_code: int | None = None,
     options: NoisegateOptions | None = None,
     defer_artifact_store: bool = False,
+    extra_preserve_patterns: tuple[re.Pattern[str], ...] = (),
 ) -> ReducedOutput:
     return _run_text_reduction_operation(
         text,
@@ -578,6 +579,7 @@ def _reduce_text_in_operation(
         options=options,
         defer_artifact_store=defer_artifact_store,
         share_alignment_budget=True,
+        extra_preserve_patterns=extra_preserve_patterns,
     )
 
 
@@ -591,6 +593,7 @@ def _run_text_reduction_operation(
     options: NoisegateOptions | None,
     defer_artifact_store: bool,
     share_alignment_budget: bool,
+    extra_preserve_patterns: tuple[re.Pattern[str], ...] = (),
 ) -> ReducedOutput:
     if share_alignment_budget:
         _raise_if_source_alignment_work_exhausted()
@@ -602,6 +605,7 @@ def _run_text_reduction_operation(
             exit_code=exit_code,
             options=options,
             defer_artifact_store=defer_artifact_store,
+            extra_preserve_patterns=extra_preserve_patterns,
         )
         _raise_if_source_alignment_work_exhausted()
         return reduced
@@ -616,6 +620,7 @@ def _run_text_reduction_operation(
                 exit_code=exit_code,
                 options=options,
                 defer_artifact_store=defer_artifact_store,
+                extra_preserve_patterns=extra_preserve_patterns,
             )
             _raise_if_source_alignment_work_exhausted()
             return reduced
@@ -632,6 +637,7 @@ def _reduce_text(
     exit_code: int | None = None,
     options: NoisegateOptions | None = None,
     defer_artifact_store: bool = False,
+    extra_preserve_patterns: tuple[re.Pattern[str], ...] = (),
 ) -> ReducedOutput:
     options = options or NoisegateOptions.from_env()
     command_class = _reduction_command_class(
@@ -685,8 +691,27 @@ def _reduce_text(
         return _unchanged(text, "below_threshold", command_class, reason="below_threshold")
 
     preserve_patterns = _preserve_patterns_for_output(command_class, text)
+    first_priority_patterns: tuple[re.Pattern[str], ...] = ()
+    if extra_preserve_patterns:
+        preserve_patterns = _combine_matching_patterns(
+            text,
+            preserve_patterns,
+            extra_preserve_patterns,
+        )
+        extra_pattern_ids = {id(pattern) for pattern in extra_preserve_patterns}
+        first_priority_patterns = tuple(
+            pattern
+            for pattern in preserve_patterns or ()
+            if id(pattern) in extra_pattern_ids
+        )
     exit_notices = _recovery_notices({"exit_code": exit_code})
-    reducer_name, compacted = _apply_reducer(text, command_class, options, exit_code)
+    reducer_name, compacted = _apply_reducer(
+        text,
+        command_class,
+        options,
+        exit_code,
+        extra_preserve_patterns=extra_preserve_patterns,
+    )
     if compacted is not None and _omission_notices(text):
         compacted = _remark_excerpt_with_line_coverage(text, compacted)
         compacted = _ensure_ranked_diagnostic_after_line_coverage_remap(
@@ -694,6 +719,7 @@ def _reduce_text(
             shortened=compacted,
             options=options,
             preserve_patterns=preserve_patterns,
+            first_priority_patterns=first_priority_patterns,
             required_notices=exit_notices,
         )
     if compacted is not None and _dropped_lcm_externalized_match(
@@ -706,6 +732,7 @@ def _reduce_text(
             compacted,
             options,
             preserve_patterns=preserve_patterns,
+            first_priority_patterns=first_priority_patterns,
         )
     if compacted is not None and _omission_notices(text):
         compacted = _ensure_ranked_diagnostic_after_line_coverage_remap(
@@ -713,6 +740,7 @@ def _reduce_text(
             shortened=compacted,
             options=options,
             preserve_patterns=preserve_patterns,
+            first_priority_patterns=first_priority_patterns,
             required_notices=exit_notices,
         )
     if compacted is not None and _dropped_omission_notice(before=text, after=compacted):
@@ -768,6 +796,7 @@ def _reduce_text(
             shortened=compacted_body,
             options=options,
             preserve_patterns=preserve_patterns,
+            first_priority_patterns=first_priority_patterns,
             required_notices=required_notices,
         )
         if compacted_body is None:
@@ -785,6 +814,7 @@ def _reduce_text(
         artifact_dir=options.artifact_dir,
         options=options,
         preserve_patterns=preserve_patterns,
+        first_priority_patterns=first_priority_patterns,
         fail_open_text=text,
     )
     if _line_coverage_remap_dropped_ranked_diagnostic(
@@ -792,6 +822,7 @@ def _reduce_text(
         after=compacted,
         options=options,
         preserve_patterns=preserve_patterns,
+        first_priority_patterns=first_priority_patterns,
         required_notices=required_notices,
     ):
         return _unchanged(
@@ -834,6 +865,7 @@ def _reduce_text(
                     artifact_dir=options.artifact_dir,
                     options=options,
                     preserve_patterns=preserve_patterns,
+                    first_priority_patterns=first_priority_patterns,
                     fail_open_text=text,
                 )
             else:
@@ -850,6 +882,7 @@ def _reduce_text(
                         shortened=compacted_body,
                         options=options,
                         preserve_patterns=preserve_patterns,
+                        first_priority_patterns=first_priority_patterns,
                         required_notices=required_notices,
                     )
                     if compacted_body is None:
@@ -871,6 +904,7 @@ def _reduce_text(
                     artifact_dir=options.artifact_dir,
                     options=options,
                     preserve_patterns=preserve_patterns,
+                    first_priority_patterns=first_priority_patterns,
                     fail_open_text=text,
                 )
                 if _line_coverage_remap_dropped_ranked_diagnostic(
@@ -878,6 +912,7 @@ def _reduce_text(
                     after=compacted,
                     options=options,
                     preserve_patterns=preserve_patterns,
+                    first_priority_patterns=first_priority_patterns,
                     required_notices=required_notices,
                 ):
                     return _unchanged(
@@ -1138,15 +1173,47 @@ def _preserve_patterns_for_output(
     return tuple(combined)
 
 
+def _combine_matching_patterns(
+    text: str,
+    base_patterns: tuple[re.Pattern[str], ...] | None,
+    extra_patterns: tuple[re.Pattern[str], ...],
+) -> tuple[re.Pattern[str], ...] | None:
+    combined = list(base_patterns or ())
+    seen_pattern_ids = {id(pattern) for pattern in combined}
+    source_lines = text.splitlines()
+    for pattern in extra_patterns:
+        if id(pattern) in seen_pattern_ids or not any(
+            pattern.search(line) for line in source_lines
+        ):
+            continue
+        seen_pattern_ids.add(id(pattern))
+        combined.append(pattern)
+    return tuple(combined) or None
+
+
 def _apply_reducer(
     text: str,
     command_class: str,
     options: NoisegateOptions,
     exit_code: int | None,
+    *,
+    extra_preserve_patterns: tuple[re.Pattern[str], ...] = (),
 ) -> tuple[str, str | None]:
     lcm_patterns = _lcm_externalized_patterns_for(text)
     reducer_patterns = REDUCER_ANCHOR_PATTERNS_BY_COMMAND_CLASS.get(command_class, ())
+    field_patterns = _combine_matching_patterns(text, None, extra_preserve_patterns) or ()
+    field_priority_patterns = (field_patterns,) if field_patterns else ()
+    reduction_patterns = reducer_patterns + field_patterns + lcm_patterns
     if options.mode == "head_tail":
+        if field_patterns:
+            return "generic_diagnostic", _important_lines(
+                text,
+                options,
+                field_patterns + CRITICAL_PATTERNS + lcm_patterns,
+                priority_patterns=field_priority_patterns + HIGH_SIGNAL_PRIORITY_PATTERNS,
+                first_priority_patterns=field_patterns,
+                exit_code=exit_code,
+            )
         if lcm_patterns:
             return "generic_head_tail", _important_lines(
                 text,
@@ -1159,56 +1226,87 @@ def _apply_reducer(
         return command_class, _important_lines(
             text,
             options,
-            reducer_patterns + lcm_patterns,
+            reduction_patterns,
+            priority_patterns=field_priority_patterns + HIGH_SIGNAL_PRIORITY_PATTERNS,
+            first_priority_patterns=field_patterns,
             exit_code=exit_code,
         )
     if command_class in {"apt", "python_package"}:
         return command_class, _important_lines(
             text,
             options,
-            reducer_patterns + lcm_patterns,
-            priority_patterns=PACKAGE_HIGH_SIGNAL_PRIORITY_PATTERNS,
+            reduction_patterns,
+            priority_patterns=field_priority_patterns + PACKAGE_HIGH_SIGNAL_PRIORITY_PATTERNS,
+            first_priority_patterns=field_patterns,
             exit_code=exit_code,
         )
     if command_class == "node":
         return "node", _important_lines(
             text,
             options,
-            reducer_patterns + lcm_patterns,
-            priority_patterns=NODE_HIGH_SIGNAL_PRIORITY_PATTERNS,
+            reduction_patterns,
+            priority_patterns=field_priority_patterns + NODE_HIGH_SIGNAL_PRIORITY_PATTERNS,
+            first_priority_patterns=field_patterns,
             exit_code=exit_code,
         )
     if command_class == "docker_build":
         return "docker_build", _important_lines(
             text,
             options,
-            reducer_patterns + lcm_patterns,
-            priority_patterns=DOCKER_BUILD_HIGH_SIGNAL_PRIORITY_PATTERNS,
+            reduction_patterns,
+            priority_patterns=(
+                field_priority_patterns + DOCKER_BUILD_HIGH_SIGNAL_PRIORITY_PATTERNS
+            ),
+            first_priority_patterns=field_patterns,
             exit_code=exit_code,
         )
     if command_class == "docker_logs":
         return "docker_logs", _important_lines(
             text,
             options,
-            reducer_patterns + lcm_patterns,
+            reduction_patterns,
+            priority_patterns=field_priority_patterns + HIGH_SIGNAL_PRIORITY_PATTERNS,
+            first_priority_patterns=field_patterns,
             exit_code=exit_code,
         )
     if command_class == "log_stream":
         return "log_stream", _important_lines(
             text,
             options,
-            reducer_patterns + lcm_patterns,
+            reduction_patterns,
+            priority_patterns=field_priority_patterns + HIGH_SIGNAL_PRIORITY_PATTERNS,
+            first_priority_patterns=field_patterns,
             exit_code=exit_code,
         )
     if command_class == "git_status":
         return "git_status", _important_lines(
             text,
             options,
-            reducer_patterns + lcm_patterns,
+            reduction_patterns,
+            priority_patterns=field_priority_patterns + HIGH_SIGNAL_PRIORITY_PATTERNS,
+            first_priority_patterns=field_patterns,
+            exit_code=exit_code,
+        )
+    if command_class in {"git_log", "git_diff"} and field_patterns:
+        return command_class, _important_lines(
+            text,
+            options,
+            reduction_patterns,
+            priority_patterns=field_priority_patterns + HIGH_SIGNAL_PRIORITY_PATTERNS,
+            first_priority_patterns=field_patterns,
             exit_code=exit_code,
         )
     if command_class == "git_log":
         return "git_log", _head_tail(text, replace(options, head_lines=40, tail_lines=8))
+    if command_class == "generic" and field_patterns:
+        return "generic_diagnostic", _important_lines(
+            text,
+            options,
+            field_patterns + CRITICAL_PATTERNS + lcm_patterns,
+            priority_patterns=field_priority_patterns + HIGH_SIGNAL_PRIORITY_PATTERNS,
+            first_priority_patterns=field_patterns,
+            exit_code=exit_code,
+        )
     if (
         command_class == "generic"
         and exit_code != 0
@@ -1241,6 +1339,28 @@ TEST_PATTERNS = tuple(
         r"^\s*E\s+",
         r"^\s*(?:=+\s*)?(?:\d+\s+(?:failed|passed|errors?)(?:,\s*)?)+\b",
         r"tests?/.*::",
+    )
+)
+
+DIAGNOSTIC_LOCATION_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+    for pattern in (
+        r"^[^\S\r\n]*(?:[A-Z]:)?[^\s:\r\n][^:\r\n]*\.[A-Z0-9_+-]+:\d+(?::\d+)?:"
+        r"[^\S\r\n]*(?:\[[^\]\r\n]+\][^\S\r\n]*)?"
+        r"(?:error|warning|info|hint|[A-Z][A-Z0-9_-]*\d{2,})\b",
+        r"^[^\S\r\n]*(?:[A-Z]:)?[^\s:\r\n][^:\r\n]*\.[A-Z0-9_+-]+:\d+:\d+"
+        r"[^\S\r\n]+-[^\S\r\n]+(?:error|warning|info|hint):[^\S\r\n]+\S",
+        r"^[^\S\r\n]*(?:[A-Z]:)?[^\s:\r\n][^:\r\n]*\.[A-Z0-9_+-]+\(\d+,\d+\):"
+        r"[^\S\r\n]*(?:error|warning|info|hint)"
+        r"(?:[^\S\r\n]+[A-Z][A-Z0-9_-]*\d+)?\b",
+        r"^[^\S\r\n]*\d+:\d+[^\S\r\n]+(?:error|warning)[^\S\r\n]+\S+",
+        r"^[^\S\r\n]*(?:[A-Z]:)?[^\s:\r\n][^:\r\n]*\.[A-Z0-9_+-]+:\d+:\d+"
+        r"[^\S\r\n]+\[(?:error|warning|info|hint)\][^\S\r\n]+"
+        r"(?:[A-Z][A-Z0-9_-]*\d+[^\S\r\n]*:[^\S\r\n]*)?\S+",
+        r"^[^\S\r\n]*[A-Z][A-Z0-9_-]*\d{2,}\b"
+        r"(?:[^\S\r\n]+\[[^\]\r\n]+\])?[^\S\r\n]+\S",
+        r"^[^\S\r\n]*-->[^\S\r\n]+(?:[A-Z]:)?[^\s:\r\n][^:\r\n]*"
+        r"\.[A-Z0-9_+-]+:\d+:\d+[^\S\r\n]*$",
     )
 )
 
@@ -1493,6 +1613,7 @@ def _important_lines(
     patterns: tuple[re.Pattern[str], ...],
     *,
     priority_patterns: tuple[tuple[re.Pattern[str], ...], ...] = HIGH_SIGNAL_PRIORITY_PATTERNS,
+    first_priority_patterns: tuple[re.Pattern[str], ...] = (),
     exit_code: int | None = None,
 ) -> str | None:
     lines = text.splitlines()
@@ -1504,7 +1625,12 @@ def _important_lines(
             return _char_head_tail_preserving_patterns(
                 text,
                 options,
-                _priority_preservation_patterns(text, patterns, priority_patterns),
+                _priority_preservation_patterns(
+                    text,
+                    patterns,
+                    priority_patterns,
+                    first_priority_patterns=first_priority_patterns,
+                ),
             )
         return _char_head_tail(text, options)
 
@@ -1564,7 +1690,12 @@ def _important_lines(
             return _char_head_tail_preserving_patterns(
                 text,
                 options,
-                _priority_preservation_patterns(text, patterns, priority_patterns),
+                _priority_preservation_patterns(
+                    text,
+                    patterns,
+                    priority_patterns,
+                    first_priority_patterns=first_priority_patterns,
+                ),
             )
         return _char_head_tail(text, options)
     selected_indices = sorted(keep)
@@ -1600,7 +1731,12 @@ def _important_lines(
         return _char_head_tail_preserving_patterns(
             selected,
             options,
-            _priority_preservation_patterns(selected, patterns, priority_patterns),
+            _priority_preservation_patterns(
+                selected,
+                patterns,
+                priority_patterns,
+                first_priority_patterns=first_priority_patterns,
+            ),
         )
     return selected
 
@@ -1638,7 +1774,11 @@ def _priority_preservation_patterns(
     text: str,
     patterns: tuple[re.Pattern[str], ...],
     priority_patterns: tuple[tuple[re.Pattern[str], ...], ...],
+    *,
+    first_priority_patterns: tuple[re.Pattern[str], ...] = (),
 ) -> tuple[re.Pattern[str], ...]:
+    if first_priority_patterns and _first_pattern_match(text, first_priority_patterns):
+        return _lcm_externalized_patterns_for(text) + first_priority_patterns
     if patterns is CRITICAL_PATTERNS or any(pattern in TEST_PATTERNS for pattern in patterns):
         return _preservation_patterns(text, patterns)
     flattened = tuple(pattern for group in priority_patterns for pattern in group)
@@ -2173,6 +2313,7 @@ def _enforce_final_budget(
     options: NoisegateOptions,
     *,
     preserve_patterns: tuple[re.Pattern[str], ...] | None = None,
+    first_priority_patterns: tuple[re.Pattern[str], ...] = (),
 ) -> str | None:
     compacted = text
     if _line_count(compacted) > options.max_lines:
@@ -2181,7 +2322,18 @@ def _enforce_final_budget(
             and _first_pattern_match(compacted, preserve_patterns) is not None
         )
         if has_preserved_match:
-            line_capped = _important_lines(compacted, options, preserve_patterns)
+            priority_patterns = (
+                (first_priority_patterns, *HIGH_SIGNAL_PRIORITY_PATTERNS)
+                if first_priority_patterns
+                else HIGH_SIGNAL_PRIORITY_PATTERNS
+            )
+            line_capped = _important_lines(
+                compacted,
+                options,
+                preserve_patterns,
+                priority_patterns=priority_patterns,
+                first_priority_patterns=first_priority_patterns,
+            )
         else:
             line_capped = _head_tail(compacted, options)
         if line_capped is not None and len(line_capped) < len(compacted):
@@ -2205,10 +2357,16 @@ def _enforce_final_budget(
             and _first_pattern_match(compacted, preserve_patterns) is not None
         )
         if has_preserved_match:
+            char_patterns = (
+                _lcm_externalized_patterns_for(compacted) + first_priority_patterns
+                if first_priority_patterns
+                and _first_pattern_match(compacted, first_priority_patterns)
+                else preserve_patterns
+            )
             char_capped = _char_head_tail_preserving_patterns(
                 compacted,
                 options,
-                preserve_patterns,
+                char_patterns,
             )
         else:
             char_capped = _char_head_tail(compacted, options)
@@ -2884,6 +3042,7 @@ def _concrete_failure_excerpt_for_notices(
     options: NoisegateOptions,
     *,
     preserve_patterns: tuple[re.Pattern[str], ...] | None = None,
+    first_priority_patterns: tuple[re.Pattern[str], ...] = (),
 ) -> str | None:
     lines = text.splitlines()
     if options.max_lines < 2:
@@ -2920,7 +3079,13 @@ def _concrete_failure_excerpt_for_notices(
 
     rich_keep: set[int] = set()
     if preserve_patterns is not None:
-        rich_keep.update(_ranked_diagnostic_line_indices(text, preserve_patterns)[:2])
+        rich_keep.update(
+            _ranked_diagnostic_line_indices(
+                text,
+                preserve_patterns,
+                first_priority_patterns,
+            )[:2]
+        )
     for index in concrete_indices[:2]:
         if index > 0 and re.search(
             r"\btraceback\b|\bunhandled\s+exception\b|Externalized tool output",
@@ -3001,24 +3166,35 @@ def _marked_excerpt_for_line_indices(lines: list[str], indices: list[int]) -> st
 def _ranked_diagnostic_line_indices(
     text: str,
     preserve_patterns: tuple[re.Pattern[str], ...] | None,
+    first_priority_patterns: tuple[re.Pattern[str], ...] = (),
 ) -> list[int]:
     if preserve_patterns is None:
         return []
 
     lines = text.splitlines()
     indices: list[int] = []
-    for match in _ranked_pattern_line_matches(text, preserve_patterns):
-        index = match.line_index
-        if (
-            index is None
-            or index < 0
-            or index >= len(lines)
-            or index in indices
-            or OMISSION_NOTICE_PATTERN.fullmatch(lines[index])
-            or any(pattern.search(lines[index]) for pattern in LCM_EXTERNALIZED_PATTERNS)
-        ):
-            continue
-        indices.append(index)
+    first_ids = {id(pattern) for pattern in first_priority_patterns}
+    remaining_patterns = tuple(
+        pattern for pattern in preserve_patterns if id(pattern) not in first_ids
+    )
+    pattern_groups = (
+        (first_priority_patterns, remaining_patterns)
+        if first_priority_patterns
+        else (preserve_patterns,)
+    )
+    for patterns in pattern_groups:
+        for match in _ranked_pattern_line_matches(text, patterns):
+            index = match.line_index
+            if (
+                index is None
+                or index < 0
+                or index >= len(lines)
+                or index in indices
+                or OMISSION_NOTICE_PATTERN.fullmatch(lines[index])
+                or any(pattern.search(lines[index]) for pattern in LCM_EXTERNALIZED_PATTERNS)
+            ):
+                continue
+            indices.append(index)
     return indices
 
 
@@ -3028,18 +3204,24 @@ def _line_coverage_remap_dropped_ranked_diagnostic(
     after: str,
     options: NoisegateOptions,
     preserve_patterns: tuple[re.Pattern[str], ...] | None,
+    first_priority_patterns: tuple[re.Pattern[str], ...] = (),
     required_notices: list[str] | None = None,
 ) -> bool:
     if not _omission_notices(before):
         return False
     lines = before.splitlines()
-    diagnostic_indices = _ranked_diagnostic_line_indices(before, preserve_patterns)
+    diagnostic_indices = _ranked_diagnostic_line_indices(
+        before,
+        preserve_patterns,
+        first_priority_patterns,
+    )
     if not diagnostic_indices:
         return False
     best = _best_ranked_diagnostic_excerpt(
         before=before,
         options=options,
         preserve_patterns=preserve_patterns,
+        first_priority_patterns=first_priority_patterns,
         required_notices=required_notices,
     )
     if best is None:
@@ -3064,6 +3246,7 @@ def _ensure_ranked_diagnostic_after_line_coverage_remap(
     shortened: str | None,
     options: NoisegateOptions,
     preserve_patterns: tuple[re.Pattern[str], ...] | None,
+    first_priority_patterns: tuple[re.Pattern[str], ...] = (),
     required_notices: list[str] | None = None,
 ) -> str | None:
     if shortened is None or not _omission_notices(before):
@@ -3073,9 +3256,14 @@ def _ensure_ranked_diagnostic_after_line_coverage_remap(
         before=before,
         options=options,
         preserve_patterns=preserve_patterns,
+        first_priority_patterns=first_priority_patterns,
         required_notices=required_notices,
     )
-    diagnostic_indices = _ranked_diagnostic_line_indices(before, preserve_patterns)
+    diagnostic_indices = _ranked_diagnostic_line_indices(
+        before,
+        preserve_patterns,
+        first_priority_patterns,
+    )
     if not diagnostic_indices:
         return shortened
     if best is None:
@@ -3104,6 +3292,7 @@ def _best_ranked_diagnostic_excerpt(
     before: str,
     options: NoisegateOptions,
     preserve_patterns: tuple[re.Pattern[str], ...] | None,
+    first_priority_patterns: tuple[re.Pattern[str], ...] = (),
     required_notices: list[str] | None = None,
 ) -> tuple[int, str] | None:
     token = None
@@ -3116,6 +3305,7 @@ def _best_ranked_diagnostic_excerpt(
             before=before,
             options=options,
             preserve_patterns=preserve_patterns,
+            first_priority_patterns=first_priority_patterns,
             required_notices=required_notices,
         )
     except _SourceAlignmentWorkExhausted:
@@ -3132,6 +3322,7 @@ def _best_ranked_diagnostic_excerpt_with_budget(
     before: str,
     options: NoisegateOptions,
     preserve_patterns: tuple[re.Pattern[str], ...] | None,
+    first_priority_patterns: tuple[re.Pattern[str], ...],
     required_notices: list[str] | None,
 ) -> tuple[int, str] | None:
     body_options = _options_reserving_notices(options, required_notices)
@@ -3144,20 +3335,40 @@ def _best_ranked_diagnostic_excerpt_with_budget(
         for index, line in enumerate(lines)
         if any(pattern.search(line) for pattern in LCM_EXTERNALIZED_PATTERNS)
     ]
-    for diagnostic_index in _ranked_diagnostic_line_indices(before, preserve_patterns):
-        candidate = _marked_excerpt_for_line_indices(
-            lines,
-            [*lcm_indices, diagnostic_index],
-        )
-        if candidate is None:
-            continue
-        candidate = _remark_excerpt_with_line_coverage_with_budget(
-            before,
-            candidate,
-            source_lines=lines,
-        )
-        if candidate is not None and _fits_budget(candidate, body_options):
-            return diagnostic_index, candidate
+    for diagnostic_index in _ranked_diagnostic_line_indices(
+        before,
+        preserve_patterns,
+        first_priority_patterns,
+    ):
+        candidate_index_sets: list[list[int]] = []
+        if first_priority_patterns and _first_pattern_match(
+            lines[diagnostic_index], first_priority_patterns
+        ):
+            max_forward_context = min(
+                max(0, options.important_context_lines),
+                len(lines) - diagnostic_index - 1,
+            )
+            for context in range(max_forward_context, 0, -1):
+                candidate_index_sets.append(
+                    sorted(
+                        {
+                            *lcm_indices,
+                            *range(diagnostic_index, diagnostic_index + context + 1),
+                        }
+                    )
+                )
+        candidate_index_sets.append(sorted({*lcm_indices, diagnostic_index}))
+        for candidate_indices in candidate_index_sets:
+            candidate = _marked_excerpt_for_line_indices(lines, candidate_indices)
+            if candidate is None:
+                continue
+            candidate = _remark_excerpt_with_line_coverage_with_budget(
+                before,
+                candidate,
+                source_lines=lines,
+            )
+            if candidate is not None and _fits_budget(candidate, body_options):
+                return diagnostic_index, candidate
     return None
 
 
@@ -3515,6 +3726,7 @@ def _append_recovery_notices(
     artifact_dir: Path | None = None,
     options: NoisegateOptions | None = None,
     preserve_patterns: tuple[re.Pattern[str], ...] | None = None,
+    first_priority_patterns: tuple[re.Pattern[str], ...] = (),
     fail_open_text: str | None = None,
 ) -> str:
     fallback = text if fail_open_text is None else fail_open_text
@@ -3564,6 +3776,7 @@ def _append_recovery_notices(
             text,
             options,
             preserve_patterns=preserve_patterns,
+            first_priority_patterns=first_priority_patterns,
         ) or text
 
     text_budget = budget - len(suffix)
@@ -3576,6 +3789,7 @@ def _append_recovery_notices(
         text,
         reserved_options,
         preserve_patterns=preserve_patterns,
+        first_priority_patterns=first_priority_patterns,
     )
     if reserved_tight_excerpt is None and reserved_options.max_lines < 2 and re.search(
         r"\bunhandled\s+exception\b",
@@ -3591,12 +3805,14 @@ def _append_recovery_notices(
             text,
             reserved_options,
             preserve_patterns=preserve_patterns,
+            first_priority_patterns=first_priority_patterns,
         )
     if shortened is not None and not used_reserved_tight_excerpt:
         marked_shortened = _single_preserved_line_excerpt(
             text,
             reserved_options,
             preserve_patterns,
+            first_priority_patterns,
         )
         if (
             marked_shortened is not None
@@ -3621,6 +3837,7 @@ def _append_recovery_notices(
             text,
             reserved_options,
             preserve_patterns,
+            first_priority_patterns,
         )
         if shortened is None:
             return fallback if requires_exit_notice else text
@@ -3629,6 +3846,7 @@ def _append_recovery_notices(
             text,
             reserved_options,
             preserve_patterns,
+            first_priority_patterns,
         )
     if shortened is None:
         notice_only = suffix.lstrip("\n")
@@ -3704,10 +3922,22 @@ def _single_preserved_line_excerpt(
     text: str,
     options: NoisegateOptions,
     preserve_patterns: tuple[re.Pattern[str], ...] | None,
+    first_priority_patterns: tuple[re.Pattern[str], ...] = (),
 ) -> str | None:
     if preserve_patterns is None:
         return None
-    matches = _ranked_pattern_line_matches(text, preserve_patterns)
+    first_ids = {id(pattern) for pattern in first_priority_patterns}
+    remaining_patterns = tuple(
+        pattern for pattern in preserve_patterns if id(pattern) not in first_ids
+    )
+    matches = [
+        *(
+            _ranked_pattern_line_matches(text, first_priority_patterns)
+            if first_priority_patterns
+            else []
+        ),
+        *_ranked_pattern_line_matches(text, remaining_patterns),
+    ]
     if not matches:
         return None
     layout = _line_layout(text)
@@ -5599,15 +5829,29 @@ def _looks_like_docker_build_output(sample: str) -> bool:
         "failed to solve" in sample
         or "did not complete successfully" in sample
         or ("dockerfile" in sample and re.search(r"(?m)^(#\d+|=>)", sample))
-        or re.search(r"(?im)(?:^|\|)\s*#\d+\s+.*\bdockerfile\b", sample)
-        or re.search(r"(?im)(?:^|\|)\s*=>\s+.*\bdockerfile\b", sample)
         or re.search(
-            r"(?im)(?:^|\|)\s*(?:#\d+|=>)\s+.*\b"
+            r"(?im)(?:^|\|)[^\S\r\n]*#\d+[^\S\r\n]+[^\r\n]*\bdockerfile\b",
+            sample,
+        )
+        or re.search(
+            r"(?im)(?:^|\|)[^\S\r\n]*=>[^\S\r\n]+[^\r\n]*\bdockerfile\b",
+            sample,
+        )
+        or re.search(
+            r"(?im)(?:^|\|)[^\S\r\n]*(?:#\d+|=>)[^\S\r\n]+[^\r\n]*\b"
             r"(?:load metadata|load \.dockerignore|exporting|writing image)\b",
             sample,
         )
-        or re.search(r"(?im)(?:^|\|)\s*(?:#\d+|=>)\s+(?:done|cached)\b", sample)
-        or re.search(r"(?im)(?:^|\|)\s*(?:#\d+|=>)\s+.*\b(?:done|cached)\b", sample)
+        or re.search(
+            r"(?im)(?:^|\|)[^\S\r\n]*(?:#\d+|=>)[^\S\r\n]+"
+            r"(?:done|cached)\b",
+            sample,
+        )
+        or re.search(
+            r"(?im)(?:^|\|)[^\S\r\n]*(?:#\d+|=>)[^\S\r\n]+"
+            r"[^\r\n]*\b(?:done|cached)\b",
+            sample,
+        )
     )
 
 
