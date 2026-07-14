@@ -488,18 +488,24 @@ def _reduce_json_value_with_budget(
 
     call_args: dict[str, Any] = _envelope_call_args(parsed) if isinstance(parsed, dict) else {}
     tool_name = ""
+    explicit_tool_name = ""
     resolved_wrapper_identity = False
     if isinstance(parsed, dict):
         explicit_tool_name = _envelope_tool_name(parsed)
         wrapper_alias = parsed.get("name")
         if isinstance(wrapper_alias, str) and wrapper_alias.strip():
             wrapper_alias = wrapper_alias.strip()
-            if explicit_tool_name and wrapper_alias != explicit_tool_name:
-                return raw
-            if explicit_tool_name or wrapper_alias in WRAPPER_TOOL_NAMES:
+            if (
+                explicit_tool_name in WRAPPER_TOOL_NAMES
+                or wrapper_alias in WRAPPER_TOOL_NAMES
+            ):
+                if explicit_tool_name and wrapper_alias != explicit_tool_name:
+                    return raw
                 explicit_tool_name = wrapper_alias
-            else:
+            elif not explicit_tool_name:
                 return raw
+        elif "name" in parsed and not explicit_tool_name:
+            return raw
         if explicit_tool_name in WRAPPER_TOOL_NAMES:
             resolved_wrapper = _resolve_wrapped_call(parsed)
             if resolved_wrapper is None:
@@ -507,7 +513,10 @@ def _reduce_json_value_with_budget(
             resolved_wrapper_identity = True
             tool_name = resolved_wrapper.tool_name
             call_args = dict(resolved_wrapper.call_args)
-            wrapper_tool_names = _tool_names_from_payload(call_args)
+            wrapper_tool_names = _tool_names_from_payload(
+                call_args,
+                root_name_is_wrapper_owned=True,
+            )
             if len(wrapper_tool_names) > 1 or (
                 wrapper_tool_names and tool_name not in wrapper_tool_names
             ):
@@ -533,7 +542,25 @@ def _reduce_json_value_with_budget(
                 json_encoded_result = _nested_json_text_requires_exact(result_value)
             except (DuplicateJSONKeyError, json.JSONDecodeError, ValueError, RecursionError):
                 return raw
-        nested_tool_name = _embedded_result_tool_name(result_value)
+        result_mapping = _result_mapping(result_value)
+        result_has_explicit_identity = bool(
+            isinstance(result_mapping, dict) and _envelope_tool_name(result_mapping)
+        )
+        allow_result_root_label = bool(
+            explicit_tool_name
+            or resolved_wrapper_identity
+            or result_has_explicit_identity
+        )
+        if (
+            isinstance(result_mapping, dict)
+            and "name" in result_mapping
+            and not allow_result_root_label
+        ):
+            return raw
+        nested_tool_name = _embedded_result_tool_name(
+            result_value,
+            allow_root_label=allow_result_root_label,
+        )
         preserve_wrapped_json_result = (
             resolved_wrapper_identity
             and json_encoded_result
@@ -928,11 +955,17 @@ def _remove_injected_exit_hints(payload: dict[Any, Any], injected_keys: tuple[st
         payload.pop(key, None)
 
 
-def _embedded_result_tool_name(result_value: Any) -> str:
+def _embedded_result_tool_name(result_value: Any, *, allow_root_label: bool) -> str:
     nested = _result_mapping(result_value)
     if not isinstance(nested, dict):
         return ""
-    names = _tool_names_from_payload(nested)
+    root_has_explicit_identity = bool(_envelope_tool_name(nested))
+    names = _tool_names_from_payload(
+        nested,
+        root_name_is_wrapper_owned=not (
+            allow_root_label or root_has_explicit_identity
+        ),
+    )
     if len(names) > 1:
         raise ValueError("ambiguous embedded result tool identity")
     return next(iter(names), "")

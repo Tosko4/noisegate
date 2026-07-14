@@ -237,7 +237,10 @@ def _transform_tool_result_with_budget(
         if resolved_wrapper is not None:
             args_map = dict(resolved_wrapper.call_args)
             arguments_map = {}
-            wrapper_tool_names = _tool_names_from_payload(args_map)
+            wrapper_tool_names = _tool_names_from_payload(
+                args_map,
+                root_name_is_wrapper_owned=True,
+            )
             if len(wrapper_tool_names) > 1 or (
                 wrapper_tool_names and effective_tool_name not in wrapper_tool_names
             ):
@@ -267,7 +270,10 @@ def _transform_tool_result_with_budget(
             )
         tool_name = effective_tool_name
         if isinstance(parsed, Mapping):
-            embedded_tool_names = _tool_names_from_payload(parsed)
+            embedded_tool_names = _tool_names_from_payload(
+                parsed,
+                root_name_is_wrapper_owned=False,
+            )
             if len(embedded_tool_names) > 1:
                 return None
             if embedded_tool_names:
@@ -278,6 +284,8 @@ def _transform_tool_result_with_budget(
                     return None
                 tool_name = embedded_tool_name
         if not tool_name:
+            if isinstance(parsed, Mapping) and "name" in parsed:
+                return None
             if not _looks_terminal_payload(parsed, call_args):
                 return None
             tool_name = "terminal"
@@ -1282,11 +1290,17 @@ def _command_sources_from_payload(payload: Mapping[str, Any]) -> tuple[Mapping[s
     return tuple(sources)
 
 
-def _tool_names_from_payload(payload: Mapping[str, Any]) -> frozenset[str]:
+def _tool_names_from_payload(
+    payload: Mapping[str, Any],
+    *,
+    root_name_is_wrapper_owned: bool,
+) -> frozenset[str]:
     names: set[str] = set()
-    for source in _command_sources_from_payload(payload):
+    for index, source in enumerate(_command_sources_from_payload(payload)):
         if tool_name := _payload_tool_name(source):
             names.add(tool_name)
+        if index == 0 and not root_name_is_wrapper_owned:
+            continue
         nested_name = source.get("name")
         if isinstance(nested_name, str) and nested_name.strip():
             names.add(nested_name.strip())

@@ -101,6 +101,39 @@ def test_transform_tool_result_compacts_terminal_json() -> None:
     assert payload["noisegate"]["fields"]["stdout"]["reducer"] == "pytest"
 
 
+def test_explicit_terminal_tool_preserves_ordinary_payload_name_label() -> None:
+    raw = json.dumps(
+        {
+            "name": "pytest shard",
+            "stdout": numbered("pytest output", 100),
+            "exit": 0,
+        }
+    )
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="terminal",
+        args={"command": "pytest -q"},
+        noisegate_max_chars=120,
+    )
+
+    payload = parse_hook_result(transformed)
+    assert payload["name"] == "pytest shard"
+    assert "[noisegate: omitted" in payload["stdout"]
+
+
+def test_bare_top_level_name_does_not_supply_tool_identity() -> None:
+    raw = json.dumps(
+        {
+            "name": "terminal",
+            "stdout": numbered("exact payload", 100),
+            "exit": 0,
+        }
+    )
+
+    assert transform_tool_result(raw, noisegate_max_chars=120) is None
+
+
 def test_transform_tool_result_preserves_failure_lines_in_stderr() -> None:
     raw = json.dumps(
         {
@@ -592,7 +625,14 @@ def test_tool_call_wrapper_preserves_json_encoded_result_fields() -> None:
 
 
 def test_tool_call_wrapper_compacts_json_encoded_terminal_result() -> None:
-    nested = json.dumps({"stdout": numbered("pytest output", 180), "exit": 0})
+    nested = json.dumps(
+        {
+            "tool_name": "terminal",
+            "name": "pytest shard",
+            "stdout": numbered("pytest output", 180),
+            "exit": 0,
+        }
+    )
     raw = json.dumps({"result": nested})
 
     transformed = transform_tool_result(
@@ -606,6 +646,7 @@ def test_tool_call_wrapper_compacts_json_encoded_terminal_result() -> None:
     payload = json.loads(transformed)
     nested_payload = json.loads(payload["result"])
     assert nested_payload["exit"] == 0
+    assert nested_payload["name"] == "pytest shard"
     assert "[noisegate: omitted" in nested_payload["stdout"]
 
 
@@ -1008,24 +1049,25 @@ def test_tool_call_wrapper_rejects_root_name_identity_in_resolved_arguments() ->
     )
 
 
-def test_tool_call_wrapper_rejects_root_name_identity_in_result() -> None:
+def test_tool_call_wrapper_treats_root_result_name_as_label() -> None:
     raw = json.dumps(
         {
-            "name": "mcp_github_get_file",
-            "stdout": numbered("exact source", 180),
+            "name": "pytest shard",
+            "stdout": numbered("pytest output", 180),
             "exit": 0,
         }
     )
 
-    assert (
-        transform_tool_result(
-            raw,
-            tool_name="tool_call",
-            args={"name": "terminal", "arguments": {"command": "pytest -q"}},
-            noisegate_max_chars=120,
-        )
-        is None
+    transformed = transform_tool_result(
+        raw,
+        tool_name="tool_call",
+        args={"name": "terminal", "arguments": {"command": "pytest -q"}},
+        noisegate_max_chars=120,
     )
+
+    payload = parse_hook_result(transformed)
+    assert payload["name"] == "pytest shard"
+    assert "[noisegate: omitted" in payload["stdout"]
 
 
 def test_tool_call_wrapper_rejects_sibling_call_ownership() -> None:
@@ -1118,24 +1160,28 @@ def test_tool_call_wrapper_rejects_malformed_identity_types() -> None:
         )
 
 
-def test_tool_call_wrapper_rejects_malformed_nested_name_identities() -> None:
+def test_tool_call_wrapper_treats_nonstring_root_result_name_as_label() -> None:
     result_with_name = json.dumps(
         {
-            "name": ["mcp_github_get_file"],
-            "stdout": numbered("exact source", 180),
+            "name": ["pytest shard"],
+            "stdout": numbered("pytest output", 180),
             "exit": 0,
         }
     )
 
-    assert (
-        transform_tool_result(
-            result_with_name,
-            tool_name="tool_call",
-            args={"name": "terminal", "arguments": {"command": "pytest -q"}},
-            noisegate_max_chars=120,
-        )
-        is None
+    transformed = transform_tool_result(
+        result_with_name,
+        tool_name="tool_call",
+        args={"name": "terminal", "arguments": {"command": "pytest -q"}},
+        noisegate_max_chars=120,
     )
+
+    payload = parse_hook_result(transformed)
+    assert payload["name"] == ["pytest shard"]
+    assert "[noisegate: omitted" in payload["stdout"]
+
+
+def test_tool_call_wrapper_rejects_malformed_name_identity_in_arguments() -> None:
     assert (
         transform_tool_result(
             json.dumps({"stdout": numbered("exact source", 180), "exit": 0}),
