@@ -202,6 +202,12 @@ def test_hermes_hooks_preserve_profiled_retrieval_output_exactly() -> None:
         "hermes -p work lcm expand 123",
         "hermes -pwork lcm expand 123",
         "hermes --yolo --profile work lcm expand 123",
+        "hermes --pass-session-id lcm expand 123",
+        "hermes --ignore-user-config lcm expand 123",
+        "hermes --ignore-rules lcm expand 123",
+        "hermes --tui lcm expand 123",
+        "hermes --resume=session-123 lcm expand 123",
+        "hermes --continue --yolo lcm expand 123",
         "exec /opt/hermes/bin/hermes --profile work 2>/dev/null lcm expand 123 <<<ignored",
         "printf '%s' \"$(hermes --profile work lcm expand 123)\"",
     )
@@ -231,6 +237,8 @@ def test_hermes_hooks_keep_profiled_maintenance_output_compactable() -> None:
     for command in (
         "hermes --profile work lcm import archive.jsonl",
         "hermes -p work lcm doctor --reindex",
+        "hermes --ignore-rules lcm import archive.jsonl",
+        "hermes --pass-session-id lcm doctor --reindex",
     ):
         terminal_output = transform_terminal_output(
             command=command,

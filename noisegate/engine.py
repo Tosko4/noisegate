@@ -130,7 +130,38 @@ MEMORY_RETRIEVAL_HELPERS = frozenset(
         "session_search",
     }
 )
-HERMES_VALUELESS_GLOBAL_OPTIONS = frozenset({"--yolo"})
+HERMES_VALUELESS_GLOBAL_OPTIONS = frozenset(
+    {
+        "--accept-hooks",
+        "--cli",
+        "--dev",
+        "--ignore-rules",
+        "--ignore-user-config",
+        "--no-restore-cwd",
+        "--pass-session-id",
+        "--safe-mode",
+        "--tui",
+        "--worktree",
+        "--yolo",
+        "-w",
+    }
+)
+HERMES_REQUIRED_VALUE_GLOBAL_OPTIONS = frozenset(
+    {
+        "--model",
+        "--provider",
+        "--resume",
+        "--skills",
+        "--toolsets",
+        "--usage-file",
+        "-m",
+        "-r",
+        "-s",
+        "-t",
+    }
+)
+HERMES_OPTIONAL_VALUE_GLOBAL_OPTIONS = frozenset({"--continue", "-c"})
+HERMES_ATTACHED_SHORT_VALUE_OPTIONS = ("-m", "-r", "-s", "-t")
 HERMES_PROFILE_ID_PATTERN = re.compile(
     r"[a-z0-9][a-z0-9_-]{0,63}",
     re.IGNORECASE | re.ASCII,
@@ -3970,6 +4001,9 @@ def _hermes_top_level_command_tokens(tokens: list[str]) -> list[str] | None:
     index = 1
     while index < len(tokens):
         token = tokens[index]
+        if token == "--":
+            index += 1
+            return tokens[index:] or None
         if token in HERMES_VALUELESS_GLOBAL_OPTIONS:
             index += 1
             continue
@@ -3992,6 +4026,48 @@ def _hermes_top_level_command_tokens(tokens: list[str]) -> list[str] | None:
         if token.startswith("-p") and token != "-p":
             if HERMES_PROFILE_ID_PATTERN.fullmatch(token[2:]) is None:
                 return None
+            index += 1
+            continue
+        if token in HERMES_REQUIRED_VALUE_GLOBAL_OPTIONS:
+            if index + 1 >= len(tokens) or tokens[index + 1].startswith("-"):
+                return None
+            index += 2
+            continue
+        long_value_option = next(
+            (
+                option
+                for option in HERMES_REQUIRED_VALUE_GLOBAL_OPTIONS
+                if option.startswith("--") and token.startswith(f"{option}=")
+            ),
+            None,
+        )
+        if long_value_option is not None:
+            if not token.removeprefix(f"{long_value_option}="):
+                return None
+            index += 1
+            continue
+        attached_short_option = next(
+            (
+                option
+                for option in HERMES_ATTACHED_SHORT_VALUE_OPTIONS
+                if token.startswith(option) and token != option
+            ),
+            None,
+        )
+        if attached_short_option is not None:
+            index += 1
+            continue
+        if token in HERMES_OPTIONAL_VALUE_GLOBAL_OPTIONS:
+            index += 1
+            if index < len(tokens) and not tokens[index].startswith("-"):
+                index += 1
+            continue
+        if token.startswith("--continue="):
+            if not token.removeprefix("--continue="):
+                return None
+            index += 1
+            continue
+        if token.startswith("-c") and token != "-c":
             index += 1
             continue
         if token.startswith("-"):
