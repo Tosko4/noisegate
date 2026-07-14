@@ -257,11 +257,13 @@ Operational rules:
 1. Use Noisegate for noisy terminal/tool output, not for exact source material.
 2. Do not compact file reads, patches, diffs, retrieved context, skill docs, memory results, MCP results, or web extraction output.
    Treat code-search output (`rg`, `grep`, `ag`, `ack`) as source context and leave it exact.
-3. Do not treat Noisegate as a raw-output archive. Raw artifacts are off by default.
-4. Keep Hermes-LCM optional. Noisegate must work without it.
-5. Do not write raw terminal output into Hindsight.
-6. If compaction fails, preserve the original output.
-7. Before committing, run the quality gate and scan the diff for secrets and personal/private data.
+3. Keep MCP stdio/HTTP outputs protected by default. Huge listings only become compactable through a future explicit allowlist; exact source, resources, schemas, rows, snapshots, stack traces, discovery metadata, and error/log output stay protected.
+4. For generic `tool_call` wrappers, classify by the real wrapped tool name when one is available; otherwise fail closed and keep the output exact.
+5. Do not treat Noisegate as a raw-output archive. Raw artifacts are off by default, and secret/header-looking output is refused even when artifacts are enabled.
+6. Keep Hermes-LCM optional. Noisegate must work without it.
+7. Do not write raw terminal output into Hindsight.
+8. If compaction fails, preserve the original output.
+9. Before committing, run the quality gate and scan the diff for secrets and personal/private data.
 
 Safe smoke test for a lane or installation:
 
@@ -326,6 +328,10 @@ unknown future tools
 
 `execute_code` is protected even when its printed output looks like compactable test, dependency, package-manager, or log spam. That boundary is deliberate: `execute_code` only returns script stdout, and stdout can be source code, JSON, configs, diffs, copied web excerpts, or other exact context. If a script intentionally wants compaction for a known noisy command, use an explicit command-aware route instead, such as the `terminal` tool, `noisegate wrap -- <command>`, or a `reduce-json` envelope labeled as a noisy command/tool. When in doubt, keep `execute_code` raw.
 
+MCP is intentionally boring by default: `mcp_*` and `mcp__*` results are exact evidence, not compaction fodder. This includes GitHub source and file content, resources, database rows, Playwright snapshots, Sentry stack traces, prompt/tool schemas, dynamic tool-discovery metadata, and MCP error/log output. A future explicit allowlist may opt in specific large listing shapes without weakening those exact-evidence defaults.
+
+When a host emits a generic `tool_call` wrapper, Noisegate uses the wrapped tool name when the wrapper supplies one. A wrapper around `terminal` follows terminal compaction behavior; a wrapper around `mcp_github_list_issues` remains protected. Missing or unknown wrapped names fail closed and stay exact. Duplicate or conflicting identities, detached argument maps, conflicting command hints, malformed JSON, cyclic/shared structures, and over-budget nesting also stay exact.
+
 Bypass controls:
 
 ```text
@@ -359,6 +365,7 @@ When artifact mode is enabled, Noisegate writes the original output to a private
 - default size cap of 1,000,000 bytes
 - content-addressed IDs shaped like `ng_<sha256-prefix>`
 - path containment and symlink traversal checks
+- refusal of secret-, credential-, cookie-, authorization-header-, and API-key-looking raw output, scanning the complete payload before storage
 
 Retrieve an artifact:
 

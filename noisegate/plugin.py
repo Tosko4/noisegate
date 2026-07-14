@@ -32,10 +32,21 @@ from .engine import (
     _store_artifact,
     classify_command,
 )
+from .json_utils import DuplicateJSONKeyError, strict_json_loads
 
 HookCallback: TypeAlias = Callable[..., str | None]
 
 TERMINAL_TOOL_NAMES = frozenset({"terminal", "process", "read_terminal"})
+WRAPPER_TOOL_NAMES = frozenset({"tool_call"})
+MAX_WRAPPER_JSON_CHARS = 65_536
+MAX_NESTED_JSON_DEPTH = 8
+MAX_NESTED_JSON_NODES = 512
+JSON_NUMBER_RE = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
+JSON5_OBJECT_KEY_RE = re.compile(
+    r"(?:[A-Za-z_$][A-Za-z0-9_$.-]*|"
+    r"[+-]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|Infinity|NaN)|"
+    r"[+-]?0[xX][0-9A-Fa-f]+)\s*:"
+)
 TERMINAL_TEXT_FIELDS = ("stdout", "stderr", "output")
 ALWAYS_PROTECTED_COMMAND_CLASSES = frozenset({"file_read", "source_search", "patch"})
 CONDITIONALLY_PROTECTED_COMMAND_CLASSES = frozenset({"git_diff"})
@@ -199,33 +210,82 @@ def _transform_tool_result_with_budget(
 ) -> str | None:
     try:
         override = kwargs.pop("noisegate_exit_code", None)
+        disable_artifacts = bool(kwargs.pop("_disable_artifacts", False))
         exit_code_override = (
             override if isinstance(override, int) and not isinstance(override, bool) else None
         )
         if not isinstance(result, str):
             return None
-        if tool_name and not _is_compactable_tool_name(tool_name):
+        args_map = args if isinstance(args, Mapping) else {}
+        arguments_map = arguments if isinstance(arguments, Mapping) else {}
+        effective_tool_name = tool_name
+        resolved_wrapper: _ResolvedWrapperCall | None = None
+        if tool_name in WRAPPER_TOOL_NAMES:
+            resolved_wrapper = _resolve_wrapped_call(args_map, arguments_map)
+            if resolved_wrapper is None:
+                return None
+            effective_tool_name = resolved_wrapper.tool_name
+        if effective_tool_name and not _is_compactable_tool_name(effective_tool_name):
             return None
         options = NoisegateOptions.from_env().with_mapping(kwargs)
+        if disable_artifacts:
+            options = replace(options, artifact_enabled=False)
         if not options.enabled or options.mode == "off":
             return None
 
-        parsed = json.loads(result)
-        args_map = args if isinstance(args, Mapping) else {}
-        arguments_map = arguments if isinstance(arguments, Mapping) else {}
-        call_args = _call_args(
-            args,
-            arguments,
-            parsed,
-            prefer_host_args=bool(tool_name),
-        )
-        if not tool_name and isinstance(parsed, Mapping):
-            embedded_tool_name = _payload_tool_name(parsed)
-            if embedded_tool_name:
+        parsed = strict_json_loads(result)
+        if resolved_wrapper is not None:
+            args_map = dict(resolved_wrapper.call_args)
+            arguments_map = {}
+            wrapper_tool_names = _tool_names_from_payload(
+                args_map,
+                root_name_is_wrapper_owned=True,
+            )
+            if len(wrapper_tool_names) > 1 or (
+                wrapper_tool_names and effective_tool_name not in wrapper_tool_names
+            ):
+                return None
+            result_sources = (
+                list(_command_sources_from_payload(parsed))
+                if isinstance(parsed, Mapping)
+                else []
+            )
+            wrapper_sources = list(_command_sources_from_payload(args_map))
+            commands = {
+                command
+                for source in (*wrapper_sources, *result_sources)
+                for command in _commands_from_source(source)
+            }
+            if len(commands) > 1:
+                return None
+            if commands and not _has_command_hint(args_map):
+                args_map["command"] = next(iter(commands))
+            call_args = args_map
+        else:
+            call_args = _call_args(
+                args,
+                arguments,
+                parsed,
+                prefer_host_args=bool(tool_name),
+            )
+        tool_name = effective_tool_name
+        if isinstance(parsed, Mapping):
+            embedded_tool_names = _tool_names_from_payload(
+                parsed,
+                root_name_is_wrapper_owned=False,
+            )
+            if len(embedded_tool_names) > 1:
+                return None
+            if embedded_tool_names:
+                embedded_tool_name = next(iter(embedded_tool_names))
                 if not _is_compactable_tool_name(embedded_tool_name):
+                    return None
+                if tool_name and embedded_tool_name != tool_name:
                     return None
                 tool_name = embedded_tool_name
         if not tool_name:
+            if isinstance(parsed, Mapping) and "name" in parsed:
+                return None
             if not _looks_terminal_payload(parsed, call_args):
                 return None
             tool_name = "terminal"
@@ -338,6 +398,12 @@ def _transform_tool_result_with_budget(
         if exit_code is None:
             exit_code = exit_code_override
         fields = _candidate_fields(tool_name, payload)
+        if (
+            resolved_wrapper is not None
+            and isinstance(payload.get("result"), str)
+            and "result" not in fields
+        ):
+            fields = (*fields, "result")
         if options.artifact_enabled and sum(
             isinstance(payload.get(field), str) and bool(payload.get(field)) for field in fields
         ) > 1:
@@ -365,6 +431,48 @@ def _transform_tool_result_with_budget(
         for field in fields:
             value = payload.get(field)
             if not isinstance(value, str):
+                continue
+            nested_json = _nested_json_text_requires_exact(value)
+            if nested_json and field == "result" and tool_name in TERMINAL_TOOL_NAMES:
+                nested_payload = strict_json_loads(value)
+                if not isinstance(nested_payload, Mapping):
+                    continue
+                nested_call_args = dict(call_args)
+                nested_commands = {
+                    command
+                    for source in (
+                        *_command_sources_from_payload(nested_call_args),
+                        *_command_sources_from_payload(nested_payload),
+                    )
+                    for command in _commands_from_source(source)
+                }
+                if len(nested_commands) > 1:
+                    return None
+                if nested_commands:
+                    nested_call_args["command"] = next(iter(nested_commands))
+                nested_kwargs = dict(kwargs)
+                nested_transformed = _transform_tool_result_with_budget(
+                    value,
+                    tool_name=tool_name,
+                    args=nested_call_args,
+                    arguments=None,
+                    defer_artifact_store=False,
+                    artifact_plans_out=None,
+                    _disable_artifacts=True,
+                    **nested_kwargs,
+                )
+                if nested_transformed is not None:
+                    payload[field] = nested_transformed
+                    field_metadata[field] = {
+                        "version": __version__,
+                        "compacted": True,
+                        "mode": options.mode,
+                        "reducer": "nested_json",
+                        "original_chars": len(value),
+                        "omitted_chars": max(0, len(value) - len(nested_transformed)),
+                    }
+                continue
+            if nested_json:
                 continue
             reduced = _reduce_text_in_operation(
                 value,
@@ -573,7 +681,7 @@ def _artifact_preview_plan_matches_serialized_output(
     output: str,
 ) -> bool:
     try:
-        owner: Any = json.loads(output)
+        owner: Any = strict_json_loads(output)
     except (json.JSONDecodeError, RecursionError, ValueError):
         return False
     for step in plan.owner_path:
@@ -584,7 +692,7 @@ def _artifact_preview_plan_matches_serialized_output(
             if not isinstance(owner, str):
                 return False
             try:
-                owner = json.loads(owner)
+                owner = strict_json_loads(owner)
             except (json.JSONDecodeError, RecursionError, ValueError):
                 return False
     return isinstance(owner, str) and _artifact_preview_plan_notice_present_in_text(plan, owner)
@@ -821,6 +929,326 @@ def _candidate_fields(tool_name: str, payload: Mapping[str, JsonValue]) -> tuple
     return tuple(field for field in candidates if field in payload)
 
 
+def _nested_json_text_requires_exact(value: str) -> bool:
+    """Validate JSON-encoded text recursively and keep the complete field exact."""
+
+    remaining = MAX_NESTED_JSON_NODES
+
+    def looks_structural(text: str) -> bool:
+        sample = text if len(text) <= MAX_WRAPPER_JSON_CHARS else text[:256]
+        stripped = sample.lstrip()
+        if stripped.startswith("\ufeff"):
+            stripped = stripped[1:].lstrip()
+        if not stripped:
+            return len(sample) < len(text)
+        if stripped.startswith('"'):
+            return True
+        tail = stripped[1:].lstrip()
+        if stripped.startswith("{"):
+            return (
+                not tail
+                or tail.startswith(('"', "'", "}"))
+                or JSON5_OBJECT_KEY_RE.match(tail) is not None
+            )
+        if stripped.startswith("["):
+            array_like = (
+                not tail
+                or tail.startswith(('"', "'", "{", "[", "]", "-"))
+                or tail[:1].isdigit()
+                or tail.startswith(
+                    ("true", "false", "null", "undefined", "NaN", "Infinity")
+                )
+            )
+            if not array_like:
+                return False
+            if tail.startswith("-") or tail[:1].isdigit():
+                closing = stripped.find("]")
+                if closing >= 0 and stripped[closing + 1 :].strip():
+                    return "," in stripped[1:closing]
+            return True
+        if stripped.rstrip() in {
+            "true",
+            "false",
+            "null",
+            "NaN",
+            "Infinity",
+            "-Infinity",
+        }:
+            return True
+        return JSON_NUMBER_RE.fullmatch(stripped.rstrip()) is not None
+
+    def looks_nested_json_candidate(text: str) -> bool:
+        sample = text if len(text) <= MAX_WRAPPER_JSON_CHARS else text[:256]
+        stripped = sample.lstrip()
+        return looks_structural(text) or stripped.rstrip() in {
+            "NaN",
+            "Infinity",
+            "-Infinity",
+        }
+
+    def inspect(node: Any, depth: int) -> None:
+        nonlocal remaining
+        if depth > MAX_NESTED_JSON_DEPTH or remaining <= 0:
+            raise ValueError("nested JSON validation budget exhausted")
+        remaining -= 1
+        if isinstance(node, Mapping):
+            for child in node.values():
+                inspect(child, depth + 1)
+            return
+        if isinstance(node, list):
+            for child in node:
+                inspect(child, depth + 1)
+            return
+        if not isinstance(node, str):
+            return
+        json_like = looks_nested_json_candidate(node)
+        if len(node) > MAX_WRAPPER_JSON_CHARS:
+            if json_like:
+                raise ValueError("nested JSON text exceeds size limit")
+            return
+        if not json_like:
+            return
+        try:
+            decoded = strict_json_loads(node)
+        except DuplicateJSONKeyError:
+            raise
+        except json.JSONDecodeError as exc:
+            raise ValueError("malformed nested JSON text") from exc
+        inspect(decoded, depth + 1)
+
+    json_like = looks_structural(value)
+    if len(value) > MAX_WRAPPER_JSON_CHARS:
+        if json_like:
+            raise ValueError("nested JSON text exceeds size limit")
+        return False
+    if not json_like:
+        return False
+    try:
+        decoded = strict_json_loads(value)
+    except DuplicateJSONKeyError:
+        raise
+    except json.JSONDecodeError as exc:
+        raise ValueError("malformed JSON-like text") from exc
+    inspect(decoded, 0)
+    return True
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedWrapperCall:
+    tool_name: str
+    call_args: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _WrapperIdentity:
+    tool_name: str
+    owner: Mapping[str, Any]
+    owner_path: tuple[Mapping[str, Any], ...]
+
+
+def _resolve_wrapped_call(*sources: Mapping[str, Any]) -> _ResolvedWrapperCall | None:
+    remaining = 64
+    visited: set[int] = set()
+
+    def mapping(value: Any) -> Mapping[str, Any] | None:
+        nonlocal remaining
+        if isinstance(value, Mapping):
+            return value
+        if not isinstance(value, str):
+            return None
+        if len(value) > MAX_WRAPPER_JSON_CHARS:
+            raise ValueError("encoded wrapper arguments are too large")
+        stripped = value.strip()
+        if not stripped.startswith("{"):
+            return None
+        remaining -= 1
+        if remaining < 0:
+            raise ValueError("wrapper traversal budget exhausted")
+        parsed = strict_json_loads(value)
+        return parsed if isinstance(parsed, Mapping) else None
+
+    def enter(value: Mapping[str, Any], depth: int) -> None:
+        nonlocal remaining
+        if depth > 8:
+            raise ValueError("wrapper traversal depth exhausted")
+        remaining -= 1
+        identity = id(value)
+        if remaining < 0 or identity in visited:
+            raise ValueError("wrapper traversal is cyclic, shared, or too large")
+        visited.add(identity)
+
+    def direct_identity(value: Mapping[str, Any], depth: int) -> _WrapperIdentity | None:
+        enter(value, depth)
+        identities: list[_WrapperIdentity] = []
+        for key in ("tool_name", "toolName", "name"):
+            if key not in value:
+                continue
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                identities.append(_WrapperIdentity(candidate.strip(), value, (value,)))
+            elif candidate not in (None, ""):
+                raise ValueError("invalid wrapped tool identity")
+        tool = value.get("tool")
+        if isinstance(tool, str) and tool.strip():
+            identities.append(_WrapperIdentity(tool.strip(), value, (value,)))
+        else:
+            tool_mapping = mapping(tool)
+            if tool_mapping is not None:
+                nested = direct_identity(tool_mapping, depth + 1)
+                if nested is not None:
+                    identities.append(
+                        replace(nested, owner_path=(value, *nested.owner_path))
+                    )
+            elif "tool" in value and tool not in (None, ""):
+                raise ValueError("invalid object-form wrapped tool identity")
+        if len(identities) > 1:
+            raise ValueError("ambiguous wrapped tool identity")
+        return identities[0] if identities else None
+
+    def argument_container(value: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        candidates: list[Mapping[str, Any]] = []
+        for key in ("arguments", "args", "input"):
+            if key not in value:
+                continue
+            candidate = mapping(value.get(key))
+            if candidate is None:
+                raise ValueError("invalid wrapped argument container")
+            candidates.append(candidate)
+        if len(candidates) > 1:
+            raise ValueError("ambiguous wrapped argument containers")
+        return candidates[0] if candidates else None
+
+    def call_args(
+        value: Mapping[str, Any],
+        identity_owner: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        def validated(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+            if len(set(_commands_from_source(candidate))) > 1:
+                raise ValueError("conflicting wrapped command hints")
+            return candidate
+
+        owner_args = argument_container(identity_owner)
+        parent_args = argument_container(value) if identity_owner is not value else None
+        command_sources = [identity_owner]
+        if identity_owner is not value:
+            command_sources.append(value)
+        command_sources.extend(
+            candidate for candidate in (owner_args, parent_args) if candidate is not None
+        )
+        commands = {
+            command
+            for source in command_sources
+            for command in _commands_from_source(source)
+        }
+        if len(commands) > 1:
+            raise ValueError("conflicting wrapped command ownership")
+        if owner_args is not None and parent_args is not None:
+            raise ValueError("ambiguous wrapped argument ownership")
+        if owner_args is not None:
+            return validated(owner_args)
+        if parent_args is not None:
+            return validated(parent_args)
+        if _has_command_hint(identity_owner):
+            return validated(identity_owner)
+        if identity_owner is not value and _has_command_hint(value):
+            return validated(value)
+        return {}
+
+    def resolve(
+        value: Mapping[str, Any],
+        depth: int,
+        *,
+        allow_container: bool,
+        inherited_commands: frozenset[str],
+    ) -> _ResolvedWrapperCall | None:
+        path_commands = set(inherited_commands)
+        path_commands.update(_commands_from_source(value))
+        if len(path_commands) > 1:
+            raise ValueError("conflicting intermediate wrapper commands")
+        identity = direct_identity(value, depth)
+        if identity is not None:
+            for owner in identity.owner_path:
+                path_commands.update(_commands_from_source(owner))
+            if len(path_commands) > 1:
+                raise ValueError("conflicting nested wrapper ownership")
+        name = identity.tool_name if identity is not None else ""
+        if identity is not None and name not in WRAPPER_TOOL_NAMES:
+            if any(
+                key in owner
+                for owner in identity.owner_path
+                for key in ("call", "request")
+            ):
+                raise ValueError("ambiguous sibling wrapped call ownership")
+            if any(
+                key in owner
+                for owner in identity.owner_path[1:-1]
+                for key in ("args", "arguments", "input")
+            ):
+                raise ValueError("ambiguous intermediate wrapped argument ownership")
+            resolved_args = call_args(value, identity.owner)
+            path_commands.update(_commands_from_source(resolved_args))
+            if len(path_commands) > 1:
+                raise ValueError("conflicting wrapped command path")
+            if path_commands and not _has_command_hint(resolved_args):
+                resolved_args = {
+                    **resolved_args,
+                    "command": next(iter(path_commands)),
+                }
+            return _ResolvedWrapperCall(name, resolved_args)
+
+        if name:
+            container_keys = ("args", "arguments", "input", "call", "request")
+        elif allow_container:
+            if any(key in value for key in ("call", "request")) and any(
+                key in value for key in ("args", "arguments", "input")
+            ):
+                raise ValueError("ambiguous identityless wrapped call ownership")
+            container_keys = ("call", "request")
+        else:
+            container_keys = ()
+        candidates: list[Mapping[str, Any]] = []
+        container_owners = [identity.owner] if identity is not None else [value]
+        if identity is not None and identity.owner is not value:
+            container_owners.append(value)
+        for owner in container_owners:
+            for key in container_keys:
+                if key not in owner:
+                    continue
+                candidate = mapping(owner.get(key))
+                if candidate is None:
+                    raise ValueError("invalid wrapped call container")
+                candidates.append(candidate)
+        if len(candidates) > 1:
+            raise ValueError("ambiguous wrapped call containers")
+        if not candidates:
+            return None
+        return resolve(
+            candidates[0],
+            depth + 1,
+            allow_container=True,
+            inherited_commands=frozenset(path_commands),
+        )
+
+    try:
+        resolved_sources: list[_ResolvedWrapperCall] = []
+        for source in sources:
+            resolved = resolve(
+                source,
+                0,
+                allow_container=True,
+                inherited_commands=frozenset(),
+            )
+            if resolved is not None:
+                resolved_sources.append(resolved)
+            elif source:
+                raise ValueError("detached wrapped argument source")
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        return None
+    if len(resolved_sources) != 1:
+        return None
+    return resolved_sources[0]
+
+
 def _commands_from_source(source: Mapping[str, Any]) -> tuple[str, ...]:
     commands = tuple(
         value
@@ -831,6 +1259,56 @@ def _commands_from_source(source: Mapping[str, Any]) -> tuple[str, ...]:
     if isinstance(argv, list) and argv and all(isinstance(item, str) for item in argv):
         commands += (shlex.join(argv),)
     return commands
+
+
+def _command_sources_from_payload(payload: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    sources: list[Mapping[str, Any]] = []
+    visited: set[int] = set()
+    remaining = 64
+
+    def visit(value: Mapping[str, Any], depth: int) -> None:
+        nonlocal remaining
+        if depth > 8 or remaining <= 0 or id(value) in visited:
+            raise ValueError("ambiguous command ownership graph")
+        remaining -= 1
+        visited.add(id(value))
+        sources.append(value)
+        for key in ("args", "arguments", "input", "call", "request", "tool"):
+            candidate: Any = value.get(key)
+            if isinstance(candidate, str):
+                if len(candidate) > MAX_WRAPPER_JSON_CHARS:
+                    raise ValueError("encoded command ownership exceeds size limit")
+                if not candidate.lstrip().startswith("{"):
+                    continue
+                candidate = strict_json_loads(candidate)
+                if not isinstance(candidate, Mapping):
+                    raise ValueError("encoded command ownership must be an object")
+            if isinstance(candidate, Mapping):
+                visit(candidate, depth + 1)
+
+    visit(payload, 0)
+    return tuple(sources)
+
+
+def _tool_names_from_payload(
+    payload: Mapping[str, Any],
+    *,
+    root_name_is_wrapper_owned: bool,
+) -> frozenset[str]:
+    names: set[str] = set()
+    for index, source in enumerate(_command_sources_from_payload(payload)):
+        if tool_name := _payload_tool_name(source):
+            names.add(tool_name)
+        if index == 0 and not root_name_is_wrapper_owned:
+            continue
+        nested_name = source.get("name")
+        if isinstance(nested_name, str) and nested_name.strip():
+            names.add(nested_name.strip())
+        elif "name" in source and nested_name not in (None, ""):
+            raise ValueError("invalid nested payload tool identity")
+    return frozenset(names)
+
+
 def _call_args(
     args: Mapping[str, Any] | None,
     arguments: Mapping[str, Any] | None,
@@ -873,12 +1351,34 @@ def _merge_command_hints(sources: list[Mapping[str, Any]]) -> Mapping[str, Any]:
 
 
 def _payload_tool_name(payload: Mapping[str, Any]) -> str:
-    return str(
-        payload.get("tool_name")
-        or payload.get("toolName")
-        or payload.get("tool")
-        or ""
-    )
+    for key in ("tool_name", "toolName"):
+        candidate = payload.get(key)
+        if key in payload and not isinstance(candidate, str) and candidate is not None:
+            raise ValueError("invalid payload tool identity")
+    names = {
+        candidate.strip()
+        for key in ("tool_name", "toolName")
+        if isinstance((candidate := payload.get(key)), str) and candidate.strip()
+    }
+    tool = payload.get("tool")
+    if isinstance(tool, str) and tool.strip():
+        names.add(tool.strip())
+    elif isinstance(tool, Mapping):
+        nested_names = {
+            candidate.strip()
+            for key in ("tool_name", "toolName", "name", "tool")
+            if isinstance((candidate := tool.get(key)), str) and candidate.strip()
+        }
+        if any(isinstance(tool.get(key), Mapping) for key in ("tool", "call", "request")):
+            raise ValueError("nested payload tool identity is ambiguous")
+        if len(nested_names) != 1:
+            raise ValueError("ambiguous object-form payload tool identity")
+        names.update(nested_names)
+    elif "tool" in payload and tool not in (None, ""):
+        raise ValueError("invalid object-form payload tool identity")
+    if len(names) > 1:
+        raise ValueError("ambiguous payload tool identity")
+    return next(iter(names), "")
 
 
 def _looks_terminal_payload(payload: Any, args: Mapping[str, Any] | None = None) -> bool:
@@ -973,7 +1473,7 @@ def _select_command(
 
 def _command_evidence_text(text: str) -> str:
     try:
-        parsed = json.loads(text)
+        parsed = strict_json_loads(text)
     except json.JSONDecodeError:
         return text
     if isinstance(parsed, str):

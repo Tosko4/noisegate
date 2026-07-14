@@ -1166,18 +1166,25 @@ def test_reduce_json_preserves_ambiguous_blank_tool_nested_payloads() -> None:
 
 
 def test_reduce_json_compacts_invalid_json_result_string_as_plain_output() -> None:
-    envelope = {
-        "tool_name": "terminal",
-        "args": {"command": "pytest"},
-        "result": "{not json\n" + numbered("line", 100),
-        "noisegate": {"max_chars": 120},
-    }
-    proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+    for first_line in (
+        "{not json",
+        "2026-07-14 build started",
+        "- warning",
+        "[2026-07-14 09:04:09] build started",
+        "[123] build started",
+    ):
+        envelope = {
+            "tool_name": "terminal",
+            "args": {"command": "pytest"},
+            "result": first_line + "\n" + numbered("line", 100),
+            "noisegate": {"max_chars": 120},
+        }
+        proc = run_cli("reduce-json", input_text=json.dumps(envelope))
 
-    assert proc.returncode == 0, proc.stderr
-    outer = json.loads(proc.stdout)
-    assert outer["result"].startswith("{not json")
-    assert "[noisegate: omitted" in outer["result"]
+        assert proc.returncode == 0, proc.stderr
+        outer = json.loads(proc.stdout)
+        assert outer["result"].startswith(first_line)
+        assert "[noisegate: omitted" in outer["result"]
 
 
 def test_reduce_json_preserves_plain_result_for_non_noisy_tool() -> None:
@@ -1191,6 +1198,766 @@ def test_reduce_json_preserves_plain_result_for_non_noisy_tool() -> None:
 
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout) == envelope
+
+
+def test_reduce_json_tool_call_uses_real_tool_name_for_plain_result() -> None:
+    envelope = {
+        "tool_name": "tool_call",
+        "args": {"name": "terminal", "arguments": {"command": "pytest -q"}},
+        "result": numbered("pytest wrapper output", 100),
+        "noisegate": {"max_chars": 120},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+    assert proc.returncode == 0, proc.stderr
+    outer = json.loads(proc.stdout)
+    assert "[noisegate: omitted" in outer["result"]
+    assert outer["result"] != envelope["result"]
+
+
+def test_reduce_json_tool_call_preserves_mcp_plain_result() -> None:
+    envelope = {
+        "tool_name": "tool_call",
+        "args": {"name": "mcp_github_list_issues", "arguments": {"repo": "Tosko4/noisegate"}},
+        "result": numbered("github issue", 100),
+        "noisegate": {"max_chars": 120},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == envelope
+
+
+def test_reduce_json_tool_call_preserves_json_encoded_mcp_result() -> None:
+    nested = json.dumps(
+        {"tool_name": "mcp_github_get_file", "content": numbered("source", 100)}
+    )
+    envelope = {
+        "tool_name": "tool_call",
+        "args": {"name": "browser_console", "arguments": {}},
+        "result": nested,
+        "logs": numbered("browser noise", 100),
+        "noisegate": {"max_chars": 600},
+    }
+    raw = json.dumps(envelope)
+
+    proc = run_cli("reduce-json", input_text=raw)
+
+    assert proc.returncode == 0, proc.stderr
+    outer = json.loads(proc.stdout)
+    assert outer["result"] == nested
+    assert json.loads(outer["result"])["tool_name"].startswith("mcp_")
+    assert "[noisegate: omitted" in outer["logs"]
+
+
+def test_reduce_json_tool_call_preserves_generic_json_result_with_noisy_sibling() -> None:
+    nested = json.dumps({"items": [f"value {index:03d}" for index in range(100)]})
+    envelope = {
+        "tool_name": "tool_call",
+        "args": {"name": "browser_console", "arguments": {}},
+        "result": nested,
+        "logs": numbered("browser noise", 100),
+        "noisegate": {"max_chars": 600},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+    assert proc.returncode == 0, proc.stderr
+    outer = json.loads(proc.stdout)
+    assert outer["result"] == nested
+    assert "[noisegate: omitted" in outer["logs"]
+
+
+def test_reduce_json_tool_call_compacts_json_encoded_terminal_result() -> None:
+    nested = json.dumps(
+        {
+            "tool_name": "terminal",
+            "name": "pytest shard",
+            "stdout": numbered("pytest output", 100),
+            "exit": 0,
+        }
+    )
+    envelope = {
+        "tool_name": "tool_call",
+        "args": {"name": "terminal", "arguments": {"command": "pytest -q"}},
+        "result": nested,
+        "noisegate": {"max_chars": 600},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+    assert proc.returncode == 0, proc.stderr
+    outer = json.loads(proc.stdout)
+    nested_result = json.loads(outer["result"])
+    assert nested_result["exit"] == 0
+    assert nested_result["name"] == "pytest shard"
+    assert "[noisegate: omitted" in nested_result["stdout"]
+
+
+def test_reduce_json_tool_call_preserves_scalar_json_results() -> None:
+    for nested in ("null   ", "false\n", "123.5e-2\t"):
+        envelope = {
+            "tool_name": "tool_call",
+            "args": {"name": "browser_console", "arguments": {}},
+            "result": nested,
+            "logs": numbered("browser noise", 100),
+            "noisegate": {"max_chars": 600},
+        }
+
+        proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+        assert proc.returncode == 0, proc.stderr
+        outer = json.loads(proc.stdout)
+        assert outer["result"] == nested
+        assert "[noisegate: omitted" in outer["logs"]
+
+
+def test_reduce_json_tool_call_rejects_invalid_deep_json_result() -> None:
+    duplicate = (
+        '{"tool_name":"mcp_github_get_file",'
+        '"tool_name":"browser_console",'
+        f'"content":{json.dumps(numbered("source", 100))}}}'
+    )
+    malformed = json.dumps('{"tool_name":"mcp_github_get_file"')
+    nonstandard = tuple(
+        json.dumps(value)
+        for value in ("NaN", "Infinity", "{foo: 1}", "['x']", "[undefined]")
+    )
+    direct_invalid = (
+        '{"tool_name":"mcp_github_get_file"',
+        '{tool_name: "mcp_github_get_file"}',
+        '{1: "non-standard"}',
+        '{1e2: "non-standard"}',
+        "[1,]",
+        "['x']",
+        "[undefined]",
+        "NaN",
+        '\ufeff{"tool_name":"mcp_github_get_file"}',
+    )
+    for result in (json.dumps(duplicate), malformed, *nonstandard, *direct_invalid):
+        envelope = {
+            "tool_name": "tool_call",
+            "args": {"name": "browser_console", "arguments": {}},
+            "result": result,
+            "logs": numbered("browser noise", 100),
+            "noisegate": {"max_chars": 600},
+        }
+        raw = json.dumps(envelope)
+
+        proc = run_cli("reduce-json", input_text=raw)
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == raw
+
+
+def test_reduce_json_tool_call_preserves_unwrapped_exact_command() -> None:
+    envelope = {
+        "tool_name": "tool_call",
+        "command": "pytest -q",
+        "args": {
+            "name": "terminal",
+            "arguments": {"command": "cat important.py"},
+        },
+        "result": numbered("source", 100),
+        "noisegate": {"max_chars": 120},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == envelope
+
+
+def test_reduce_json_tool_call_ignores_result_identity_without_wrapper_identity() -> None:
+    envelope = {
+        "tool_name": "tool_call",
+        "args": {},
+        "result": {"tool_name": "terminal", "stdout": numbered("exact", 100)},
+        "noisegate": {"max_chars": 120},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == envelope
+
+
+def test_reduce_json_tool_call_container_preserves_exact_command() -> None:
+    for container in ("call", "request"):
+        envelope = {
+            "tool_name": "tool_call",
+            "args": {
+                container: {
+                    "name": "terminal",
+                    "arguments": {"command": "cat important.py"},
+                }
+            },
+            "result": numbered("source", 100),
+            "noisegate": {"max_chars": 120},
+        }
+
+        proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(proc.stdout) == envelope
+
+
+def test_reduce_json_tool_call_container_compacts_noisy_command() -> None:
+    for container in ("call", "request"):
+        envelope = {
+            "tool_name": "tool_call",
+            "args": {
+                container: {
+                    "name": "terminal",
+                    "arguments": {"command": "pytest -q"},
+                }
+            },
+            "result": numbered("pytest output", 100),
+            "noisegate": {"max_chars": 120},
+        }
+
+        proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+        assert proc.returncode == 0, proc.stderr
+        assert "[noisegate: omitted" in json.loads(proc.stdout)["result"]
+
+
+def test_reduce_json_wrapper_preserves_exact_command_against_nested_stale_hint() -> None:
+    source = numbered("source", 100)
+    nested = {"args": {"command": "pytest -q"}, "stdout": source, "exit_code": 0}
+
+    for result in (nested, json.dumps(nested)):
+        envelope = {
+            "tool_name": "tool_call",
+            "args": {
+                "name": "terminal",
+                "arguments": {"command": "cat important.py"},
+            },
+            "result": result,
+            "noisegate": {"max_chars": 120},
+        }
+        raw = json.dumps(envelope)
+
+        proc = run_cli("reduce-json", input_text=raw)
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == raw
+
+
+def test_reduce_json_duplicate_wrapper_identity_keys_fail_open() -> None:
+    result = json.dumps(numbered("source", 100))
+    raw = (
+        '{"tool_name":"tool_call","args":'
+        '{"name":"mcp_github_get_file","name":"terminal",'
+        '"arguments":{"command":"pytest -q"}},'
+        f'"result":{result},"noisegate":{{"max_chars":120}}}}'
+    )
+
+    proc = run_cli("reduce-json", input_text=raw)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == raw
+
+
+def test_reduce_json_duplicate_nested_result_keys_fail_open() -> None:
+    first = json.dumps(numbered("exact source", 100))
+    second = json.dumps(numbered("pytest output", 100))
+    nested = f'{{"stdout":{first},"stdout":{second},"exit":0}}'
+    envelope = {
+        "tool_name": "tool_call",
+        "args": {"name": "terminal", "arguments": {"command": "pytest -q"}},
+        "result": nested,
+        "noisegate": {"max_chars": 120},
+    }
+    raw = json.dumps(envelope)
+
+    proc = run_cli("reduce-json", input_text=raw)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == raw
+
+
+def test_reduce_json_conflicting_nested_result_identity_aliases_fail_open() -> None:
+    envelope = {
+        "tool_name": "tool_call",
+        "args": {"name": "terminal", "arguments": {"command": "pytest -q"}},
+        "result": {
+            "tool_name": "terminal",
+            "toolName": "mcp_github_get_file",
+            "stdout": numbered("exact source", 100),
+        },
+        "noisegate": {"max_chars": 120},
+    }
+    raw = json.dumps(envelope)
+
+    proc = run_cli("reduce-json", input_text=raw)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == raw
+
+
+def test_reduce_json_secondary_result_command_conflict_fails_open() -> None:
+    envelope = {
+        "tool_name": "tool_call",
+        "args": {"name": "terminal", "arguments": {"command": "pytest -q"}},
+        "result": {
+            "args": {"command": "pytest -q", "cmd": "git status --short"},
+            "stdout": numbered("exact source", 100),
+            "exit": 0,
+        },
+        "noisegate": {"max_chars": 120},
+    }
+    raw = json.dumps(envelope)
+
+    proc = run_cli("reduce-json", input_text=raw)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == raw
+
+
+def test_reduce_json_wrapper_and_nested_identity_mismatch_fails_open() -> None:
+    envelope = {
+        "tool_name": "tool_call",
+        "args": {"name": "terminal", "arguments": {"command": "pytest -q"}},
+        "result": {
+            "tool_name": "browser_console",
+            "content": numbered("conflicting owner", 100),
+        },
+        "noisegate": {"max_chars": 120},
+    }
+    raw = json.dumps(envelope)
+
+    proc = run_cli("reduce-json", input_text=raw)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == raw
+
+
+def test_reduce_json_object_form_protected_result_identity_fails_open() -> None:
+    envelope = {
+        "tool_name": "tool_call",
+        "args": {"name": "terminal", "arguments": {"command": "pytest -q"}},
+        "result": {
+            "tool": {"name": "mcp_github_get_file"},
+            "stdout": numbered("exact source", 100),
+        },
+        "noisegate": {"max_chars": 120},
+    }
+    raw = json.dumps(envelope)
+
+    proc = run_cli("reduce-json", input_text=raw)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == raw
+
+
+def test_reduce_json_result_input_command_conflict_fails_open() -> None:
+    envelope = {
+        "tool_name": "tool_call",
+        "args": {"name": "terminal", "arguments": {"command": "pytest -q"}},
+        "result": {
+            "input": {"command": "cat important.py"},
+            "stdout": numbered("exact source", 100),
+            "exit": 0,
+        },
+        "noisegate": {"max_chars": 120},
+    }
+    raw = json.dumps(envelope)
+
+    proc = run_cli("reduce-json", input_text=raw)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == raw
+
+
+def test_reduce_json_nonstandard_numeric_constants_fail_open() -> None:
+    for constant in ("NaN", "Infinity", "-Infinity"):
+        raw = (
+            '{"tool_name":"tool_call","args":{"name":"terminal",'
+            '"arguments":{"command":"pytest -q"}},"result":{"stdout":'
+            f'{json.dumps(numbered("pytest output", 100))},"exit":{constant}}},'
+            '"noisegate":{"max_chars":120}}'
+        )
+
+        proc = run_cli("reduce-json", input_text=raw)
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == raw
+
+
+def test_reduce_json_nested_protected_result_identity_fails_open() -> None:
+    envelope = {
+        "tool_name": "tool_call",
+        "args": {"name": "terminal", "arguments": {"command": "pytest -q"}},
+        "result": {
+            "input": {"tool": {"name": "mcp_github_get_file"}},
+            "stdout": numbered("exact source", 100),
+            "exit": 0,
+        },
+        "noisegate": {"max_chars": 120},
+    }
+    raw = json.dumps(envelope)
+
+    proc = run_cli("reduce-json", input_text=raw)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == raw
+
+
+def test_reduce_json_top_level_name_wrapper_preserves_protected_tool() -> None:
+    envelope = {
+        "name": "tool_call",
+        "args": {"name": "mcp_github_get_file", "arguments": {}},
+        "command": "pytest -q",
+        "result": numbered("exact source", 100),
+        "noisegate": {"max_chars": 120},
+    }
+    raw = json.dumps(envelope)
+
+    proc = run_cli("reduce-json", input_text=raw)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == raw
+
+
+def test_reduce_json_does_not_promote_ordinary_top_level_name_to_tool_identity() -> None:
+    for name in ("terminal", "browser_console"):
+        envelope = {
+            "name": name,
+            "output": numbered("exact payload", 100),
+            "noisegate": {"max_chars": 120},
+        }
+        raw = json.dumps(envelope)
+
+        proc = run_cli("reduce-json", input_text=raw)
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == raw
+
+
+def test_reduce_json_top_level_name_wrapper_propagates_nested_exact_command() -> None:
+    envelope = {
+        "name": "tool_call",
+        "args": {
+            "name": "terminal",
+            "arguments": {"input": {"command": "cat important.py"}},
+        },
+        "stdout": numbered("exact source", 100),
+        "noisegate": {"max_chars": 120},
+    }
+    raw = json.dumps(envelope)
+
+    proc = run_cli("reduce-json", input_text=raw)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == raw
+
+
+def test_reduce_json_direct_tool_name_wrapper_compacts_and_preserves_identity() -> None:
+    envelope = {
+        "tool_name": "tool_call",
+        "args": {"name": "terminal", "arguments": {"command": "pytest -q"}},
+        "stdout": numbered("pytest output", 100),
+        "exit": 0,
+        "noisegate": {"max_chars": 120},
+    }
+    raw = json.dumps(envelope)
+
+    proc = run_cli("reduce-json", input_text=raw)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout != raw
+    transformed = json.loads(proc.stdout)
+    assert transformed["tool_name"] == "tool_call"
+    assert transformed["args"] == envelope["args"]
+    assert "[noisegate: omitted" in transformed["stdout"]
+
+
+def test_reduce_json_explicit_terminal_preserves_ordinary_name_label() -> None:
+    envelope = {
+        "tool_name": "terminal",
+        "name": "pytest shard",
+        "command": "pytest -q",
+        "stdout": numbered("pytest output", 100),
+        "exit": 0,
+        "noisegate": {"max_chars": 120},
+    }
+    raw = json.dumps(envelope)
+
+    proc = run_cli("reduce-json", input_text=raw)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout != raw
+    transformed = json.loads(proc.stdout)
+    assert transformed["tool_name"] == "terminal"
+    assert transformed["name"] == "pytest shard"
+    assert "[noisegate: omitted" in transformed["stdout"]
+
+
+def test_reduce_json_explicit_terminal_preserves_ordinary_result_name_label() -> None:
+    envelope = {
+        "tool_name": "terminal",
+        "command": "pytest -q",
+        "result": {
+            "name": "pytest shard",
+            "stdout": numbered("pytest output", 100),
+            "exit": 0,
+        },
+        "noisegate": {"max_chars": 120},
+    }
+    raw = json.dumps(envelope)
+
+    proc = run_cli("reduce-json", input_text=raw)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout != raw
+    transformed = json.loads(proc.stdout)
+    assert transformed["result"]["name"] == "pytest shard"
+    assert "[noisegate: omitted" in transformed["result"]["stdout"]
+
+
+def test_reduce_json_wrapper_rejects_protected_identity_in_resolved_arguments() -> None:
+    for direct in (False, True):
+        envelope = {
+            "tool_name": "tool_call",
+            "args": {
+                "name": "terminal",
+                "arguments": {
+                    "tool_name": "mcp_github_get_file",
+                    "command": "pytest -q",
+                },
+            },
+            "noisegate": {"max_chars": 120},
+        }
+        if direct:
+            envelope.update({"stdout": numbered("exact source", 100), "exit": 0})
+        else:
+            envelope["result"] = {
+                "stdout": numbered("exact source", 100),
+                "exit": 0,
+            }
+        raw = json.dumps(envelope)
+
+        proc = run_cli("reduce-json", input_text=raw)
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == raw
+
+
+def test_reduce_json_wrapper_rejects_root_name_identity_in_arguments() -> None:
+    envelope = {
+        "tool_name": "tool_call",
+        "args": {
+            "name": "terminal",
+            "arguments": {
+                "name": "mcp_github_get_file",
+                "command": "pytest -q",
+            },
+        },
+        "result": {"stdout": numbered("exact source", 100), "exit": 0},
+        "noisegate": {"max_chars": 120},
+    }
+    raw = json.dumps(envelope)
+
+    proc = run_cli("reduce-json", input_text=raw)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == raw
+
+
+def test_reduce_json_wrapper_treats_root_result_name_as_label() -> None:
+    envelope = {
+        "tool_name": "tool_call",
+        "args": {"name": "terminal", "arguments": {"command": "pytest -q"}},
+        "result": {
+            "name": "pytest shard",
+            "stdout": numbered("pytest output", 100),
+            "exit": 0,
+        },
+        "noisegate": {"max_chars": 120},
+    }
+    raw = json.dumps(envelope)
+
+    proc = run_cli("reduce-json", input_text=raw)
+
+    assert proc.returncode == 0, proc.stderr
+    transformed = json.loads(proc.stdout)
+    assert transformed["result"]["name"] == "pytest shard"
+    assert "[noisegate: omitted" in transformed["result"]["stdout"]
+
+
+def test_reduce_json_rejects_explicit_wrapper_conflict_or_bare_name() -> None:
+    cases = (
+        {
+            "tool_name": "terminal",
+            "name": "tool_call",
+            "command": "pytest -q",
+            "result": numbered("exact source", 100),
+            "noisegate": {"max_chars": 120},
+        },
+        {
+            "name": "mcp_github_get_file",
+            "command": "pytest -q",
+            "result": numbered("exact source", 100),
+            "noisegate": {"max_chars": 120},
+        },
+    )
+    for envelope in cases:
+        raw = json.dumps(envelope)
+
+        proc = run_cli("reduce-json", input_text=raw)
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == raw
+
+
+def test_reduce_json_wrapper_rejects_sibling_call_ownership() -> None:
+    for direct in (False, True):
+        envelope = {
+            "tool_name": "tool_call",
+            "args": {
+                "name": "terminal",
+                "arguments": {"command": "pytest -q"},
+                "call": {"name": "mcp_github_get_file", "arguments": {}},
+            },
+            "noisegate": {"max_chars": 120},
+        }
+        if direct:
+            envelope.update({"stdout": numbered("exact source", 100), "exit": 0})
+        else:
+            envelope["result"] = {
+                "stdout": numbered("exact source", 100),
+                "exit": 0,
+            }
+        raw = json.dumps(envelope)
+
+        proc = run_cli("reduce-json", input_text=raw)
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == raw
+
+
+def test_reduce_json_wrapper_rejects_identityless_sibling_ownership() -> None:
+    for sibling in (
+        {"tool_name": "mcp_github_get_file"},
+        {"command": "cat important.py"},
+    ):
+        envelope = {
+            "tool_name": "tool_call",
+            "args": {
+                "call": {
+                    "name": "terminal",
+                    "arguments": {"command": "pytest -q"},
+                },
+                "arguments": sibling,
+            },
+            "result": numbered("exact source", 100),
+            "noisegate": {"max_chars": 120},
+        }
+        raw = json.dumps(envelope)
+
+        proc = run_cli("reduce-json", input_text=raw)
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == raw
+
+
+def test_reduce_json_rejects_malformed_explicit_identity_types() -> None:
+    for malformed in (
+        {"tool_name": {"name": "mcp_github_get_file"}},
+        {"toolName": ["terminal"]},
+        {"tool": 7},
+    ):
+        envelope = {
+            **malformed,
+            "command": "pytest -q",
+            "stdout": numbered("exact source", 100),
+            "exit": 0,
+            "noisegate": {"max_chars": 120},
+        }
+        raw = json.dumps(envelope)
+
+        proc = run_cli("reduce-json", input_text=raw)
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == raw
+
+
+def test_reduce_json_wrapper_rejects_malformed_name_identity_in_arguments() -> None:
+    envelope = {
+        "tool_name": "tool_call",
+        "args": {
+            "name": "terminal",
+            "arguments": {
+                "name": ["mcp_github_get_file"],
+                "command": "pytest -q",
+            },
+        },
+        "result": numbered("exact source", 100),
+        "noisegate": {"max_chars": 120},
+    }
+    raw = json.dumps(envelope)
+
+    proc = run_cli("reduce-json", input_text=raw)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == raw
+
+
+def test_reduce_json_wrapper_treats_nonstring_root_result_name_as_label() -> None:
+    envelope = {
+        "tool_name": "tool_call",
+        "args": {"name": "terminal", "arguments": {"command": "pytest -q"}},
+        "result": {
+            "name": ["pytest shard"],
+            "stdout": numbered("pytest output", 100),
+            "exit": 0,
+        },
+        "noisegate": {"max_chars": 120},
+    }
+    raw = json.dumps(envelope)
+
+    proc = run_cli("reduce-json", input_text=raw)
+
+    assert proc.returncode == 0, proc.stderr
+    transformed = json.loads(proc.stdout)
+    assert transformed["result"]["name"] == ["pytest shard"]
+    assert "[noisegate: omitted" in transformed["result"]["stdout"]
+
+
+def test_reduce_json_identityless_result_root_name_stays_exact() -> None:
+    for result in (
+        {
+            "name": "pytest shard",
+            "stdout": numbered("exact payload", 100),
+            "exit": 0,
+        },
+        json.dumps(
+            {
+                "name": "pytest shard",
+                "stdout": numbered("exact payload", 100),
+                "exit": 0,
+            }
+        ),
+        {
+            "name": ["pytest shard"],
+            "stdout": numbered("exact payload", 100),
+            "exit": 0,
+        },
+    ):
+        envelope = {
+            "args": {"command": "pytest -q"},
+            "result": result,
+            "noisegate": {"max_chars": 120},
+        }
+        raw = json.dumps(envelope)
+
+        proc = run_cli("reduce-json", input_text=raw)
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == raw
 
 
 def test_reduce_json_bad_input_fails_open() -> None:

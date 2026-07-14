@@ -57,6 +57,42 @@ BYPASS_MARKERS = (
     "[noisegate:raw]",
     "[noisegate bypass]",
 )
+SECRET_ARTIFACT_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+    for pattern in (
+        r"\b(?:api[_-]?key|access[_-]?token|token|secret|password|passwd|private[_-]?key|client[_-]?secret|credentials?|authorization|cookie|session(?:id)?)\s*[:=]",
+        r"^\s*(?:[<>*]\s*)?(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-access-token|x-amz-security-token|x-goog-api-key)\s*[:=]",
+        r"[\"'](?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-access-token|x-amz-security-token|x-goog-api-key|api[_-]?key|access[_-]?token|token|secret|password|passwd|private[_-]?key|client[_-]?secret|credentials?)[\"']\s*:",
+        r"^[ \t]*(?:(?:>[ \t]*)|(?:[-+*][ \t]+)|(?:\d+[.)][ \t]+))*"
+        r"[\"']?-{5}BEGIN "
+        r"(?:(?:[A-Z0-9]+ )*PRIVATE KEY|PGP PRIVATE KEY BLOCK)-{5}[\"']?[ \t]*\r?$",
+        r"\btype\s*=\s*[\"']?password[\"']?(?=[\s/>]|$)",
+        r"\bname\s*=\s*[\"']?(?:[A-Za-z0-9_.-]+\[)?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|token|secret|password|passwd|private[_-]?key|client[_-]?secret|credentials?|session(?:id)?)(?:\])?[\"']?(?=[\s;/>]|$)",
+        r"\bbearer\s+[A-Za-z0-9._~+/=-]{12,}",
+        r"(?:^|\s)--?(?:api[_-]?key|access[_-]?token|token|secret|password|passwd|private[_-]?key|client[_-]?secret|credentials?|authorization|cookie)\s+\S+",
+        r"\b(?:password|passwd|authorization|cookie)\s+\S+",
+        r"(?:^|\s)(?:-u|--user|--auth|--credentials?)(?:\s+|=)\S+",
+        r"(?:^|\s)-u\S+:\S+",
+    )
+)
+SECRET_ENV_ASSIGNMENT_KEY = re.compile(
+    r"\b[A-Za-z_][A-Za-z0-9_]*\b(?=[\"']?\s*[:=])"
+)
+SECRET_ENV_KEY_MARKERS = (
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "API_KEY",
+    "ACCESS_KEY",
+    "PRIVATE_KEY",
+    "CLIENT_SECRET",
+    "CREDENTIAL",
+    "AUTHORIZATION",
+    "COOKIE",
+    "SESSION",
+)
+SECRET_ENV_KEY_SUFFIXES = ("_PWD", "_PASS", "_AUTH")
 PROTECTED_TOOL_NAMES = frozenset(
     {
         "memory",
@@ -2663,6 +2699,8 @@ def _plan_artifact(text: str, options: NoisegateOptions) -> dict[str, JsonValue]
             "size_bytes": len(data),
             "size_cap": options.artifact_size_cap,
         }
+    if _looks_secret_bearing_text(text):
+        return {"stored": False, "reason": "secret_detected", "size_bytes": len(data)}
     digest = hashlib.sha256(data).hexdigest()
     return {
         "stored": True,
@@ -2691,6 +2729,20 @@ def _drop_artifact_if_notice_cannot_fit(
 
 
 def _store_artifact(text: str, options: NoisegateOptions) -> dict[str, JsonValue]:
+    data = text.encode("utf-8")
+    if len(data) > options.artifact_size_cap:
+        return {
+            "stored": False,
+            "reason": "too_large",
+            "size_bytes": len(data),
+            "size_cap": options.artifact_size_cap,
+        }
+    if _looks_secret_bearing_text(text):
+        return {
+            "stored": False,
+            "reason": "secret_detected",
+            "size_bytes": len(data),
+        }
     try:
         store = ArtifactStore(options.artifact_dir, size_cap=options.artifact_size_cap)
         artifact = store.store(text)
@@ -3644,6 +3696,123 @@ def _line_count(text: str) -> int:
 def _has_bypass_marker(text: str) -> bool:
     sample = text[:2_000]
     return any(marker in sample for marker in BYPASS_MARKERS)
+
+
+def _strip_terminal_escape_sequences(
+    text: str,
+    *,
+    preserve_osc_payload: bool = True,
+) -> str:
+    output: list[str] = []
+    index = 0
+
+    def consume_csi(start: int) -> int:
+        cursor = start
+        while cursor < len(text):
+            final = text[cursor]
+            cursor += 1
+            if "@" <= final <= "~":
+                break
+        return cursor
+
+    def consume_control_string(start: int, *, allow_bel: bool) -> tuple[int, int]:
+        cursor = start
+        while cursor < len(text):
+            if text[cursor] == "\x9c" or (allow_bel and text[cursor] == "\x07"):
+                return cursor + 1, cursor
+            if text[cursor] == "\x1b" and cursor + 1 < len(text) and text[cursor + 1] == "\\":
+                return cursor + 2, cursor
+            cursor += 1
+        return len(text), len(text)
+
+    while index < len(text):
+        char = text[index]
+        if char in {"\x07", "\x9c"}:
+            index += 1
+            continue
+        if char == "\x9b":
+            index = consume_csi(index + 1)
+            continue
+        if char in {"\x90", "\x98", "\x9d", "\x9e", "\x9f"}:
+            payload_start = index + 1
+            index, payload_end = consume_control_string(
+                payload_start,
+                allow_bel=char == "\x9d",
+            )
+            if preserve_osc_payload:
+                output.append(text[payload_start:payload_end])
+            continue
+        if char != "\x1b":
+            if not "\x80" <= char <= "\x9f":
+                output.append(char)
+            index += 1
+            continue
+        if index + 1 >= len(text):
+            break
+        marker = text[index + 1]
+        if marker == "[":
+            index = consume_csi(index + 2)
+            continue
+        if marker in {"]", "P", "X", "^", "_"}:
+            payload_start = index + 2
+            index, payload_end = consume_control_string(
+                payload_start,
+                allow_bel=marker == "]",
+            )
+            if preserve_osc_payload:
+                output.append(text[payload_start:payload_end])
+            continue
+        index += 2
+    return "".join(output)
+
+
+def _looks_credential_uri(text: str) -> bool:
+    search_from = 0
+    while True:
+        separator = text.find("://", search_from)
+        if separator < 0:
+            return False
+        scheme_start = separator
+        while scheme_start > 0 and (
+            text[scheme_start - 1].isalnum() or text[scheme_start - 1] in "+.-"
+        ):
+            scheme_start -= 1
+        scheme = text[scheme_start:separator]
+        if scheme and scheme[0].isalpha():
+            authority_start = separator + 3
+            authority_end = authority_start
+            while authority_end < len(text) and text[authority_end] not in "\t\r\n /?#":
+                authority_end += 1
+            at = text.find("@", authority_start, authority_end)
+            if at >= authority_start and text[authority_start:at]:
+                return True
+        search_from = separator + 3
+
+
+def _looks_secret_env_assignment(text: str) -> bool:
+    for match in SECRET_ENV_ASSIGNMENT_KEY.finditer(text):
+        key = match.group(0).upper()
+        if any(marker in key for marker in SECRET_ENV_KEY_MARKERS) or key.endswith(
+            SECRET_ENV_KEY_SUFFIXES
+        ):
+            return True
+    return False
+
+
+def _looks_secret_bearing_text(text: str) -> bool:
+    if any(
+        (ord(char) < 32 and char not in {"\t", "\n", "\r"}) or char == "\x7f"
+        for char in text
+    ):
+        return True
+    normalized = _strip_terminal_escape_sequences(text)
+    visible = _strip_terminal_escape_sequences(text, preserve_osc_payload=False)
+    return any(
+        _looks_credential_uri(candidate)
+        or _looks_secret_env_assignment(candidate)
+        or any(pattern.search(candidate) for pattern in SECRET_ARTIFACT_PATTERNS)
+        for candidate in (text, normalized, visible)
+    )
 
 
 def _contains_command(command: str, names: tuple[str, ...]) -> bool:
