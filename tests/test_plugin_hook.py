@@ -608,6 +608,34 @@ def test_tool_call_wrapper_preserves_scalar_json_result_fields() -> None:
         assert "[noisegate: omitted" in payload["logs"]
 
 
+def test_tool_call_wrapper_compacts_log_prefixed_plain_result() -> None:
+    for first_line in (
+        "2026-07-14 build started",
+        "- warning",
+        "[2026-07-14 09:04:09] build started",
+        "[123] build started",
+    ):
+        raw = json.dumps(
+            {
+                "result": first_line + "\n" + numbered("detail", 180),
+                "logs": numbered("browser noise", 180),
+            }
+        )
+
+        transformed = transform_tool_result(
+            raw,
+            tool_name="tool_call",
+            args={"name": "browser_console", "arguments": {}},
+            noisegate_max_chars=600,
+        )
+
+        assert transformed is not None
+        payload = json.loads(transformed)
+        assert payload["result"].startswith(first_line)
+        assert "[noisegate: omitted" in payload["result"]
+        assert "[noisegate: omitted" in payload["logs"]
+
+
 def test_nested_json_detection_bounds_oversized_text_before_parsing() -> None:
     assert plugin._nested_json_text_requires_exact("plain " * 20_000) is False
     try:
@@ -630,7 +658,21 @@ def test_tool_call_wrapper_rejects_duplicate_keys_in_nested_json_strings() -> No
         json.dumps(value)
         for value in ("NaN", "Infinity", "{foo: 1}", "['x']", "[undefined]")
     )
-    for nested in (duplicate, json.dumps(duplicate), malformed, *nonstandard):
+    direct_invalid = (
+        '{"tool_name":"mcp_github_get_file"',
+        '{tool_name: "mcp_github_get_file"}',
+        "[1,]",
+        "['x']",
+        "[undefined]",
+        "NaN",
+    )
+    for nested in (
+        duplicate,
+        json.dumps(duplicate),
+        malformed,
+        *nonstandard,
+        *direct_invalid,
+    ):
         raw = json.dumps({"result": nested, "logs": numbered("browser noise", 180)})
         assert (
             transform_tool_result(

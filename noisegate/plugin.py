@@ -41,6 +41,8 @@ WRAPPER_TOOL_NAMES = frozenset({"tool_call"})
 MAX_WRAPPER_JSON_CHARS = 65_536
 MAX_NESTED_JSON_DEPTH = 8
 MAX_NESTED_JSON_NODES = 512
+JSON_NUMBER_RE = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
+JSON5_OBJECT_KEY_RE = re.compile(r"[A-Za-z_$][A-Za-z0-9_$.-]*\s*:")
 TERMINAL_TEXT_FIELDS = ("stdout", "stderr", "output")
 ALWAYS_PROTECTED_COMMAND_CLASSES = frozenset({"file_read", "source_search", "patch"})
 CONDITIONALLY_PROTECTED_COMMAND_CLASSES = frozenset({"git_diff"})
@@ -880,26 +882,46 @@ def _nested_json_text_requires_exact(value: str) -> bool:
             return True
         tail = stripped[1:].lstrip()
         if stripped.startswith("{"):
-            return not tail or tail.startswith(('"', "}"))
-        if stripped.startswith("["):
             return (
                 not tail
-                or tail.startswith(('"', "{", "[", "]", "-"))
-                or tail[:1].isdigit()
-                or tail.startswith(("true", "false", "null"))
+                or tail.startswith(('"', "'", "}"))
+                or JSON5_OBJECT_KEY_RE.match(tail) is not None
             )
-        if stripped.rstrip() in {"true", "false", "null"}:
+        if stripped.startswith("["):
+            array_like = (
+                not tail
+                or tail.startswith(('"', "'", "{", "[", "]", "-"))
+                or tail[:1].isdigit()
+                or tail.startswith(
+                    ("true", "false", "null", "undefined", "NaN", "Infinity")
+                )
+            )
+            if not array_like:
+                return False
+            if tail.startswith("-") or tail[:1].isdigit():
+                closing = stripped.find("]")
+                if closing >= 0 and stripped[closing + 1 :].strip():
+                    return "," in stripped[1:closing]
             return True
-        return stripped.startswith("-") or stripped[:1].isdigit()
+        if stripped.rstrip() in {
+            "true",
+            "false",
+            "null",
+            "NaN",
+            "Infinity",
+            "-Infinity",
+        }:
+            return True
+        return JSON_NUMBER_RE.fullmatch(stripped.rstrip()) is not None
 
     def looks_nested_json_candidate(text: str) -> bool:
         sample = text if len(text) <= MAX_WRAPPER_JSON_CHARS else text[:256]
         stripped = sample.lstrip()
-        return (
-            looks_structural(text)
-            or stripped.startswith(("{", "["))
-            or stripped.rstrip() in {"NaN", "Infinity", "-Infinity"}
-        )
+        return looks_structural(text) or stripped.rstrip() in {
+            "NaN",
+            "Infinity",
+            "-Infinity",
+        }
 
     def inspect(node: Any, depth: int) -> None:
         nonlocal remaining
@@ -942,8 +964,8 @@ def _nested_json_text_requires_exact(value: str) -> bool:
         decoded = strict_json_loads(value)
     except DuplicateJSONKeyError:
         raise
-    except json.JSONDecodeError:
-        return False
+    except json.JSONDecodeError as exc:
+        raise ValueError("malformed JSON-like text") from exc
     inspect(decoded, 0)
     return True
 

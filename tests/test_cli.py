@@ -1166,18 +1166,25 @@ def test_reduce_json_preserves_ambiguous_blank_tool_nested_payloads() -> None:
 
 
 def test_reduce_json_compacts_invalid_json_result_string_as_plain_output() -> None:
-    envelope = {
-        "tool_name": "terminal",
-        "args": {"command": "pytest"},
-        "result": "{not json\n" + numbered("line", 100),
-        "noisegate": {"max_chars": 120},
-    }
-    proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+    for first_line in (
+        "{not json",
+        "2026-07-14 build started",
+        "- warning",
+        "[2026-07-14 09:04:09] build started",
+        "[123] build started",
+    ):
+        envelope = {
+            "tool_name": "terminal",
+            "args": {"command": "pytest"},
+            "result": first_line + "\n" + numbered("line", 100),
+            "noisegate": {"max_chars": 120},
+        }
+        proc = run_cli("reduce-json", input_text=json.dumps(envelope))
 
-    assert proc.returncode == 0, proc.stderr
-    outer = json.loads(proc.stdout)
-    assert outer["result"].startswith("{not json")
-    assert "[noisegate: omitted" in outer["result"]
+        assert proc.returncode == 0, proc.stderr
+        outer = json.loads(proc.stdout)
+        assert outer["result"].startswith(first_line)
+        assert "[noisegate: omitted" in outer["result"]
 
 
 def test_reduce_json_preserves_plain_result_for_non_noisy_tool() -> None:
@@ -1292,7 +1299,15 @@ def test_reduce_json_tool_call_rejects_invalid_deep_json_result() -> None:
         json.dumps(value)
         for value in ("NaN", "Infinity", "{foo: 1}", "['x']", "[undefined]")
     )
-    for result in (json.dumps(duplicate), malformed, *nonstandard):
+    direct_invalid = (
+        '{"tool_name":"mcp_github_get_file"',
+        '{tool_name: "mcp_github_get_file"}',
+        "[1,]",
+        "['x']",
+        "[undefined]",
+        "NaN",
+    )
+    for result in (json.dumps(duplicate), malformed, *nonstandard, *direct_invalid):
         envelope = {
             "tool_name": "tool_call",
             "args": {"name": "browser_console", "arguments": {}},
