@@ -27,6 +27,7 @@ from .engine import (
     _raise_if_source_alignment_work_exhausted,
     _recovery_notices,
     _reduce_text_in_operation,
+    _reduction_command_class,
     _source_alignment_work_operation,
     _SourceAlignmentWorkExhausted,
     _store_artifact,
@@ -48,16 +49,38 @@ JSON5_OBJECT_KEY_RE = re.compile(
     r"[+-]?0[xX][0-9A-Fa-f]+)\s*:"
 )
 TERMINAL_TEXT_FIELDS = ("stdout", "stderr", "output")
-ALWAYS_PROTECTED_COMMAND_CLASSES = frozenset({"file_read", "source_search", "patch"})
+PROCESS_TEXT_FIELDS = (
+    "stdout",
+    "stderr",
+    "output",
+    "logs",
+    "log",
+    "new_output",
+    "output_preview",
+)
+ALWAYS_PROTECTED_COMMAND_CLASSES = frozenset(
+    {"file_read", "source_search", "patch", "systemctl_show"}
+)
 CONDITIONALLY_PROTECTED_COMMAND_CLASSES = frozenset({"git_diff"})
 EXACT_COMMAND_CLASSES = (
     ALWAYS_PROTECTED_COMMAND_CLASSES | CONDITIONALLY_PROTECTED_COMMAND_CLASSES
 )
 OUTPUT_ASSISTED_COMMAND_CLASSES = frozenset({"file_read", "source_search"})
 NOISY_COMMAND_CLASSES = frozenset(
-    {"apt", "docker_build", "docker_logs", "node", "pytest", "python_package", "unittest"}
+    {
+        "apt",
+        "docker_build",
+        "docker_logs",
+        "log_stream",
+        "node",
+        "pytest",
+        "python_package",
+        "unittest",
+    }
 )
 COMMAND_ALIASES = ("command", "cmd", "shell_command", "code")
+PROCESS_COMMAND_CONTAINERS = ("process", "session", "metadata")
+PROCESS_LOG_ACTIONS = frozenset({"log", "poll", "wait"})
 GENERIC_TEXT_FIELDS = (
     "stdout",
     "stderr",
@@ -314,6 +337,7 @@ def _transform_tool_result_with_budget(
             preserve_patterns = _preserve_patterns_for(
                 command,
                 parsed,
+                tool_name=tool_name,
                 exit_code=exit_code_override,
             )
             if options.artifact_enabled:
@@ -413,24 +437,59 @@ def _transform_tool_result_with_budget(
             for field in fields
             if isinstance((value := payload.get(field)), str)
         )
-        command = _select_command(
-            command_text,
-            call_args,
-            args_map,
-            arguments_map,
-            payload,
-            exit_code=exit_code,
-        )
+        if tool_name == "process":
+            command = _select_process_command(
+                command_text,
+                payload,
+                call_args,
+                args_map,
+                arguments_map,
+                exit_code=exit_code,
+            )
+        else:
+            command = _select_command(
+                command_text,
+                call_args,
+                args_map,
+                arguments_map,
+                payload,
+                exit_code=exit_code,
+            )
         field_metadata: dict[str, JsonValue] = {}
         original_values: dict[str, str] = {}
         reduced_values: dict[str, str] = {}
         preview_plans_by_field: dict[str, _ArtifactPreviewPlan] = {}
         preserve_patterns_by_field: dict[str, tuple[re.Pattern[str], ...] | None] = {}
         reduce_options = replace(options, artifact_enabled=False)
+        commandless_process_log_fallback_allowed = (
+            tool_name != "process"
+            or bool(command)
+            or _process_commandless_log_fallback_allowed(
+                payload,
+                call_args,
+                args_map,
+                arguments_map,
+            )
+        )
 
         for field in fields:
             value = payload.get(field)
             if not isinstance(value, str):
+                continue
+            if (
+                tool_name == "process"
+                and not command
+                and (
+                    not commandless_process_log_fallback_allowed
+                    or _reduction_command_class(
+                        "",
+                        value,
+                        tool_name=tool_name,
+                        exit_code=exit_code,
+                    )
+                    != "log_stream"
+                )
+            ):
                 continue
             nested_json = _nested_json_text_requires_exact(value)
             if nested_json and field == "result" and tool_name in TERMINAL_TOOL_NAMES:
@@ -487,7 +546,12 @@ def _transform_tool_result_with_budget(
                 text = reduced.text
                 preserve_patterns: tuple[re.Pattern[str], ...] | None = None
                 if options.artifact_enabled:
-                    preserve_patterns = _preserve_patterns_for(command, value, exit_code=exit_code)
+                    preserve_patterns = _preserve_patterns_for(
+                        command,
+                        value,
+                        tool_name=tool_name,
+                        exit_code=exit_code,
+                    )
                     metadata["artifact"] = _plan_artifact(value, options)
                     _drop_artifact_if_notice_cannot_fit(
                         metadata,
@@ -846,9 +910,15 @@ def _preserve_patterns_for(
     command: str,
     text: str,
     *,
+    tool_name: str | None = None,
     exit_code: int | None = None,
 ) -> tuple[re.Pattern[str], ...] | None:
-    command_class = classify_command(command, text, exit_code=exit_code)
+    command_class = _reduction_command_class(
+        command,
+        text,
+        tool_name=tool_name,
+        exit_code=exit_code,
+    )
     return _preserve_patterns_for_output(command_class, text)
 
 
@@ -925,7 +995,12 @@ def _transform_terminal_output_with_budget(
 
 
 def _candidate_fields(tool_name: str, payload: Mapping[str, JsonValue]) -> tuple[str, ...]:
-    candidates = TERMINAL_TEXT_FIELDS if tool_name in TERMINAL_TOOL_NAMES else GENERIC_TEXT_FIELDS
+    if tool_name == "process":
+        candidates = PROCESS_TEXT_FIELDS
+    elif tool_name in TERMINAL_TOOL_NAMES:
+        candidates = TERMINAL_TEXT_FIELDS
+    else:
+        candidates = GENERIC_TEXT_FIELDS
     return tuple(field for field in candidates if field in payload)
 
 
@@ -1471,6 +1546,98 @@ def _select_command(
     return candidates[0] if candidates else ""
 
 
+def _process_commandless_log_fallback_allowed(*sources: Mapping[str, Any]) -> bool:
+    actions: list[str] = []
+    visited: set[int] = set()
+    remaining = 32
+    valid = True
+
+    def visit(source: Mapping[str, Any], depth: int) -> None:
+        nonlocal remaining, valid
+        if not valid or id(source) in visited:
+            return
+        if depth > 4 or remaining <= 0:
+            valid = False
+            return
+        visited.add(id(source))
+        remaining -= 1
+        action = source.get("action")
+        if action is not None:
+            if not isinstance(action, str) or not action.strip():
+                valid = False
+                return
+            actions.append(action.strip().lower())
+        for key in PROCESS_COMMAND_CONTAINERS:
+            nested = source.get(key)
+            if isinstance(nested, Mapping):
+                visit(nested, depth + 1)
+
+    for source in sources:
+        visit(source, 0)
+    return valid and bool(actions) and all(action in PROCESS_LOG_ACTIONS for action in actions)
+
+
+def _select_process_command(
+    text: str,
+    payload: Mapping[str, Any],
+    *sources: Mapping[str, Any],
+    exit_code: int | None = None,
+) -> str:
+    real_commands: list[str] = []
+
+    def add_commands(source: Mapping[str, Any]) -> None:
+        for command in _commands_from_source(source):
+            if _looks_like_process_action_command(command):
+                continue
+            if command not in real_commands:
+                real_commands.append(command)
+
+    add_commands(payload)
+    for nested in _nested_process_command_sources(payload):
+        add_commands(nested)
+    for source in sources:
+        add_commands(source)
+
+    command_sources = [{"command": command} for command in real_commands]
+    return _select_command(text, *command_sources, exit_code=exit_code)
+
+
+def _nested_process_command_sources(payload: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    sources: list[Mapping[str, Any]] = []
+    visited: set[int] = {id(payload)}
+    remaining = 16
+
+    def visit(owner: Mapping[str, Any], depth: int) -> None:
+        nonlocal remaining
+        if depth > 4 or remaining <= 0:
+            raise ValueError("nested process command ownership exceeds limits")
+        for key in PROCESS_COMMAND_CONTAINERS:
+            candidate = owner.get(key)
+            if not isinstance(candidate, Mapping):
+                continue
+            if id(candidate) in visited:
+                raise ValueError("ambiguous nested process command ownership")
+            remaining -= 1
+            visited.add(id(candidate))
+            sources.append(candidate)
+            visit(candidate, depth + 1)
+
+    visit(payload, 0)
+    return tuple(sources)
+
+
+def _looks_like_process_action_command(command: str) -> bool:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    return bool(
+        len(tokens) >= 2
+        and Path(tokens[0]).name.lower() == "process"
+        and tokens[1].lower() in PROCESS_LOG_ACTIONS
+    )
+
+
 def _command_evidence_text(text: str) -> str:
     try:
         parsed = strict_json_loads(text)
@@ -1519,5 +1686,7 @@ def _extract_exit_code(payload: Mapping[str, JsonValue], tool_name: str) -> int 
         and isinstance(status, str)
         and status.lower() in {"failed", "failure", "error", "errored"}
     ):
+        if tool_name == "process" and not numeric_values:
+            return None
         return 1
     return numeric_values[0] if numeric_values else None

@@ -1356,7 +1356,9 @@ def test_only_known_noisy_tool_results_are_compacted() -> None:
     long_text = numbered("tool output", 120)
     cases = {
         "terminal": json.dumps({"stdout": long_text, "exit": 0}),
-        "process": json.dumps({"output": long_text, "exit_code": 0}),
+        "process": json.dumps(
+            {"action": "log", "output": f"{long_text}\nERROR process failed", "exit_code": 0}
+        ),
         "read_terminal": json.dumps({"output": long_text, "status": "ok"}),
         "browser_console": json.dumps({"logs": long_text}),
     }
@@ -2589,16 +2591,22 @@ def test_transform_tool_result_keeps_ambiguous_blank_tool_payloads_exact() -> No
         assert transform_tool_result(json.dumps(payload), noisegate_max_chars=120) is None
 
 
-def test_terminal_status_failed_is_treated_as_error_exit_code() -> None:
-    raw = json.dumps({"status": "failed", "output": numbered("line", 100)})
+def test_process_failed_status_without_numeric_code_does_not_fabricate_exit_notice() -> None:
+    raw = json.dumps(
+        {
+            "action": "wait",
+            "status": "failed",
+            "output": f'{numbered("line", 100)}\nERROR worker failed',
+        }
+    )
 
     transformed = transform_tool_result(raw, tool_name="process", noisegate_max_chars=120)
 
     payload = parse_hook_result(transformed)
     output = payload["output"]
     assert isinstance(output, str)
-    assert "[noisegate: exit_code=1]" in output
-    assert payload["noisegate"]["fields"]["output"]["exit_code"] == 1
+    assert "[noisegate: exit_code=" not in output
+    assert payload["noisegate"]["fields"]["output"].get("exit_code") is None
 
 
 def test_transform_tool_result_uses_command_alias_when_command_is_blank() -> None:

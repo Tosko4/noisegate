@@ -1125,6 +1125,12 @@ def _envelope_call_args(payload: dict[Any, Any]) -> dict[str, Any]:
 
 
 def _merge_call_arg_hints(target: dict[str, Any], source: dict[Any, Any]) -> None:
+    if "action" in source:
+        action = source.get("action")
+        if "action" not in target:
+            target["action"] = action
+        elif target["action"] != action:
+            target["action"] = (target["action"], action)
     if _has_command_hint(target):
         return
     for key in ("command", "cmd", "shell_command", "code"):

@@ -54,7 +54,8 @@ It knows how to reduce common noisy outputs:
 - `apt` / `apt-get`, `pip`, and `uv` package-install/update logs, including resolver failures before a `uv run` command starts
 - `npm`, `pnpm`, and `yarn`
 - `git status` and `git log`
-- Docker build-style logs and explicit `docker logs` / `docker compose logs` output
+- Docker build-style logs and explicit `docker logs`, `docker service logs`, and `docker compose logs` output
+- Hermes background `process` poll/log/wait payloads when the underlying command or diagnostic content identifies a known noisy stream, including Docker, journalctl, `systemctl status`, dmesg, and follow-mode tail output from known log targets, while keeping process metadata intact; commandless non-diagnostic previews, followed source/config files, and `systemctl show` properties stay exact
 - generic long output with deterministic head/tail fallback
 
 And it refuses to touch things that should stay exact:
