@@ -397,6 +397,8 @@ Hindsight is semantic long-term memory, not a raw output bucket. Noisegate must 
 
 ## Development
 
+Planning to contribute? Read [CONTRIBUTING.md](CONTRIBUTING.md) first, especially the product-fit, safety, testing, and AI-assistance rules.
+
 Start clean:
 
 ```bash
@@ -415,6 +417,8 @@ uv run python scripts/check_contributors.py
 rm -rf dist
 uv build
 uvx twine check dist/*
+git diff --check origin/main...HEAD
+git diff --cached --check
 git diff --check
 ```
 

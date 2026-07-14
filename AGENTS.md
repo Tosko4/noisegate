@@ -2,6 +2,8 @@
 
 Noisegate is a standalone Hermes Agent plugin and CLI for deterministic terminal/tool-output compaction.
 
+Read `CONTRIBUTING.md` before opening an issue, changing code, or preparing a pull request. It is the public contribution contract for people and agents; this file adds repository-specific execution guidance.
+
 ## Product scope
 
 - Primary target: Hermes Agent.
