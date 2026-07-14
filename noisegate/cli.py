@@ -27,6 +27,7 @@ from .engine import (
 from .installer import DEFAULT_PACKAGE_SPEC, InstallHermesError, install_hermes
 from .json_utils import DuplicateJSONKeyError, strict_json_loads
 from .plugin import (
+    TERMINAL_TOOL_NAMES,
     WRAPPER_TOOL_NAMES,
     _artifact_preview_plan,
     _artifact_preview_plan_matches_serialized_output,
@@ -533,7 +534,11 @@ def _reduce_json_value_with_budget(
             except (DuplicateJSONKeyError, json.JSONDecodeError, ValueError, RecursionError):
                 return raw
         nested_tool_name = _embedded_result_tool_name(result_value)
-        preserve_wrapped_json_result = resolved_wrapper_identity and json_encoded_result
+        preserve_wrapped_json_result = (
+            resolved_wrapper_identity
+            and json_encoded_result
+            and tool_name not in TERMINAL_TOOL_NAMES
+        )
         if (
             nested_tool_name
             and tool_name

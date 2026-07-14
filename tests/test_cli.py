@@ -1270,6 +1270,24 @@ def test_reduce_json_tool_call_preserves_generic_json_result_with_noisy_sibling(
     assert "[noisegate: omitted" in outer["logs"]
 
 
+def test_reduce_json_tool_call_compacts_json_encoded_terminal_result() -> None:
+    nested = json.dumps({"stdout": numbered("pytest output", 100), "exit": 0})
+    envelope = {
+        "tool_name": "tool_call",
+        "args": {"name": "terminal", "arguments": {"command": "pytest -q"}},
+        "result": nested,
+        "noisegate": {"max_chars": 600},
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+    assert proc.returncode == 0, proc.stderr
+    outer = json.loads(proc.stdout)
+    nested_result = json.loads(outer["result"])
+    assert nested_result["exit"] == 0
+    assert "[noisegate: omitted" in nested_result["stdout"]
+
+
 def test_reduce_json_tool_call_preserves_scalar_json_results() -> None:
     for nested in ("null   ", "false\n", "123.5e-2\t"):
         envelope = {
@@ -1302,10 +1320,13 @@ def test_reduce_json_tool_call_rejects_invalid_deep_json_result() -> None:
     direct_invalid = (
         '{"tool_name":"mcp_github_get_file"',
         '{tool_name: "mcp_github_get_file"}',
+        '{1: "non-standard"}',
+        '{1e2: "non-standard"}',
         "[1,]",
         "['x']",
         "[undefined]",
         "NaN",
+        '\ufeff{"tool_name":"mcp_github_get_file"}',
     )
     for result in (json.dumps(duplicate), malformed, *nonstandard, *direct_invalid):
         envelope = {

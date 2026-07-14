@@ -42,7 +42,11 @@ MAX_WRAPPER_JSON_CHARS = 65_536
 MAX_NESTED_JSON_DEPTH = 8
 MAX_NESTED_JSON_NODES = 512
 JSON_NUMBER_RE = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
-JSON5_OBJECT_KEY_RE = re.compile(r"[A-Za-z_$][A-Za-z0-9_$.-]*\s*:")
+JSON5_OBJECT_KEY_RE = re.compile(
+    r"(?:[A-Za-z_$][A-Za-z0-9_$.-]*|"
+    r"[+-]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|Infinity|NaN)|"
+    r"[+-]?0[xX][0-9A-Fa-f]+)\s*:"
+)
 TERMINAL_TEXT_FIELDS = ("stdout", "stderr", "output")
 ALWAYS_PROTECTED_COMMAND_CLASSES = frozenset({"file_read", "source_search", "patch"})
 CONDITIONALLY_PROTECTED_COMMAND_CLASSES = frozenset({"git_diff"})
@@ -206,6 +210,7 @@ def _transform_tool_result_with_budget(
 ) -> str | None:
     try:
         override = kwargs.pop("noisegate_exit_code", None)
+        disable_artifacts = bool(kwargs.pop("_disable_artifacts", False))
         exit_code_override = (
             override if isinstance(override, int) and not isinstance(override, bool) else None
         )
@@ -223,6 +228,8 @@ def _transform_tool_result_with_budget(
         if effective_tool_name and not _is_compactable_tool_name(effective_tool_name):
             return None
         options = NoisegateOptions.from_env().with_mapping(kwargs)
+        if disable_artifacts:
+            options = replace(options, artifact_enabled=False)
         if not options.enabled or options.mode == "off":
             return None
 
@@ -383,6 +390,12 @@ def _transform_tool_result_with_budget(
         if exit_code is None:
             exit_code = exit_code_override
         fields = _candidate_fields(tool_name, payload)
+        if (
+            resolved_wrapper is not None
+            and isinstance(payload.get("result"), str)
+            and "result" not in fields
+        ):
+            fields = (*fields, "result")
         if options.artifact_enabled and sum(
             isinstance(payload.get(field), str) and bool(payload.get(field)) for field in fields
         ) > 1:
@@ -411,7 +424,47 @@ def _transform_tool_result_with_budget(
             value = payload.get(field)
             if not isinstance(value, str):
                 continue
-            if _nested_json_text_requires_exact(value):
+            nested_json = _nested_json_text_requires_exact(value)
+            if nested_json and field == "result" and tool_name in TERMINAL_TOOL_NAMES:
+                nested_payload = strict_json_loads(value)
+                if not isinstance(nested_payload, Mapping):
+                    continue
+                nested_call_args = dict(call_args)
+                nested_commands = {
+                    command
+                    for source in (
+                        *_command_sources_from_payload(nested_call_args),
+                        *_command_sources_from_payload(nested_payload),
+                    )
+                    for command in _commands_from_source(source)
+                }
+                if len(nested_commands) > 1:
+                    return None
+                if nested_commands:
+                    nested_call_args["command"] = next(iter(nested_commands))
+                nested_kwargs = dict(kwargs)
+                nested_transformed = _transform_tool_result_with_budget(
+                    value,
+                    tool_name=tool_name,
+                    args=nested_call_args,
+                    arguments=None,
+                    defer_artifact_store=False,
+                    artifact_plans_out=None,
+                    _disable_artifacts=True,
+                    **nested_kwargs,
+                )
+                if nested_transformed is not None:
+                    payload[field] = nested_transformed
+                    field_metadata[field] = {
+                        "version": __version__,
+                        "compacted": True,
+                        "mode": options.mode,
+                        "reducer": "nested_json",
+                        "original_chars": len(value),
+                        "omitted_chars": max(0, len(value) - len(nested_transformed)),
+                    }
+                continue
+            if nested_json:
                 continue
             reduced = _reduce_text_in_operation(
                 value,
@@ -876,6 +929,8 @@ def _nested_json_text_requires_exact(value: str) -> bool:
     def looks_structural(text: str) -> bool:
         sample = text if len(text) <= MAX_WRAPPER_JSON_CHARS else text[:256]
         stripped = sample.lstrip()
+        if stripped.startswith("\ufeff"):
+            stripped = stripped[1:].lstrip()
         if not stripped:
             return len(sample) < len(text)
         if stripped.startswith('"'):

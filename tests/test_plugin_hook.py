@@ -591,6 +591,66 @@ def test_tool_call_wrapper_preserves_json_encoded_result_fields() -> None:
     assert "[noisegate: omitted" in payload["logs"]
 
 
+def test_tool_call_wrapper_compacts_json_encoded_terminal_result() -> None:
+    nested = json.dumps({"stdout": numbered("pytest output", 180), "exit": 0})
+    raw = json.dumps({"result": nested})
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="tool_call",
+        args={"name": "terminal", "arguments": {"command": "pytest -q"}},
+        noisegate_max_chars=600,
+    )
+
+    assert transformed is not None
+    payload = json.loads(transformed)
+    nested_payload = json.loads(payload["result"])
+    assert nested_payload["exit"] == 0
+    assert "[noisegate: omitted" in nested_payload["stdout"]
+
+
+def test_tool_call_wrapper_rejects_nested_terminal_command_conflicts() -> None:
+    for owner in ("args", "input"):
+        nested = json.dumps(
+            {
+                owner: {"command": "cat important.py"},
+                "stdout": numbered("exact source", 180),
+                "exit": 0,
+            }
+        )
+        raw = json.dumps({"result": nested, "stdout": numbered("sibling noise", 180)})
+
+        assert (
+            transform_tool_result(
+                raw,
+                tool_name="tool_call",
+                args={"name": "terminal", "arguments": {"command": "pytest -q"}},
+                noisegate_max_chars=600,
+            )
+            is None
+        )
+
+
+def test_tool_call_wrapper_nested_terminal_never_stores_artifacts(monkeypatch) -> None:
+    nested = json.dumps({"stdout": numbered("pytest output", 180), "exit": 0})
+    raw = json.dumps({"result": nested})
+
+    def unexpected_store(*_args, **_kwargs):
+        raise AssertionError("nested terminal JSON must not persist an artifact")
+
+    monkeypatch.setattr(plugin, "_store_artifact", unexpected_store)
+    transformed = transform_tool_result(
+        raw,
+        tool_name="tool_call",
+        args={"name": "terminal", "arguments": {"command": "pytest -q"}},
+        noisegate_max_chars=600,
+        noisegate_artifacts=True,
+        noisegate_artifact_enabled=True,
+    )
+
+    assert transformed is not None
+
+
 def test_tool_call_wrapper_preserves_scalar_json_result_fields() -> None:
     for nested in ("null   ", "true\n", "-12.5e3\t"):
         raw = json.dumps({"result": nested, "logs": numbered("browser noise", 180)})
@@ -661,10 +721,13 @@ def test_tool_call_wrapper_rejects_duplicate_keys_in_nested_json_strings() -> No
     direct_invalid = (
         '{"tool_name":"mcp_github_get_file"',
         '{tool_name: "mcp_github_get_file"}',
+        '{1: "non-standard"}',
+        '{1e2: "non-standard"}',
         "[1,]",
         "['x']",
         "[undefined]",
         "NaN",
+        '\ufeff{"tool_name":"mcp_github_get_file"}',
     )
     for nested in (
         duplicate,
