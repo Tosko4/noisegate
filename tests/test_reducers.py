@@ -977,6 +977,12 @@ def test_named_non_noisy_tools_are_protected_by_default() -> None:
         "hermes lcm expand 123 <<<\"ignored value\"",
         "hermes lcm expand 123 <<< \"ignored value\"",
         "exec /opt/bin/lcm_expand 123",
+        "exec -a hermes /opt/hermes/bin/hermes --profile work lcm expand 123",
+        "exec -aretrieval /opt/bin/lcm_expand 123",
+        "exec -l /opt/bin/lcm_expand 123",
+        "exec -cl /opt/bin/lcm_expand 123",
+        "exec -cla retrieval /opt/bin/lcm_expand 123",
+        "echo `echo \\`/opt/bin/session_search q\\``",
         "printf '%s' \"$(hermes lcm expand 123)\"",
         "printf '%s' \"$(value=`hermes lcm expand 123`; printf '%s' \"$value\")\"",
         "hermes lcm expand-query retrieval",
@@ -1008,6 +1014,35 @@ def test_terminal_memory_retrieval_commands_are_exact(command: str) -> None:
     assert result.metadata["command_class"] == "memory_retrieval"
     assert result.metadata["reducer"] == "protected_memory_retrieval"
     assert result.metadata["reason"] == "memory_retrieval_passthrough"
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "hermes --profile work lcm expand 123",
+        "hermes --profile=work lcm expand 123",
+        "hermes -p work lcm expand 123",
+        "hermes -pwork lcm expand 123",
+        "hermes --yolo --profile work lcm expand 123",
+        "/opt/hermes/bin/hermes --profile work lcm expand 123",
+        "exec /opt/hermes/bin/hermes --profile work 2>/dev/null lcm expand 123 <<<ignored",
+        "printf '%s' \"$(hermes --profile work lcm expand 123)\"",
+    ),
+)
+def test_profiled_hermes_memory_retrieval_commands_are_exact(command: str) -> None:
+    raw = numbered("profiled retrieval evidence", 100)
+
+    result = reduce_text(
+        raw,
+        command=command,
+        tool_name="terminal",
+        options=options(max_chars=120),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["command_class"] == "memory_retrieval"
+    assert result.metadata["reducer"] == "protected_memory_retrieval"
 
 
 @pytest.mark.parametrize(
@@ -1122,6 +1157,42 @@ def test_retrieval_executable_intent_beats_diff_like_query_and_output(command: s
 )
 def test_memory_maintenance_commands_remain_compactable(command: str, line: str) -> None:
     raw = numbered(line, 100)
+
+    result = reduce_text(
+        raw,
+        command=command,
+        tool_name="terminal",
+        options=options(max_chars=160),
+    )
+
+    assert result.changed is True
+    assert result.metadata["command_class"] == "generic"
+    assert result.metadata["reducer"] == "generic_head_tail"
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "hermes --profile work lcm import archive.jsonl",
+        "hermes -p work lcm doctor --reindex",
+        "hermes --profile lcm expand 123",
+        "hermes chat -q 'lcm expand 123'",
+        "hermes --profile --yolo lcm expand 123",
+        "hermes --profile= lcm expand 123",
+        "hermes -p --yolo lcm expand 123",
+        "hermes -p",
+        "hermes --profile=bad:name lcm expand 123",
+        "hermes -p-work lcm expand 123",
+        "hermes --profile 'bad name' lcm expand 123",
+        "hermes --profile=abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklm "
+        "lcm expand 123",
+        "hermes --profile \u017f lcm expand 123",
+        "hermes --profile \u0131 lcm expand 123",
+        "hermes --profile \u0130 lcm expand 123",
+    ),
+)
+def test_profile_syntax_without_retrieval_intent_remains_compactable(command: str) -> None:
+    raw = numbered("ordinary Hermes output", 100)
 
     result = reduce_text(
         raw,

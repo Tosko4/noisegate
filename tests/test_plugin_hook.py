@@ -167,6 +167,10 @@ def test_hermes_hooks_preserve_executed_retrieval_shell_forms_exactly() -> None:
         "hermes 2>/dev/null lcm expand 123",
         "hermes lcm expand 123 <<<ignored",
         "exec /opt/bin/lcm_expand 123",
+        "exec -a hermes /opt/hermes/bin/hermes --profile work lcm expand 123",
+        "exec -aretrieval /opt/bin/lcm_expand 123",
+        "exec -l /opt/bin/lcm_expand 123",
+        "echo `echo \\`/opt/bin/session_search q\\``",
         "printf '%s' \"$(hermes lcm expand 123)\"",
         "printf '%s' \"$(value=`hermes lcm expand 123`; printf '%s' \"$value\")\"",
     )
@@ -188,6 +192,62 @@ def test_hermes_hooks_preserve_executed_retrieval_shell_forms_exactly() -> None:
             )
             is None
         ), command
+
+
+def test_hermes_hooks_preserve_profiled_retrieval_output_exactly() -> None:
+    output = numbered("exact profiled retrieval evidence PASSED", 180)
+    commands = (
+        "hermes --profile work lcm expand 123",
+        "hermes --profile=work lcm expand 123",
+        "hermes -p work lcm expand 123",
+        "hermes -pwork lcm expand 123",
+        "hermes --yolo --profile work lcm expand 123",
+        "exec /opt/hermes/bin/hermes --profile work 2>/dev/null lcm expand 123 <<<ignored",
+        "printf '%s' \"$(hermes --profile work lcm expand 123)\"",
+    )
+
+    for command in commands:
+        assert (
+            transform_terminal_output(
+                command=command,
+                output=output,
+                noisegate_max_chars=160,
+            )
+            is None
+        ), command
+        assert (
+            transform_tool_result(
+                terminal_result(output, command=command),
+                tool_name="terminal",
+                noisegate_max_chars=160,
+            )
+            is None
+        ), command
+
+
+def test_hermes_hooks_keep_profiled_maintenance_output_compactable() -> None:
+    output = numbered("Hermes maintenance progress", 180)
+
+    for command in (
+        "hermes --profile work lcm import archive.jsonl",
+        "hermes -p work lcm doctor --reindex",
+    ):
+        terminal_output = transform_terminal_output(
+            command=command,
+            output=output,
+            noisegate_max_chars=160,
+        )
+        assert isinstance(terminal_output, str), command
+        assert "[noisegate: omitted" in terminal_output, command
+
+        tool_output = transform_tool_result(
+            terminal_result(output, command=command),
+            tool_name="terminal",
+            noisegate_max_chars=160,
+        )
+        payload = parse_hook_result(tool_output)
+        assert payload["noisegate"]["compacted"] is True, command
+        assert "[noisegate: omitted" in payload["stdout"], command
 
 
 def test_explicit_terminal_tool_preserves_ordinary_payload_name_label() -> None:

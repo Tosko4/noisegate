@@ -64,7 +64,10 @@ SECRET_ARTIFACT_PATTERNS = tuple(
         r"private[_-]?key|client[_-]?secret|credentials?|authorization|cookie|"
         r"session(?:id)?)\s*[:=]",
         r"^\s*(?:[<>*]\s*)?(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-access-token|x-amz-security-token|x-goog-api-key)\s*[:=]",
-        r"[\"'](?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-access-token|x-amz-security-token|x-goog-api-key|api[_-]?key|access[_-]?token|token|secret|password|passwd|private[_-]?key|client[_-]?secret|credentials?)[\"']\s*:",
+        r"[\"'](?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|"
+        r"x-auth-token|x-access-token|x-amz-security-token|x-goog-api-key|"
+        r"api(?:[ \t]+|[_-]?)key|access[_-]?token|token|secret|password|passwd|"
+        r"private[_-]?key|client[_-]?secret|credentials?)[\"']\s*:",
         r"^[ \t]*(?:(?:>[ \t]*)|(?:[-+*][ \t]+)|(?:\d+[.)][ \t]+))*"
         r"[\"']?-{5}BEGIN "
         r"(?:(?:[A-Z0-9]+ )*PRIVATE KEY|PGP PRIVATE KEY BLOCK)-{5}[\"']?[ \t]*\r?$",
@@ -126,6 +129,11 @@ MEMORY_RETRIEVAL_HELPERS = frozenset(
         "lcm_load_session",
         "session_search",
     }
+)
+HERMES_VALUELESS_GLOBAL_OPTIONS = frozenset({"--yolo"})
+HERMES_PROFILE_ID_PATTERN = re.compile(
+    r"[a-z0-9][a-z0-9_-]{0,63}",
+    re.IGNORECASE | re.ASCII,
 )
 LCM_EXTERNALIZED_PATTERNS = tuple(
     re.compile(pattern)
@@ -3925,15 +3933,18 @@ def _looks_like_memory_retrieval_command(command: str) -> bool:
         executable = Path(tokens[0]).name.lower()
         if executable in MEMORY_RETRIEVAL_HELPERS:
             return True
-        if executable != "hermes" or len(tokens) < 3:
+        if executable != "hermes":
             continue
 
-        group = tokens[1].lower()
-        action = tokens[2].lower()
+        hermes_command = _hermes_top_level_command_tokens(tokens)
+        if hermes_command is None or len(hermes_command) < 2:
+            continue
+        group = hermes_command[0].lower()
+        action = hermes_command[1].lower()
         if group == "lcm":
             if action in {"grep", "load-session", "describe", "expand", "expand-query"}:
                 return True
-            if len(tokens) >= 4 and (action, tokens[3].lower()) in {
+            if len(hermes_command) >= 3 and (action, hermes_command[2].lower()) in {
                 ("load", "session"),
                 ("expand", "query"),
             }:
@@ -3949,6 +3960,44 @@ def _looks_like_memory_retrieval_command(command: str) -> bool:
         ):
             return True
     return False
+
+
+def _hermes_top_level_command_tokens(tokens: list[str]) -> list[str] | None:
+    """Return the Hermes command after the narrow set of recognized global options."""
+
+    if not tokens or Path(tokens[0]).name.lower() != "hermes":
+        return None
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in HERMES_VALUELESS_GLOBAL_OPTIONS:
+            index += 1
+            continue
+        if token in {"--profile", "-p"}:
+            if (
+                index + 1 >= len(tokens)
+                or HERMES_PROFILE_ID_PATTERN.fullmatch(tokens[index + 1]) is None
+            ):
+                return None
+            index += 2
+            continue
+        if token.startswith("--profile="):
+            if (
+                HERMES_PROFILE_ID_PATTERN.fullmatch(token.removeprefix("--profile="))
+                is None
+            ):
+                return None
+            index += 1
+            continue
+        if token.startswith("-p") and token != "-p":
+            if HERMES_PROFILE_ID_PATTERN.fullmatch(token[2:]) is None:
+                return None
+            index += 1
+            continue
+        if token.startswith("-"):
+            return None
+        return tokens[index:]
+    return None
 
 
 def _memory_retrieval_substitutions(command: str) -> list[tuple[str, str]] | None:
@@ -4009,12 +4058,25 @@ def _memory_retrieval_execution_tokens(tokens: list[str]) -> list[str]:
     normalized = _strip_command_wrappers(normalized)
     if not normalized or normalized[0] != "exec":
         return normalized
-    normalized = normalized[1:]
-    if normalized[:1] == ["--"]:
-        normalized = normalized[1:]
-    elif normalized and normalized[0].startswith("-"):
-        return []
-    return _strip_command_wrappers(normalized)
+    index = 1
+    while index < len(normalized):
+        token = normalized[index]
+        if token == "--":
+            index += 1
+            break
+        if not token.startswith("-") or token == "-":
+            break
+        cluster = token[1:]
+        argv0_index = cluster.find("a")
+        option_cluster = cluster if argv0_index < 0 else cluster[:argv0_index]
+        if not cluster or any(option not in {"c", "l"} for option in option_cluster):
+            return []
+        if argv0_index >= 0 and not cluster[argv0_index + 1 :]:
+            index += 1
+            if index >= len(normalized):
+                return []
+        index += 1
+    return _strip_command_wrappers(normalized[index:])
 
 
 def _is_pytest_command(command: str) -> bool:
@@ -4108,6 +4170,10 @@ def _command_substitutions(command: str) -> list[tuple[str, str]]:
                     scan += 1
                     continue
                 if current == "\\":
+                    if scan + 1 < len(command) and command[scan + 1] == "`":
+                        body_chars.append("`")
+                        scan += 2
+                        continue
                     body_chars.append(current)
                     inner_escaped = True
                     scan += 1
