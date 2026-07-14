@@ -27,6 +27,7 @@ from .engine import (
 from .installer import DEFAULT_PACKAGE_SPEC, InstallHermesError, install_hermes
 from .json_utils import DuplicateJSONKeyError, strict_json_loads
 from .plugin import (
+    FIELD_AWARE_WRITE_TOOL_NAMES,
     TERMINAL_TOOL_NAMES,
     WRAPPER_TOOL_NAMES,
     _artifact_preview_plan,
@@ -532,7 +533,11 @@ def _reduce_json_value_with_budget(
                 call_args["command"] = next(iter(wrapper_commands))
         else:
             tool_name = explicit_tool_name or _payload_tool_name(parsed, call_args)
-        if tool_name and not _is_compactable_tool_name(tool_name):
+        if (
+            tool_name
+            and tool_name not in FIELD_AWARE_WRITE_TOOL_NAMES
+            and not _is_compactable_tool_name(tool_name)
+        ):
             return raw
     if isinstance(parsed, dict) and "result" in parsed:
         result_value = parsed["result"]
@@ -565,6 +570,7 @@ def _reduce_json_value_with_budget(
             resolved_wrapper_identity
             and json_encoded_result
             and tool_name not in TERMINAL_TOOL_NAMES
+            and tool_name not in FIELD_AWARE_WRITE_TOOL_NAMES
         )
         if (
             nested_tool_name
@@ -717,7 +723,12 @@ def _reduce_json_value_with_budget(
                 parsed["result"] = transformed_value
             else:
                 parsed["result"] = transformed
-            candidate = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+            candidate = json.dumps(
+                parsed,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
             if _has_direct_text_payload(parsed):
                 direct_plans: list[_ArtifactPreviewPlan] = []
                 direct_transformed = _transform_direct_payload_preserving_json_result(
@@ -845,7 +856,12 @@ def _transform_direct_payload_preserving_json_result(
             return None
         transformed_payload["result"] = result_value
         restore_wrapper_identity(transformed_payload)
-        return json.dumps(transformed_payload, ensure_ascii=False, separators=(",", ":"))
+        return json.dumps(
+            transformed_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
 
     direct_raw = json.dumps(direct_payload, ensure_ascii=False, separators=(",", ":"))
     transformed = tool_transform(
@@ -864,7 +880,12 @@ def _transform_direct_payload_preserving_json_result(
     if not isinstance(transformed_payload, dict):
         return None
     restore_wrapper_identity(transformed_payload)
-    return json.dumps(transformed_payload, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(
+        transformed_payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 def _envelope_tool_name(payload: dict[Any, Any]) -> str:

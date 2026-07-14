@@ -644,7 +644,12 @@ def _transform_tool_result_with_budget(
             "original_result_chars": len(result),
             "fields": field_metadata,
         }
-        candidate = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        candidate = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
         if len(candidate) >= len(result):
             return None
 
@@ -675,7 +680,12 @@ def _transform_tool_result_with_budget(
                     ):
                         return None
                     payload[field] = text
-            candidate = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            candidate = json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
         if len(candidate) >= len(result):
             return None
         if defer_artifact_store and artifact_plans_out is not None:
@@ -1121,7 +1131,12 @@ def _transform_write_diagnostic_fields(
         "original_result_chars": len(result),
         "fields": field_metadata,
     }
-    candidate = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    candidate = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
     return candidate if len(candidate) < len(result) else None
 
 

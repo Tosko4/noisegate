@@ -324,6 +324,9 @@ This exception is inline-only: diagnostic fields never create raw
 artifacts, even when artifact mode is enabled. Here, exact means the parsed field
 value: when a sibling diagnostic compacts, Noisegate reserializes the outer JSON
 and adds collision-safe metadata, so the complete JSON byte stream may differ.
+`noisegate reduce-json` applies the same field-level contract when a Hermes-like
+envelope resolves directly, or through an unambiguous `tool_call` wrapper, to one
+of the supported write/patch-like tools.
 
 Protected surfaces include:
 

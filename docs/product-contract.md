@@ -45,6 +45,7 @@ Noisegate exists to improve agent context value, not to make output shorter at a
 
 - [ ] Full-result Hermes hook compaction remains limited to noisy terminal-like surfaces: `terminal`, `process`, `read_terminal`, and `browser_console`.
 - [ ] The only protected-tool exception is field-level compaction of known diagnostic strings on `write_file`, `patch`, `apply_patch`, `edit_file`, and `replace_in_file`; wrappers receive it only after unambiguous identity resolution.
+- [ ] `reduce-json` mirrors that same field-level exception for directly identified and unambiguously wrapped Hermes-like envelopes without enabling artifacts for diagnostic fields.
 - [ ] Useful-context tools are protected by name/prefix, and unknown future tools fail closed.
 - [ ] Noisegate stays independent from Hermes-LCM and Hindsight.
 

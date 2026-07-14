@@ -109,6 +109,21 @@ def test_generic_long_output_uses_deterministic_head_tail() -> None:
     assert result.metadata["omitted_chars"] > 0
 
 
+def test_write_diagnostic_location_patterns_are_line_anchored() -> None:
+    assert all(
+        pattern.pattern.startswith("^") for pattern in engine.DIAGNOSTIC_LOCATION_PATTERNS
+    )
+
+
+def test_write_diagnostic_location_patterns_reject_long_nonmatching_line() -> None:
+    long_noise = "x" * 8_192
+
+    assert all(
+        pattern.search(long_noise) is None
+        for pattern in engine.DIAGNOSTIC_LOCATION_PATTERNS
+    )
+
+
 def test_generic_head_tail_remaps_colliding_upstream_line_omission_by_coverage() -> None:
     raw = "\n".join(
         [

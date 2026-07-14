@@ -1185,8 +1185,17 @@ def _apply_reducer(
     lcm_patterns = _lcm_externalized_patterns_for(text)
     reducer_patterns = REDUCER_ANCHOR_PATTERNS_BY_COMMAND_CLASS.get(command_class, ())
     field_patterns = _combine_matching_patterns(text, None, extra_preserve_patterns) or ()
+    field_priority_patterns = (field_patterns,) if field_patterns else ()
     reduction_patterns = reducer_patterns + field_patterns + lcm_patterns
     if options.mode == "head_tail":
+        if field_patterns:
+            return "generic_diagnostic", _important_lines(
+                text,
+                options,
+                field_patterns + CRITICAL_PATTERNS + lcm_patterns,
+                priority_patterns=field_priority_patterns + HIGH_SIGNAL_PRIORITY_PATTERNS,
+                exit_code=exit_code,
+            )
         if lcm_patterns:
             return "generic_head_tail", _important_lines(
                 text,
@@ -1200,6 +1209,7 @@ def _apply_reducer(
             text,
             options,
             reduction_patterns,
+            priority_patterns=field_priority_patterns + HIGH_SIGNAL_PRIORITY_PATTERNS,
             exit_code=exit_code,
         )
     if command_class in {"apt", "python_package"}:
@@ -1207,7 +1217,7 @@ def _apply_reducer(
             text,
             options,
             reduction_patterns,
-            priority_patterns=PACKAGE_HIGH_SIGNAL_PRIORITY_PATTERNS,
+            priority_patterns=field_priority_patterns + PACKAGE_HIGH_SIGNAL_PRIORITY_PATTERNS,
             exit_code=exit_code,
         )
     if command_class == "node":
@@ -1215,7 +1225,7 @@ def _apply_reducer(
             text,
             options,
             reduction_patterns,
-            priority_patterns=NODE_HIGH_SIGNAL_PRIORITY_PATTERNS,
+            priority_patterns=field_priority_patterns + NODE_HIGH_SIGNAL_PRIORITY_PATTERNS,
             exit_code=exit_code,
         )
     if command_class == "docker_build":
@@ -1223,7 +1233,9 @@ def _apply_reducer(
             text,
             options,
             reduction_patterns,
-            priority_patterns=DOCKER_BUILD_HIGH_SIGNAL_PRIORITY_PATTERNS,
+            priority_patterns=(
+                field_priority_patterns + DOCKER_BUILD_HIGH_SIGNAL_PRIORITY_PATTERNS
+            ),
             exit_code=exit_code,
         )
     if command_class == "docker_logs":
@@ -1231,6 +1243,7 @@ def _apply_reducer(
             text,
             options,
             reduction_patterns,
+            priority_patterns=field_priority_patterns + HIGH_SIGNAL_PRIORITY_PATTERNS,
             exit_code=exit_code,
         )
     if command_class == "log_stream":
@@ -1238,6 +1251,7 @@ def _apply_reducer(
             text,
             options,
             reduction_patterns,
+            priority_patterns=field_priority_patterns + HIGH_SIGNAL_PRIORITY_PATTERNS,
             exit_code=exit_code,
         )
     if command_class == "git_status":
@@ -1245,6 +1259,7 @@ def _apply_reducer(
             text,
             options,
             reduction_patterns,
+            priority_patterns=field_priority_patterns + HIGH_SIGNAL_PRIORITY_PATTERNS,
             exit_code=exit_code,
         )
     if command_class == "git_log":
@@ -1254,6 +1269,7 @@ def _apply_reducer(
             text,
             options,
             field_patterns + CRITICAL_PATTERNS + lcm_patterns,
+            priority_patterns=field_priority_patterns + HIGH_SIGNAL_PRIORITY_PATTERNS,
             exit_code=exit_code,
         )
     if (
@@ -1292,15 +1308,19 @@ TEST_PATTERNS = tuple(
 )
 
 DIAGNOSTIC_LOCATION_PATTERNS = tuple(
-    re.compile(pattern, re.IGNORECASE)
+    re.compile(pattern, re.IGNORECASE | re.MULTILINE)
     for pattern in (
-        r"(?:^|\s)(?:[A-Z]:)?[^\s:\r\n][^:\r\n]*\.[A-Z0-9_+-]+:\d+:\d+:"
+        r"^\s*(?:[A-Z]:)?[^\s:\r\n][^:\r\n]*\.[A-Z0-9_+-]+:\d+(?::\d+)?:"
         r"\s*(?:\[[^\]\r\n]+\]\s*)?(?:error|warning|info|hint|[A-Z][A-Z0-9_-]*\d{2,})\b",
-        r"(?:^|\s)(?:[A-Z]:)?[^\s:\r\n][^\r\n]*\.[A-Z0-9_+-]+\(\d+,\d+\):"
+        r"^\s*(?:[A-Z]:)?[^\s:\r\n][^:\r\n]*\.[A-Z0-9_+-]+:\d+:\d+\s+-\s+"
+        r"(?:error|warning|info|hint):\s+\S",
+        r"^\s*(?:[A-Z]:)?[^\s:\r\n][^:\r\n]*\.[A-Z0-9_+-]+\(\d+,\d+\):"
         r"\s*(?:error|warning|info|hint)(?:\s+[A-Z][A-Z0-9_-]*\d+)?\b",
         r"^\s*\d+:\d+\s+(?:error|warning)\s+\S+",
-        r"(?:^|\s)(?:[A-Z]:)?[^\s:\r\n][^:\r\n]*\.[A-Z0-9_+-]+:\d+:\d+"
+        r"^\s*(?:[A-Z]:)?[^\s:\r\n][^:\r\n]*\.[A-Z0-9_+-]+:\d+:\d+"
         r"\s+\[(?:error|warning|info|hint)\]\s+(?:[A-Z][A-Z0-9_-]*\d+\s*:\s*)?\S+",
+        r"^\s*[A-Z][A-Z0-9_-]*\d{2,}\b(?:\s+\[[^\]\r\n]+\])?\s+\S",
+        r"^\s*-->\s+(?:[A-Z]:)?[^\s:\r\n][^:\r\n]*\.[A-Z0-9_+-]+:\d+:\d+\s*$",
     )
 )
 
