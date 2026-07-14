@@ -13,6 +13,7 @@ from typing import Any, Protocol, TypeAlias
 from ._version import __version__
 from .artifacts import ArtifactError, ArtifactStore, _capture_artifact_write_receipts
 from .engine import (
+    DIAGNOSTIC_LOCATION_PATTERNS,
     JsonValue,
     NoisegateOptions,
     _append_recovery_notices,
@@ -39,6 +40,24 @@ HookCallback: TypeAlias = Callable[..., str | None]
 
 TERMINAL_TOOL_NAMES = frozenset({"terminal", "process", "read_terminal"})
 WRAPPER_TOOL_NAMES = frozenset({"tool_call"})
+FIELD_AWARE_WRITE_TOOL_NAMES = frozenset(
+    {"write_file", "patch", "apply_patch", "edit_file", "replace_in_file"}
+)
+WRITE_DIAGNOSTIC_FIELDS = (
+    "lsp_diagnostics",
+    "diagnostics",
+    "lint",
+    "lint_output",
+    "lint_errors",
+    "typecheck",
+    "typecheck_output",
+    "pyright",
+    "mypy",
+    "tsc",
+    "eslint",
+    "errors",
+    "warnings",
+)
 MAX_WRAPPER_JSON_CHARS = 65_536
 MAX_NESTED_JSON_DEPTH = 8
 MAX_NESTED_JSON_NODES = 512
@@ -248,7 +267,11 @@ def _transform_tool_result_with_budget(
             if resolved_wrapper is None:
                 return None
             effective_tool_name = resolved_wrapper.tool_name
-        if effective_tool_name and not _is_compactable_tool_name(effective_tool_name):
+        if (
+            effective_tool_name
+            and effective_tool_name not in FIELD_AWARE_WRITE_TOOL_NAMES
+            and not _is_compactable_tool_name(effective_tool_name)
+        ):
             return None
         options = NoisegateOptions.from_env().with_mapping(kwargs)
         if disable_artifacts:
@@ -301,7 +324,10 @@ def _transform_tool_result_with_budget(
                 return None
             if embedded_tool_names:
                 embedded_tool_name = next(iter(embedded_tool_names))
-                if not _is_compactable_tool_name(embedded_tool_name):
+                if (
+                    embedded_tool_name not in FIELD_AWARE_WRITE_TOOL_NAMES
+                    and not _is_compactable_tool_name(embedded_tool_name)
+                ):
                     return None
                 if tool_name and embedded_tool_name != tool_name:
                     return None
@@ -312,6 +338,19 @@ def _transform_tool_result_with_budget(
             if not _looks_terminal_payload(parsed, call_args):
                 return None
             tool_name = "terminal"
+
+        if tool_name in FIELD_AWARE_WRITE_TOOL_NAMES:
+            if not isinstance(parsed, dict):
+                return None
+            return _transform_write_diagnostic_fields(
+                result,
+                parsed,
+                tool_name=tool_name,
+                call_args=call_args,
+                args_map=args_map,
+                arguments_map=arguments_map,
+                options=options,
+            )
 
         if isinstance(parsed, str):
             command = _select_command(
@@ -1002,6 +1041,88 @@ def _candidate_fields(tool_name: str, payload: Mapping[str, JsonValue]) -> tuple
     else:
         candidates = GENERIC_TEXT_FIELDS
     return tuple(field for field in candidates if field in payload)
+
+
+def _transform_write_diagnostic_fields(
+    result: str,
+    parsed: Mapping[str, JsonValue],
+    *,
+    tool_name: str,
+    call_args: Mapping[str, Any],
+    args_map: Mapping[str, Any],
+    arguments_map: Mapping[str, Any],
+    options: NoisegateOptions,
+) -> str | None:
+    """Compact only allowlisted diagnostic strings from write-like results."""
+
+    fields = tuple(field for field in WRITE_DIAGNOSTIC_FIELDS if field in parsed)
+    if not fields:
+        return None
+
+    diagnostic_values: dict[str, str] = {}
+    for field in fields:
+        value = parsed.get(field)
+        if not isinstance(value, str) or _nested_json_text_requires_exact(value):
+            return None
+        diagnostic_values[field] = value
+
+    # Every non-allowlisted field is exact evidence. This protects content,
+    # source, diff, patch, result, output, text, and future source-bearing keys
+    # without guessing their shape. Diagnostics also stay inline-only because
+    # they may include private paths and source excerpts.
+    reduce_options = replace(options, artifact_enabled=False)
+    command_text = "\n".join(diagnostic_values.values())
+    command = _select_command(
+        command_text,
+        call_args,
+        args_map,
+        arguments_map,
+        parsed,
+        exit_code=None,
+    )
+    payload: dict[str, JsonValue] = dict(parsed)
+    field_metadata: dict[str, JsonValue] = {}
+
+    for field in fields:
+        value = diagnostic_values[field]
+        reduced = _reduce_text_in_operation(
+            value,
+            command=command,
+            # The tool remains protected at the engine boundary. This scoped
+            # plugin path has already selected one diagnostic string field.
+            tool_name=None,
+            source=f"json_field:{field}",
+            exit_code=None,
+            options=reduce_options,
+            extra_preserve_patterns=DIAGNOSTIC_LOCATION_PATTERNS,
+        )
+        if not reduced.changed:
+            continue
+        metadata = dict(reduced.metadata)
+        metadata["tool_name"] = tool_name
+        if not _valid_transformed_text(
+            original=value,
+            transformed=reduced.text,
+            metadata=metadata,
+            options=reduce_options,
+        ):
+            return None
+        payload[field] = reduced.text
+        field_metadata[field] = metadata
+
+    if not field_metadata:
+        return None
+
+    metadata_key = _metadata_key(payload)
+    payload[metadata_key] = {
+        "version": __version__,
+        "compacted": True,
+        "mode": options.mode,
+        "original_result_chars": len(result),
+        "fields": field_metadata,
+    }
+    candidate = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return candidate if len(candidate) < len(result) else None
 
 
 def _nested_json_text_requires_exact(value: str) -> bool:

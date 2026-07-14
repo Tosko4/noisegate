@@ -11,6 +11,7 @@ All notable changes to Noisegate are documented here. Release notes are generate
 ### Changed
 
 - Generic `tool_call` wrappers now use the wrapped tool name when it is unambiguous, allowing wrapped terminal noise to compact while wrapped MCP/source tools and ambiguous ownership stay exact.
+- Hermes write/patch-like JSON results may now compact only known diagnostic string fields while preserving source, content, diffs, patches, metadata, and unknown parsed values exactly; this scoped path never stores raw artifacts.
 - Secret/header-looking raw output is refused for artifact storage even when artifact mode is enabled.
 
 ### Fixed

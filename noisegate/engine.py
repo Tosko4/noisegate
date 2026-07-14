@@ -568,6 +568,7 @@ def _reduce_text_in_operation(
     exit_code: int | None = None,
     options: NoisegateOptions | None = None,
     defer_artifact_store: bool = False,
+    extra_preserve_patterns: tuple[re.Pattern[str], ...] = (),
 ) -> ReducedOutput:
     return _run_text_reduction_operation(
         text,
@@ -578,6 +579,7 @@ def _reduce_text_in_operation(
         options=options,
         defer_artifact_store=defer_artifact_store,
         share_alignment_budget=True,
+        extra_preserve_patterns=extra_preserve_patterns,
     )
 
 
@@ -591,6 +593,7 @@ def _run_text_reduction_operation(
     options: NoisegateOptions | None,
     defer_artifact_store: bool,
     share_alignment_budget: bool,
+    extra_preserve_patterns: tuple[re.Pattern[str], ...] = (),
 ) -> ReducedOutput:
     if share_alignment_budget:
         _raise_if_source_alignment_work_exhausted()
@@ -602,6 +605,7 @@ def _run_text_reduction_operation(
             exit_code=exit_code,
             options=options,
             defer_artifact_store=defer_artifact_store,
+            extra_preserve_patterns=extra_preserve_patterns,
         )
         _raise_if_source_alignment_work_exhausted()
         return reduced
@@ -616,6 +620,7 @@ def _run_text_reduction_operation(
                 exit_code=exit_code,
                 options=options,
                 defer_artifact_store=defer_artifact_store,
+                extra_preserve_patterns=extra_preserve_patterns,
             )
             _raise_if_source_alignment_work_exhausted()
             return reduced
@@ -632,6 +637,7 @@ def _reduce_text(
     exit_code: int | None = None,
     options: NoisegateOptions | None = None,
     defer_artifact_store: bool = False,
+    extra_preserve_patterns: tuple[re.Pattern[str], ...] = (),
 ) -> ReducedOutput:
     options = options or NoisegateOptions.from_env()
     command_class = _reduction_command_class(
@@ -685,8 +691,20 @@ def _reduce_text(
         return _unchanged(text, "below_threshold", command_class, reason="below_threshold")
 
     preserve_patterns = _preserve_patterns_for_output(command_class, text)
+    if extra_preserve_patterns:
+        preserve_patterns = _combine_matching_patterns(
+            text,
+            preserve_patterns,
+            extra_preserve_patterns,
+        )
     exit_notices = _recovery_notices({"exit_code": exit_code})
-    reducer_name, compacted = _apply_reducer(text, command_class, options, exit_code)
+    reducer_name, compacted = _apply_reducer(
+        text,
+        command_class,
+        options,
+        exit_code,
+        extra_preserve_patterns=extra_preserve_patterns,
+    )
     if compacted is not None and _omission_notices(text):
         compacted = _remark_excerpt_with_line_coverage(text, compacted)
         compacted = _ensure_ranked_diagnostic_after_line_coverage_remap(
@@ -1138,14 +1156,36 @@ def _preserve_patterns_for_output(
     return tuple(combined)
 
 
+def _combine_matching_patterns(
+    text: str,
+    base_patterns: tuple[re.Pattern[str], ...] | None,
+    extra_patterns: tuple[re.Pattern[str], ...],
+) -> tuple[re.Pattern[str], ...] | None:
+    combined = list(base_patterns or ())
+    seen_pattern_ids = {id(pattern) for pattern in combined}
+    source_lines = text.splitlines()
+    for pattern in extra_patterns:
+        if id(pattern) in seen_pattern_ids or not any(
+            pattern.search(line) for line in source_lines
+        ):
+            continue
+        seen_pattern_ids.add(id(pattern))
+        combined.append(pattern)
+    return tuple(combined) or None
+
+
 def _apply_reducer(
     text: str,
     command_class: str,
     options: NoisegateOptions,
     exit_code: int | None,
+    *,
+    extra_preserve_patterns: tuple[re.Pattern[str], ...] = (),
 ) -> tuple[str, str | None]:
     lcm_patterns = _lcm_externalized_patterns_for(text)
     reducer_patterns = REDUCER_ANCHOR_PATTERNS_BY_COMMAND_CLASS.get(command_class, ())
+    field_patterns = _combine_matching_patterns(text, None, extra_preserve_patterns) or ()
+    reduction_patterns = reducer_patterns + field_patterns + lcm_patterns
     if options.mode == "head_tail":
         if lcm_patterns:
             return "generic_head_tail", _important_lines(
@@ -1159,14 +1199,14 @@ def _apply_reducer(
         return command_class, _important_lines(
             text,
             options,
-            reducer_patterns + lcm_patterns,
+            reduction_patterns,
             exit_code=exit_code,
         )
     if command_class in {"apt", "python_package"}:
         return command_class, _important_lines(
             text,
             options,
-            reducer_patterns + lcm_patterns,
+            reduction_patterns,
             priority_patterns=PACKAGE_HIGH_SIGNAL_PRIORITY_PATTERNS,
             exit_code=exit_code,
         )
@@ -1174,7 +1214,7 @@ def _apply_reducer(
         return "node", _important_lines(
             text,
             options,
-            reducer_patterns + lcm_patterns,
+            reduction_patterns,
             priority_patterns=NODE_HIGH_SIGNAL_PRIORITY_PATTERNS,
             exit_code=exit_code,
         )
@@ -1182,7 +1222,7 @@ def _apply_reducer(
         return "docker_build", _important_lines(
             text,
             options,
-            reducer_patterns + lcm_patterns,
+            reduction_patterns,
             priority_patterns=DOCKER_BUILD_HIGH_SIGNAL_PRIORITY_PATTERNS,
             exit_code=exit_code,
         )
@@ -1190,25 +1230,32 @@ def _apply_reducer(
         return "docker_logs", _important_lines(
             text,
             options,
-            reducer_patterns + lcm_patterns,
+            reduction_patterns,
             exit_code=exit_code,
         )
     if command_class == "log_stream":
         return "log_stream", _important_lines(
             text,
             options,
-            reducer_patterns + lcm_patterns,
+            reduction_patterns,
             exit_code=exit_code,
         )
     if command_class == "git_status":
         return "git_status", _important_lines(
             text,
             options,
-            reducer_patterns + lcm_patterns,
+            reduction_patterns,
             exit_code=exit_code,
         )
     if command_class == "git_log":
         return "git_log", _head_tail(text, replace(options, head_lines=40, tail_lines=8))
+    if command_class == "generic" and field_patterns:
+        return "generic_diagnostic", _important_lines(
+            text,
+            options,
+            field_patterns + CRITICAL_PATTERNS + lcm_patterns,
+            exit_code=exit_code,
+        )
     if (
         command_class == "generic"
         and exit_code != 0
@@ -1241,6 +1288,19 @@ TEST_PATTERNS = tuple(
         r"^\s*E\s+",
         r"^\s*(?:=+\s*)?(?:\d+\s+(?:failed|passed|errors?)(?:,\s*)?)+\b",
         r"tests?/.*::",
+    )
+)
+
+DIAGNOSTIC_LOCATION_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"(?:^|\s)(?:[A-Z]:)?[^\s:\r\n][^:\r\n]*\.[A-Z0-9_+-]+:\d+:\d+:"
+        r"\s*(?:\[[^\]\r\n]+\]\s*)?(?:error|warning|info|hint|[A-Z][A-Z0-9_-]*\d{2,})\b",
+        r"(?:^|\s)(?:[A-Z]:)?[^\s:\r\n][^\r\n]*\.[A-Z0-9_+-]+\(\d+,\d+\):"
+        r"\s*(?:error|warning|info|hint)(?:\s+[A-Z][A-Z0-9_-]*\d+)?\b",
+        r"^\s*\d+:\d+\s+(?:error|warning)\s+\S+",
+        r"(?:^|\s)(?:[A-Z]:)?[^\s:\r\n][^:\r\n]*\.[A-Z0-9_+-]+:\d+:\d+"
+        r"\s+\[(?:error|warning|info|hint)\]\s+(?:[A-Z][A-Z0-9_-]*\d+\s*:\s*)?\S+",
     )
 )
 

@@ -14,6 +14,9 @@ Noisegate exists to improve agent context value, not to make output shorter at a
 
 - [ ] File reads and source-like terminal commands stay byte-for-byte unchanged.
 - [ ] Diffs, patches, code-search output, retrieved context, skills, memory, Hindsight, LCM, MCP, web extraction, and unknown future tools remain protected by default.
+- [ ] Write/patch-like JSON results may compact only explicitly allowlisted diagnostic string fields; source-bearing and unknown fields, including `content`, `source`, `diff`, and `patch`, remain exact as parsed values.
+- [ ] Field-value exactness is not described as byte-for-byte outer-envelope preservation: once a diagnostic compacts, JSON serialization may normalize and collision-safe Noisegate metadata is added.
+- [ ] Direct string write/patch results, short/no-gain diagnostics, unsupported or nested-JSON diagnostic values, invalid or duplicate-key JSON, and ambiguous tool identities fail open unchanged.
 - [ ] Terminal LCM/Hindsight/memory/session retrieval commands stay exact, while maintenance, indexing, and retry progress remains eligible for compaction.
 - [ ] If a command mixes source inspection with words like `ERROR` or `failed`, Noisegate does not reinterpret that source as a build/test failure.
 
@@ -35,11 +38,13 @@ Noisegate exists to improve agent context value, not to make output shorter at a
 - [ ] Artifact mode remains explicit, private filesystem only, size-capped, path-contained, symlink-safe, and permissioned `0700`/`0600`.
 - [ ] Artifact planning scans the complete payload and refuses obvious secret labels, including spaced forms such as `API Key:`.
 - [ ] `transform_terminal_output` never stores pre-redaction raw output.
+- [ ] Field-level write/patch diagnostic compaction never stores raw artifacts, even when artifact mode is globally enabled.
 - [ ] Docs describe artifact privacy honestly and do not imply Noisegate is a log archive.
 
 ### 6. Hermes integration stays thin and safe
 
-- [ ] Hermes hook compaction remains limited to noisy terminal-like surfaces: `terminal`, `process`, `read_terminal`, and `browser_console`.
+- [ ] Full-result Hermes hook compaction remains limited to noisy terminal-like surfaces: `terminal`, `process`, `read_terminal`, and `browser_console`.
+- [ ] The only protected-tool exception is field-level compaction of known diagnostic strings on `write_file`, `patch`, `apply_patch`, `edit_file`, and `replace_in_file`; wrappers receive it only after unambiguous identity resolution.
 - [ ] Useful-context tools are protected by name/prefix, and unknown future tools fail closed.
 - [ ] Noisegate stays independent from Hermes-LCM and Hindsight.
 
