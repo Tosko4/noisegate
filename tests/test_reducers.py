@@ -6,16 +6,85 @@ import pytest
 
 import noisegate.engine as engine
 from noisegate.engine import NoisegateOptions, _first_pattern_match, reduce_text
+from noisegate.plugin import transform_terminal_output
 
 
 def numbered(prefix: str, count: int) -> str:
     return "\n".join(f"{prefix} {index:03d}" for index in range(1, count + 1))
 
 
+def source_like_python() -> str:
+    lines = [
+        "# Source file that deliberately looks like noisy output.",
+        "def render_status() -> dict[str, str]:",
+        "    return {",
+        "        'FAILED': 'literal test fixture, not a pytest result',",
+        "        'ERROR': 'literal config value, not a runtime failure',",
+        "        'Traceback': 'literal docs example',",
+        "        'npm ERR!': 'literal npm transcript fixture',",
+        "        'Dockerfile': 'literal filename fixture',",
+        "    }",
+    ]
+    lines.extend(
+        f"# exact source filler {index:03d}: FAILED ERROR Traceback npm ERR!"
+        for index in range(80)
+    )
+    return "\n".join(lines)
+
+
 def options(**overrides: object) -> NoisegateOptions:
     values: dict[str, object] = {"max_chars": 160, "head_lines": 3, "tail_lines": 2}
     values.update(overrides)
     return NoisegateOptions(**values)  # type: ignore[arg-type]
+
+
+def capture_alignment_budgets(
+    monkeypatch: pytest.MonkeyPatch,
+    *limits: int,
+) -> list[engine._SourceAlignmentWorkBudget]:
+    budgets: list[engine._SourceAlignmentWorkBudget] = []
+    configured_limits = iter(limits)
+
+    def new_budget() -> engine._SourceAlignmentWorkBudget:
+        budget = engine._SourceAlignmentWorkBudget(
+            next(configured_limits, engine._SOURCE_ALIGNMENT_WORK_LIMIT)
+        )
+        budgets.append(budget)
+        return budget
+
+    monkeypatch.setattr(engine, "_new_source_alignment_work_budget", new_budget)
+    return budgets
+
+
+def assert_fail_open_or_truthful_failure_excerpt(
+    raw: str,
+    transformed: str | None,
+) -> None:
+    if transformed is None or transformed == raw:
+        return
+
+    output_lines = transformed.splitlines()
+    assert output_lines[-1] == "[noisegate: exit_code=1]"
+    excerpt_lines = output_lines[:-1]
+    source_lines = raw.splitlines()
+    source_index = 0
+    saw_omission = False
+    for line in excerpt_lines:
+        omission = re.fullmatch(r"\[noisegate: omitted (\d+) lines\]", line)
+        if omission is not None:
+            omitted_count = int(omission.group(1))
+            assert omitted_count > 0
+            source_index += omitted_count
+            assert source_index <= len(source_lines)
+            saw_omission = True
+            continue
+        assert source_index < len(source_lines)
+        assert line == source_lines[source_index]
+        source_index += 1
+
+    assert source_index == len(source_lines)
+    if excerpt_lines != source_lines:
+        assert saw_omission
 
 
 def test_short_output_is_not_changed() -> None:
@@ -40,6 +109,832 @@ def test_generic_long_output_uses_deterministic_head_tail() -> None:
     assert result.metadata["omitted_chars"] > 0
 
 
+def test_generic_head_tail_remaps_colliding_upstream_line_omission_by_coverage() -> None:
+    raw = "\n".join(
+        [
+            "head",
+            "line-1",
+            "line-2",
+            "line-3",
+            "[noisegate: omitted 8 lines]",
+            "line-5",
+            "line-6",
+            "line-7",
+            "line-8",
+            "tail",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="make noisy",
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=1,
+            tail_lines=1,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.text == "head\n[noisegate: omitted 15 lines]\ntail"
+    assert engine._represented_line_coverage(result.text) == 17
+
+
+@pytest.mark.parametrize(
+    "trailing_newline",
+    ["", "\n"],
+    ids=("no_trailing_newline", "trailing_newline"),
+)
+def test_generic_tail_only_remap_preserves_duplicate_line_source_position(
+    trailing_newline: str,
+) -> None:
+    raw = "\n".join(
+        [
+            "same",
+            "[noisegate: omitted 100 lines]",
+            "middle",
+            "same",
+        ]
+    ) + trailing_newline
+
+    result = reduce_text(
+        raw,
+        command="make noisy",
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=1,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.text == "[noisegate: omitted 102 lines]\nsame"
+    assert engine._represented_line_coverage(result.text) == 103
+
+
+def test_generic_head_only_remap_preserves_duplicate_line_source_position() -> None:
+    raw = "\n".join(
+        [
+            "same",
+            "[noisegate: omitted 100 lines]",
+            "middle",
+            "same",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="make noisy",
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=1,
+            tail_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.text == "same\n[noisegate: omitted 102 lines]"
+    assert engine._represented_line_coverage(result.text) == 103
+
+
+def test_remap_selects_interior_duplicate_between_generated_boundary_markers() -> None:
+    source_lines = [
+        "same",
+        "before",
+        "[noisegate: omitted 5 lines]",
+        "same",
+        "after",
+        "same",
+    ]
+    excerpt = engine._marked_excerpt_for_line_indices(source_lines, [3])
+
+    assert excerpt == "[noisegate: omitted 3 lines]\nsame\n[noisegate: omitted 2 lines]"
+    assert engine._remark_excerpt_with_line_coverage(
+        "\n".join(source_lines),
+        excerpt,
+    ) == "[noisegate: omitted 7 lines]\nsame\n[noisegate: omitted 2 lines]"
+
+
+@pytest.mark.parametrize(
+    ("source_lines", "kept_indices", "expected"),
+    [
+        (
+            [
+                "duplicate anchor",
+                "noise-a",
+                "[noisegate: omitted 10 lines]",
+                "duplicate anchor",
+                "noise-b",
+                "duplicate anchor",
+            ],
+            [0, 5],
+            "duplicate anchor\n[noisegate: omitted 13 lines]\nduplicate anchor",
+        ),
+        (
+            [
+                "duplicate anchor",
+                "noise-a",
+                "duplicate anchor",
+                "[noisegate: omitted 5 lines]",
+                "noise-b",
+                "duplicate anchor",
+                "noise-c",
+                "duplicate anchor",
+                "noise-d",
+            ],
+            [0, 5, 7],
+            "\n".join(
+                [
+                    "duplicate anchor",
+                    "[noisegate: omitted 8 lines]",
+                    "duplicate anchor",
+                    "[noisegate: omitted 1 lines]",
+                    "duplicate anchor",
+                    "[noisegate: omitted 1 lines]",
+                ]
+            ),
+        ),
+    ],
+    ids=("two_anchors", "three_anchors"),
+)
+def test_stitched_duplicate_anchors_remap_monotonically_by_occurrence(
+    source_lines: list[str],
+    kept_indices: list[int],
+    expected: str,
+) -> None:
+    excerpt = engine._marked_excerpt_for_line_indices(source_lines, kept_indices)
+
+    assert excerpt is not None
+    assert engine._remark_excerpt_with_line_coverage(
+        "\n".join(source_lines),
+        excerpt,
+    ) == expected
+    assert engine._represented_line_coverage(expected) == engine._represented_line_coverage(
+        "\n".join(source_lines)
+    )
+
+
+def test_ambiguous_generated_or_upstream_marker_mapping_fails_open() -> None:
+    raw = "\n".join(
+        [
+            "[noisegate: omitted 3 lines]",
+            "same",
+            "middle",
+            "same",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="make noisy",
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=1,
+        ),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reason"] == "reducer_no_output"
+
+
+def test_repeated_omission_only_alignment_has_linear_work_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "[noisegate: omitted 1 lines]"
+    source_size = 1_000
+    source_lines = [marker] * source_size
+    excerpt = "\n".join(
+        [
+            *([marker] * 24),
+            "[noisegate: omitted 960 lines]",
+            *([marker] * 16),
+        ]
+    )
+    work_limit = source_size * 2
+
+    assert engine._source_line_indices_for_excerpt(
+        source_lines,
+        excerpt,
+        _work_limit=work_limit,
+    ) == []
+
+    monkeypatch.setattr(engine, "_SOURCE_ALIGNMENT_WORK_LIMIT", work_limit)
+    result = reduce_text(
+        "\n".join(source_lines),
+        command="make noisy",
+        options=NoisegateOptions(
+            max_chars=4_000,
+            max_lines=160,
+            head_lines=24,
+            tail_lines=16,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.text == "[noisegate: omitted 1000 lines]"
+
+
+def test_duplicate_alignment_work_exhaustion_returns_ambiguous() -> None:
+    marker = "[noisegate: omitted 1 lines]"
+    source_lines = [part for _ in range(20) for part in ("same", marker)] + ["tail"]
+    excerpt = "\n".join(source_lines)
+
+    assert engine._source_line_indices_for_excerpt(
+        source_lines,
+        excerpt,
+        _work_limit=8,
+    ) is None
+    assert engine._source_line_indices_for_excerpt(
+        source_lines,
+        excerpt,
+        _work_limit=10_000,
+    ) == [*range(0, 40, 2), 40]
+
+
+@pytest.mark.parametrize(
+    "entrypoint_name",
+    ["reduce_text", "_preview_reduce_text"],
+)
+def test_public_reduction_shares_one_alignment_budget_across_ranked_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint_name: str,
+) -> None:
+    budgets = capture_alignment_budgets(monkeypatch)
+    marker = "[noisegate: omitted 1 lines]"
+    ref = "externalized_ref=dup"
+    raw = "\n".join(
+        [
+            marker,
+            *([ref] * 20),
+            *[f"ValueError: diagnostic-{index}" for index in range(4_000)],
+        ]
+    )
+
+    result = getattr(engine, entrypoint_name)(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=NoisegateOptions(
+            max_chars=500_000,
+            max_lines=22,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert len(raw.splitlines()) == 4_021
+    assert len(budgets) == 1
+    assert 1 < budgets[0].alignment_calls < 200
+    assert budgets[0].exhausted is True
+    assert budgets[0].spent <= budgets[0].limit
+    assert engine._SOURCE_ALIGNMENT_WORK_BUDGET.get() is None
+
+
+def test_direct_ranked_loop_cannot_mint_alignment_budget_per_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budgets = capture_alignment_budgets(monkeypatch, 1_000)
+    marker = "[noisegate: omitted 1 lines]"
+    ref = "externalized_ref=dup"
+    raw = "\n".join(
+        [
+            marker,
+            *([ref] * 20),
+            *[f"ValueError: diagnostic-{index}" for index in range(100)],
+        ]
+    )
+
+    best = engine._best_ranked_diagnostic_excerpt(
+        before=raw,
+        options=NoisegateOptions(
+            max_chars=500_000,
+            max_lines=22,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+        preserve_patterns=engine._preserve_patterns_for_output("pytest", raw),
+    )
+
+    assert best is None
+    assert len(budgets) == 1
+    assert budgets[0].exhausted is True
+    assert engine._SOURCE_ALIGNMENT_WORK_BUDGET.get() is None
+
+
+def test_non_exhausted_public_alignment_budget_still_compacts_correctly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budgets = capture_alignment_budgets(monkeypatch)
+    raw = "\n".join(
+        [
+            "externalized_ref=foo",
+            "[noisegate: omitted 8 lines]",
+            "ValueError: actionable boom",
+            *[f"middle-{index}-" + ("x" * 80) for index in range(5)],
+            "ERROR: generic transient noise",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=NoisegateOptions(
+            max_chars=140,
+            max_lines=50,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=0,
+            max_important_lines=1,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.text == "\n".join(
+        [
+            "externalized_ref=foo",
+            "[noisegate: omitted 8 lines]",
+            "ValueError: actionable boom",
+            "[noisegate: omitted 6 lines]",
+            "[noisegate: exit_code=1]",
+        ]
+    )
+    assert len(budgets) == 1
+    assert budgets[0].alignment_calls > 1
+    assert 0 < budgets[0].spent < budgets[0].limit
+    assert budgets[0].exhausted is False
+    assert engine._SOURCE_ALIGNMENT_WORK_BUDGET.get() is None
+
+
+def test_exhausted_public_alignment_budget_does_not_leak_to_next_reduction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budgets = capture_alignment_budgets(
+        monkeypatch,
+        1,
+        engine._SOURCE_ALIGNMENT_WORK_LIMIT,
+    )
+    raw = "\n".join(
+        [
+            "head",
+            "[noisegate: omitted 8 lines]",
+            "middle",
+            "tail",
+        ]
+    )
+    reduction_options = NoisegateOptions(
+        max_chars=10_000,
+        max_lines=3,
+        head_lines=1,
+        tail_lines=1,
+    )
+
+    exhausted = reduce_text(raw, command="make noisy", options=reduction_options)
+    independent = reduce_text(raw, command="make noisy", options=reduction_options)
+
+    assert exhausted.changed is False
+    assert exhausted.text == raw
+    assert independent.changed is True
+    assert independent.text == "head\n[noisegate: omitted 9 lines]\ntail"
+    assert len(budgets) == 2
+    assert budgets[0].exhausted is True
+    assert budgets[1].exhausted is False
+    assert budgets[0] is not budgets[1]
+    assert engine._SOURCE_ALIGNMENT_WORK_BUDGET.get() is None
+
+
+def test_top_level_reduction_isolates_inherited_alignment_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inherited = engine._SourceAlignmentWorkBudget(0)
+    created = capture_alignment_budgets(monkeypatch)
+    token = engine._SOURCE_ALIGNMENT_WORK_BUDGET.set(inherited)
+    raw = "\n".join(
+        [
+            "head",
+            "[noisegate: omitted 8 lines]",
+            "middle",
+            "tail",
+        ]
+    )
+    try:
+        result = reduce_text(
+            raw,
+            command="make noisy",
+            options=NoisegateOptions(
+                max_chars=10_000,
+                max_lines=3,
+                head_lines=1,
+                tail_lines=1,
+            ),
+        )
+        assert engine._SOURCE_ALIGNMENT_WORK_BUDGET.get() is inherited
+    finally:
+        engine._SOURCE_ALIGNMENT_WORK_BUDGET.reset(token)
+
+    assert result.changed is True
+    assert len(created) == 1
+    assert inherited.spent == 0
+    assert inherited.exhausted is False
+    assert engine._SOURCE_ALIGNMENT_WORK_BUDGET.get() is None
+
+
+def test_cached_alignment_does_not_spend_shared_budget_twice() -> None:
+    budget = engine._SourceAlignmentWorkBudget(10_000)
+    token = engine._SOURCE_ALIGNMENT_WORK_BUDGET.set(budget)
+    source_lines = [
+        "head",
+        "[noisegate: omitted 8 lines]",
+        "middle",
+        "tail",
+    ]
+    excerpt = "head\n[noisegate: omitted 2 lines]\ntail"
+    try:
+        first = engine._source_line_indices_for_excerpt(source_lines, excerpt)
+        spent_after_first = budget.spent
+        second = engine._source_line_indices_for_excerpt(source_lines, excerpt)
+    finally:
+        engine._SOURCE_ALIGNMENT_WORK_BUDGET.reset(token)
+
+    assert first == second == [0, 3]
+    assert spent_after_first > 0
+    assert budget.spent == spent_after_first
+    assert budget.alignment_calls == 2
+    assert engine._SOURCE_ALIGNMENT_WORK_BUDGET.get() is None
+
+
+def test_generic_head_tail_aggregates_duplicate_upstream_line_omissions() -> None:
+    raw = "\n".join(
+        [
+            "head",
+            "[noisegate: omitted 4 lines]",
+            "line-2",
+            "line-3",
+            "line-4",
+            "line-5",
+            "[noisegate: omitted 4 lines]",
+            "tail",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="make noisy",
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=1,
+            tail_lines=1,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.text == "head\n[noisegate: omitted 12 lines]\ntail"
+    assert engine._represented_line_coverage(result.text) == 14
+
+
+def test_line_coverage_remap_keeps_fittable_ranked_failure() -> None:
+    raw = "\n".join(
+        [
+            "FAILED tests/t.py::test_x - AssertionError: nope",
+            *["[noisegate: omitted 8 lines]"] * 3,
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        options=NoisegateOptions(
+            max_chars=80,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.text == "\n".join(
+        [
+            "FAILED tests/t.py::test_x - AssertionError: nope",
+            "[noisegate: omitted 24 lines]",
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "command_class"),
+    [
+        ("pytest -q", "pytest"),
+        ("npm test", "node"),
+        ("docker build .", "docker_build"),
+        ("make noisy", "generic"),
+    ],
+)
+def test_line_coverage_remap_keeps_best_ranked_fittable_diagnostic(
+    command: str,
+    command_class: str,
+) -> None:
+    raw = "\n".join(
+        [
+            "[noisegate: omitted 8 lines]",
+            "ValueError: actionable boom",
+            *[f"middle-{index}-" + ("x" * 80) for index in range(5)],
+            "ERROR: generic transient noise",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command=command,
+        exit_code=1,
+        options=NoisegateOptions(
+            max_chars=120,
+            max_lines=4,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=0,
+            max_important_lines=1,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.metadata["command_class"] == command_class
+    assert result.text == "\n".join(
+        [
+            "[noisegate: omitted 8 lines]",
+            "ValueError: actionable boom",
+            "[noisegate: omitted 6 lines]",
+            "[noisegate: exit_code=1]",
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_chars", "max_lines"),
+    [(140, 50), (10_000, 5)],
+    ids=("char_budget", "line_budget"),
+)
+def test_line_coverage_remap_keeps_lcm_ref_with_best_ranked_diagnostic(
+    max_chars: int,
+    max_lines: int,
+) -> None:
+    raw = "\n".join(
+        [
+            "externalized_ref=foo",
+            "[noisegate: omitted 8 lines]",
+            "ValueError: actionable boom",
+            *[f"middle-{index}-" + ("x" * 80) for index in range(5)],
+            "ERROR: generic transient noise",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=NoisegateOptions(
+            max_chars=max_chars,
+            max_lines=max_lines,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=0,
+            max_important_lines=1,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.text == "\n".join(
+        [
+            "externalized_ref=foo",
+            "[noisegate: omitted 8 lines]",
+            "ValueError: actionable boom",
+            "[noisegate: omitted 6 lines]",
+            "[noisegate: exit_code=1]",
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_chars", "max_lines"),
+    [(140, 50), (10_000, 5)],
+    ids=("char_budget_second_pass", "line_budget_second_pass"),
+)
+def test_duplicate_lcm_refs_and_diagnostics_preserve_multiplicity_and_position(
+    max_chars: int,
+    max_lines: int,
+) -> None:
+    raw = "\n".join(
+        [
+            "externalized_ref=dup",
+            "ValueError: repeated",
+            "[noisegate: omitted 5 lines]",
+            *[f"middle-{index}-" + ("x" * 80) for index in range(5)],
+            "ValueError: repeated",
+            "externalized_ref=dup",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=NoisegateOptions(
+            max_chars=max_chars,
+            max_lines=max_lines,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+            max_important_lines=3,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.text == "\n".join(
+        [
+            "externalized_ref=dup",
+            "ValueError: repeated",
+            "[noisegate: omitted 11 lines]",
+            "externalized_ref=dup",
+            "[noisegate: exit_code=1]",
+        ]
+    )
+    assert result.text.splitlines().count("externalized_ref=dup") == 2
+    body = "\n".join(result.text.splitlines()[:-1])
+    assert engine._represented_line_coverage(body) == engine._represented_line_coverage(raw)
+
+
+def test_duplicate_diagnostic_text_preserves_best_source_occurrence() -> None:
+    source_lines = [
+        "externalized_ref=dup",
+        "ValueError: repeated",
+        "[noisegate: omitted 5 lines]",
+        "noise",
+        "ValueError: repeated",
+        "externalized_ref=dup",
+    ]
+    raw = "\n".join(source_lines)
+    later_marked = engine._marked_excerpt_for_line_indices(source_lines, [0, 4, 5])
+    assert later_marked is not None
+    later_excerpt = engine._remark_excerpt_with_line_coverage(raw, later_marked)
+    assert later_excerpt is not None
+    preserve_patterns = engine._preserve_patterns_for_output("pytest", raw)
+    remap_options = NoisegateOptions(
+        max_chars=200,
+        max_lines=6,
+        head_lines=0,
+        tail_lines=0,
+        important_context_lines=0,
+    )
+
+    ensured = engine._ensure_ranked_diagnostic_after_line_coverage_remap(
+        before=raw,
+        shortened=later_excerpt,
+        options=remap_options,
+        preserve_patterns=preserve_patterns,
+    )
+
+    assert ensured == "\n".join(
+        [
+            "externalized_ref=dup",
+            "ValueError: repeated",
+            "[noisegate: omitted 7 lines]",
+            "externalized_ref=dup",
+        ]
+    )
+    assert engine._source_line_indices_for_excerpt(source_lines, ensured) == [0, 1, 5]
+    exit_notice = "[noisegate: exit_code=1]"
+    assert engine._line_coverage_remap_dropped_ranked_diagnostic(
+        before=raw,
+        after=f"{later_excerpt}\n{exit_notice}",
+        options=NoisegateOptions(
+            max_chars=240,
+            max_lines=7,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+        preserve_patterns=preserve_patterns,
+        required_notices=[exit_notice],
+    ) is True
+
+
+def test_line_coverage_remap_keeps_reducer_specific_anchor_with_lcm_ref() -> None:
+    raw = "\n".join(
+        [
+            "externalized_ref=foo",
+            " M important.py",
+            "[noisegate: omitted 1 lines]",
+            "xxxx",
+            "[noisegate: omitted 2 lines]",
+            "yyyy",
+            "[noisegate: omitted 20 lines]",
+            "zzzz",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="git status --short",
+        exit_code=1,
+        options=NoisegateOptions(
+            max_chars=91,
+            max_lines=4,
+            max_important_lines=2,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.text == "\n".join(
+        [
+            "externalized_ref=foo",
+            " M important.py",
+            "[noisegate: omitted 26 lines]",
+            "[noisegate: exit_code=1]",
+        ]
+    )
+    assert len(result.text) == 91
+    body = "\n".join(result.text.splitlines()[:-1])
+    assert engine._represented_line_coverage(body) == engine._represented_line_coverage(raw)
+
+
+def test_generated_char_marker_cannot_impersonate_upstream_marker() -> None:
+    raw = "HEAD-a\n[noisegate: omitted 32 chars]\nb-TAIL"
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        options=options(
+            max_chars=42,
+            max_lines=50,
+            head_lines=50,
+            tail_lines=50,
+        ),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+
+
+def test_duplicate_upstream_char_markers_fail_open_when_they_cannot_fit() -> None:
+    notice = "[noisegate: omitted 32 chars]"
+    raw = "\n".join(
+        [
+            "head-" + ("h" * 40),
+            notice,
+            "middle-1-" + ("x" * 40),
+            "middle-2-" + ("x" * 40),
+            notice,
+            "tail-" + ("t" * 40),
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="make noisy",
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=1,
+            tail_lines=1,
+        ),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.text.splitlines().count(notice) == 2
+
+
+def test_final_budget_fails_open_when_upstream_char_marker_cannot_fit() -> None:
+    raw = "HEAD-a\n[noisegate: omitted 32 chars]\nb-TAIL"
+
+    rewrite = engine._enforce_final_budget(
+        raw,
+        options(
+            max_chars=42,
+            max_lines=50,
+            head_lines=50,
+            tail_lines=50,
+        ),
+        preserve_patterns=engine.CRITICAL_PATTERNS,
+    )
+
+    assert rewrite is None
+
+
 def test_named_non_noisy_tools_are_protected_by_default() -> None:
     raw = numbered("useful context", 100)
 
@@ -58,104 +953,186 @@ def test_named_non_noisy_tools_are_protected_by_default() -> None:
         assert result.metadata["reducer"] == "protected_tool"
 
 
-def test_memory_retrieval_tool_outputs_are_protected_by_default() -> None:
-    raw = numbered("retrieval evidence", 100)
-
-    for tool_name in (
-        "lcm_grep",
-        "lcm_load_session",
-        "lcm_describe",
-        "lcm_expand",
-        "lcm_expand_query",
-        "lcm_status",
-        "lcm_doctor",
-        "hindsight_recall",
-        "hindsight_reflect",
-        "hindsight_retain",
-        "memory",
-        "session_search",
-    ):
-        result = reduce_text(raw, tool_name=tool_name, options=options(max_chars=120))
-        assert result.changed is False
-        assert result.text == raw
-        assert result.metadata["reducer"] == "protected_tool"
-
-
-def test_memory_retrieval_cli_outputs_are_protected_by_default() -> None:
-    raw = "\n".join(
-        [
-            "LCM expanded payload store_id=123",
-            *numbered("raw memory evidence", 100).splitlines(),
-            "externalized_ref=payload_abc.json",
-        ]
-    )
-
-    for command in (
-        "hermes lcm grep retrieval",
-        "hermes lcm load-session abc123",
-        "hermes lcm describe 42",
-        "hermes lcm expand --store-id 123",
-        "hermes lcm expand-query retrieval",
+@pytest.mark.parametrize(
+    "command",
+    (
         "lcm_grep retrieval",
         "lcm_load_session abc123",
         "lcm_describe 42",
-        "lcm_expand 123",
+        "./lcm_expand 123",
         "lcm_expand_query retrieval",
-        "hindsight recall retrieval",
-        "hindsight reflect retrieval",
-        "memory search retrieval",
+        "/usr/local/bin/hindsight_recall foo",
+        "hindsight_reflect retrieval",
+        "/opt/venv/bin/session_search query",
+        "hermes lcm grep retrieval",
+        "hermes lcm load-session abc123",
+        "hermes lcm load session abc123",
+        "hermes lcm describe 42",
+        "hermes lcm expand 123",
+        "session_search git diff",
+        "hermes lcm expand git diff",
+        "hermes 2>/dev/null lcm expand 123",
+        "hermes lcm expand 123 <<<ignored",
+        "hermes lcm expand 123 <<< ignored",
+        "hermes lcm expand 123 <<<\"ignored value\"",
+        "hermes lcm expand 123 <<< \"ignored value\"",
+        "exec /opt/bin/lcm_expand 123",
+        "printf '%s' \"$(hermes lcm expand 123)\"",
+        "printf '%s' \"$(value=`hermes lcm expand 123`; printf '%s' \"$value\")\"",
+        "hermes lcm expand-query retrieval",
+        "hermes lcm expand query retrieval",
+        "hermes hindsight recall retrieval",
+        "hermes hindsight reflect retrieval",
         "hermes memory search retrieval",
-        "session_search retrieval",
-    ):
-        result = reduce_text(
-            raw,
-            command=command,
-            tool_name="terminal",
-            options=options(max_chars=160),
-        )
-        assert result.changed is False
-        assert result.text == raw
-        assert result.metadata["reducer"] == "protected_memory_retrieval"
+        "hermes memory recall retrieval",
+        "hermes memory reflect retrieval",
+        "hermes memory get memory-id",
+        "hermes memory read memory-id",
+        "hermes memory show memory-id",
+        "hermes memory list",
+        "hermes session search retrieval",
+    ),
+)
+def test_terminal_memory_retrieval_commands_are_exact(command: str) -> None:
+    raw = numbered("retrieval evidence", 100)
 
-
-def test_indexing_api_and_lcm_maintenance_logs_can_reduce_in_terminal() -> None:
-    cases = (
-        (
-            "python embed.py --batch-size 512",
-            "\n".join(f"embedding batch {index}/50000 ok" for index in range(1, 180)),
-        ),
-        (
-            "python build_vector_index.py",
-            "\n".join(f"vector DB indexing shard={index} committed" for index in range(1, 180)),
-        ),
-        (
-            "python build_hnsw.py",
-            "\n".join(f"HNSW/pgvector build layer {index} complete" for index in range(1, 180)),
-        ),
-        (
-            "python api_worker.py",
-            "\n".join(f"API retry rate-limit backoff attempt={index}" for index in range(1, 180)),
-        ),
-        (
-            "hermes lcm import archive.jsonl",
-            "\n".join(f"indexed {index}/50000 messages" for index in range(1, 180)),
-        ),
-        (
-            "hermes lcm doctor --reindex",
-            "\n".join(f"lcm doctor checked vector row {index}" for index in range(1, 180)),
-        ),
+    result = reduce_text(
+        raw,
+        command=command,
+        tool_name="terminal",
+        options=options(max_chars=120),
     )
 
-    for command, raw in cases:
-        result = reduce_text(
-            raw,
-            command=command,
-            tool_name="terminal",
-            options=options(max_chars=220, head_lines=2, tail_lines=2),
-        )
-        assert result.changed is True
-        assert "[noisegate: omitted" in result.text
-        assert result.metadata["reducer"] == "generic_head_tail"
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["command_class"] == "memory_retrieval"
+    assert result.metadata["reducer"] == "protected_memory_retrieval"
+    assert result.metadata["reason"] == "memory_retrieval_passthrough"
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_class", "expected_reducer"),
+    (
+        ("rg lcm expand src", "source_search", "protected_source_search"),
+        ("grep hindsight recall logs", "source_search", "protected_source_search"),
+        ("printf session_search", "generic", "generic_head_tail"),
+        ("echo 'hermes lcm expand'", "generic", "generic_head_tail"),
+        ("echo '$(hermes lcm expand 123)'", "generic", "generic_head_tail"),
+        ("echo '`hermes lcm expand 123`'", "generic", "generic_head_tail"),
+        ("git diff session_search", "git_diff", "protected_diff"),
+        ("pytest -q -k 'hindsight recall'", "pytest", "pytest"),
+    ),
+)
+def test_retrieval_phrases_in_arguments_keep_existing_behavior(
+    command: str,
+    expected_class: str,
+    expected_reducer: str,
+) -> None:
+    raw = numbered("ordinary output", 100)
+
+    result = reduce_text(
+        raw,
+        command=command,
+        tool_name="terminal",
+        options=options(max_chars=120),
+    )
+
+    assert result.metadata["command_class"] == expected_class
+    assert result.metadata["reducer"] == expected_reducer
+    assert result.changed is (expected_class not in {"git_diff", "source_search"})
+
+
+def test_nested_retrieval_substitution_inspection_fails_open_at_bound() -> None:
+    raw = numbered("possibly retrieved evidence", 100)
+    command = "hermes lcm expand 123"
+    for _ in range(engine._MEMORY_RETRIEVAL_SUBSTITUTION_LIMIT + 1):
+        command = f'printf \'%s\' "$({command})"'
+
+    result = reduce_text(
+        raw,
+        command=command,
+        tool_name="terminal",
+        options=options(max_chars=120),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["command_class"] == "memory_retrieval"
+
+
+def test_nested_retrieval_substitution_inspection_deduplicates_bodies() -> None:
+    raw = numbered("ordinary output", 100)
+    repeated = " ".join(
+        "$(printf ordinary)"
+        for _ in range(engine._MEMORY_RETRIEVAL_SUBSTITUTION_LIMIT + 1)
+    )
+
+    result = reduce_text(
+        raw,
+        command=f'printf \'%s\' "{repeated}"',
+        tool_name="terminal",
+        options=options(max_chars=120),
+    )
+
+    assert result.changed is True
+    assert result.metadata["command_class"] == "generic"
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "session_search git diff",
+        "hermes lcm expand git diff",
+    ),
+)
+def test_retrieval_executable_intent_beats_diff_like_query_and_output(command: str) -> None:
+    raw = "\n".join(
+        [
+            "diff --git a/recalled.py b/recalled.py",
+            "--- a/recalled.py",
+            "+++ b/recalled.py",
+            "@@ -1,2 +1,2 @@",
+            "-old recalled evidence",
+            "+new recalled evidence",
+            *[f"+exact recalled diff line {index:03d}" for index in range(120)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command=command,
+        tool_name="terminal",
+        options=options(max_chars=160, preserve_diffs=False),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["command_class"] == "memory_retrieval"
+    assert result.metadata["reducer"] == "protected_memory_retrieval"
+
+
+@pytest.mark.parametrize(
+    ("command", "line"),
+    (
+        ("hermes lcm import archive.jsonl", "indexed message"),
+        ("hermes lcm doctor --reindex", "vector index progress"),
+        ("python embed.py --batch-size 512", "embedding batch complete"),
+        ("python api_worker.py", "API retry rate-limit backoff"),
+    ),
+)
+def test_memory_maintenance_commands_remain_compactable(command: str, line: str) -> None:
+    raw = numbered(line, 100)
+
+    result = reduce_text(
+        raw,
+        command=command,
+        tool_name="terminal",
+        options=options(max_chars=160),
+    )
+
+    assert result.changed is True
+    assert result.metadata["command_class"] == "generic"
+    assert result.metadata["reducer"] == "generic_head_tail"
 
 
 def test_named_noisy_tools_can_still_reduce() -> None:
@@ -208,8 +1185,8 @@ def test_line_reducer_can_shrink_marker_before_tight_char_budget() -> None:
     )
 
     assert result.changed is True
-    assert result.text == "l\n[noisegate: omitted 34 chars]\n99"
-    assert len(result.text) == 34
+    assert result.text == "l00\n[noisegate: omitted 99 lines]"
+    assert len(result.text) == 33
 
 
 def test_tiny_line_budget_fails_open_instead_of_dropping_marker() -> None:
@@ -290,6 +1267,896 @@ def test_important_line_char_cap_keeps_middle_failure() -> None:
     assert "AssertionError: boom" in result.text
 
 
+def test_line_budget_prefers_pytest_assertion_detail_over_progress_line() -> None:
+    lines = [
+        f"tests/test_generated.py::test_pass_before_{index:03d} PASSED [ 20%]"
+        for index in range(120)
+    ]
+    lines.append("tests/test_generated.py::test_signal FAILED [ 50%]")
+    lines.extend(
+        f"tests/test_generated.py::test_pass_after_{index:03d} PASSED [ 70%]"
+        for index in range(120)
+    )
+    lines.extend(
+        [
+            "=================================== FAILURES ===================================",
+            "_______________________________ test_signal _______________________________",
+            "E       AssertionError: DOGFOOD_SIGNAL_SURVIVED",
+            "=========================== short test summary info ===========================",
+            "FAILED tests/test_generated.py::test_signal - AssertionError: DOGFOOD_SIGNAL_SURVIVED",
+        ]
+    )
+    raw = "\n".join(lines)
+
+    result = reduce_text(
+        raw,
+        command="uv run pytest -vv tests/test_generated.py",
+        options=options(max_chars=700, max_lines=20, max_important_lines=20),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 700
+    assert "DOGFOOD_SIGNAL_SURVIVED" in result.text
+
+
+def test_char_budget_prefers_pytest_assertion_detail_over_progress_line() -> None:
+    lines = [
+        f"tests/test_generated.py::test_pass_before_{index:03d} PASSED [ 20%]"
+        for index in range(20)
+    ]
+    lines.append("tests/test_generated.py::test_signal FAILED [ 50%]")
+    lines.extend(
+        f"tests/test_generated.py::test_pass_after_{index:03d} PASSED [ 70%]"
+        for index in range(20)
+    )
+    lines.extend(
+        [
+            "=================================== FAILURES ===================================",
+            "_______________________________ test_signal _______________________________",
+            "E       AssertionError: DOGFOOD_SIGNAL_SURVIVED",
+            "=========================== short test summary info ===========================",
+            "FAILED tests/test_generated.py::test_signal - AssertionError: DOGFOOD_SIGNAL_SURVIVED",
+        ]
+    )
+    raw = "\n".join(lines)
+
+    result = reduce_text(
+        raw,
+        command="uv run pytest -vv tests/test_generated.py",
+        options=options(max_chars=700, max_lines=160, max_important_lines=80),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 700
+    assert "DOGFOOD_SIGNAL_SURVIVED" in result.text
+
+
+def test_char_budget_ignores_passing_test_name_with_exception_substring() -> None:
+    lines = [
+        "tests/test_widget.py::test_exception_name PASSED " + ("p" * 40)
+        for _ in range(8)
+    ]
+    lines.extend(
+        [
+            "tests/test_widget.py::test_boom FAILED [100%]",
+            "E       RuntimeError: boom",
+        ]
+    )
+    raw = "\n".join(lines)
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(max_chars=180, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 180
+    assert "RuntimeError: boom" in result.text
+    assert "test_exception_name PASSED" not in result.text
+
+
+def test_line_budget_prefers_pytest_exception_summary_over_count_summary() -> None:
+    raw = "\n".join(
+        [
+            *[f"tests/test_widget.py::test_ok_{index} PASSED" for index in range(30)],
+            "FAILED tests/test_widget.py::test_widget - TypeError: unsupported operand type",
+            *[f"noise {index}" for index in range(30)],
+            "========================= 1 failed in 0.12s =========================",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            # Prefix marker + interior signal + suffix marker + exit notice.
+            max_lines=4,
+            head_lines=0,
+            tail_lines=0,
+            max_important_lines=10,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "TypeError: unsupported operand type" in result.text
+    assert "1 failed in 0.12s" not in result.text
+
+
+def test_line_budget_uses_marked_summary_when_progress_needs_two_markers() -> None:
+    raw = "\n".join(
+        [
+            *[f"tests/test_widget.py::test_ok_{index} PASSED" for index in range(10)],
+            "tests/test_widget.py::test_widget FAILED [100%]",
+            *[f"noise {index}" for index in range(10)],
+            "========================= 1 failed in 0.12s =========================",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            max_important_lines=10,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "tests/test_widget.py::test_widget FAILED" not in result.text
+    assert "1 failed in 0.12s" in result.text
+    assert "[noisegate: omitted 21 lines]" in result.text
+    assert "[noisegate: exit_code=1]" in result.text
+
+
+def test_char_budget_prefers_real_pytest_failure_over_incidental_exception_log() -> None:
+    raw = "\n".join(
+        [
+            "Exception ignored in: <function _cleanup at 0xabc>",
+            *[f"captured log noise {index} " + ("x" * 50) for index in range(10)],
+            "tests/test_widget.py::test_widget FAILED [100%]",
+            "E       AssertionError: real failure detail",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(max_chars=180, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert "AssertionError: real failure detail" in result.text
+    assert "Exception ignored" not in result.text
+
+
+def test_recovery_notice_survives_when_incidental_exception_name_is_dropped() -> None:
+    raw = "\n".join(
+        [
+            *[
+                "tests/test_widget.py::test_exception_name PASSED " + ("p" * 20)
+                for _ in range(4)
+            ],
+            "FAILED tests/test_widget.py::test_widget - TypeError: unsupported operand type",
+            *[f"noise {index} " + ("x" * 20) for index in range(6)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(max_chars=170, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 170
+    assert "TypeError: unsupported operand type" in result.text
+    assert "test_exception_name PASSED" not in result.text
+    assert "[noisegate: exit_code=1]" in result.text
+
+
+def test_char_budget_falls_back_to_lower_ranked_pytest_line_that_fits() -> None:
+    raw = "\n".join(
+        [
+            "E       AssertionError: " + ("x" * 200),
+            *[f"noise {index}" for index in range(10)],
+            "tests/test_widget.py::test_widget FAILED",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(max_chars=120, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 120
+    assert "tests/test_widget.py::test_widget FAILED" in result.text
+
+
+def test_char_budget_keeps_trying_anchors_when_capped_context_loses_anchor() -> None:
+    raw = "\n".join(
+        [
+            "E       AssertionError: " + ("x" * 200),
+            "captured ERROR local log recovered successfully",
+            *[f"noise {index}" for index in range(8)],
+            "tests/test_widget.py::test_widget FAILED [100%]",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=135,
+            max_lines=80,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=2,
+        ),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 135
+    assert "tests/test_widget.py::test_widget FAILED" in result.text
+    assert "captured ERROR local log" not in result.text
+
+
+def test_line_budget_falls_back_to_lower_ranked_pytest_line_that_fits() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(20)],
+            "E       AssertionError: " + ("x" * 200),
+            *[f"noise {index}" for index in range(20)],
+            "tests/test_widget.py::test_widget FAILED",
+            *[f"teardown {index}" for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            # The four truthful lines occupy exactly 125 characters.
+            max_chars=125,
+            max_lines=4,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 125
+    assert len(result.text.splitlines()) <= 4
+    assert "tests/test_widget.py::test_widget FAILED" in result.text
+
+
+def test_char_budget_prefers_pytest_failure_over_benign_error_log() -> None:
+    raw = "\n".join(
+        [
+            "ERROR monitoring task recovered successfully",
+            *[f"captured log noise {index} " + ("x" * 20) for index in range(10)],
+            "tests/test_widget.py::test_widget FAILED [100%]",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(max_chars=120, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 120
+    assert "tests/test_widget.py::test_widget FAILED" in result.text
+    assert "ERROR monitoring task recovered successfully" not in result.text
+
+
+def test_line_budget_prefers_traceback_over_failed_progress_line() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(20)],
+            "tests/test_widget.py::test_widget FAILED [100%]",
+            *[f"noise {index}" for index in range(20)],
+            "Traceback (most recent call last):",
+            *[f"teardown {index}" for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            # Prefix marker + interior signal + suffix marker + exit notice.
+            max_lines=4,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "Traceback (most recent call last):" in result.text
+    assert "tests/test_widget.py::test_widget FAILED" not in result.text
+
+
+def test_line_budget_recognizes_exception_group_as_diagnostic_detail() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(20)],
+            "ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)",
+            *[f"noise {index}" for index in range(20)],
+            "FAILED tests/test_widget.py::test_widget - ExceptionGroup",
+            *[f"teardown {index}" for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            # Prefix marker + interior signal + suffix marker + exit notice.
+            max_lines=4,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "ExceptionGroup: unhandled errors" in result.text
+    assert "FAILED tests/test_widget.py::test_widget" not in result.text
+
+
+def test_line_budget_recognizes_exception_in_header_as_diagnostic_detail() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(20)],
+            "Exception in thread worker-1:",
+            *[f"noise {index}" for index in range(20)],
+            "========================= 1 failed in 0.12s =========================",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "Exception in thread worker-1:" in result.text
+    assert "1 failed in 0.12s" not in result.text
+
+
+def test_line_budget_preserves_unhandled_exception_shutdown_detail() -> None:
+    raw = "\n".join(
+        [
+            *[
+                f"tests/test_widget.py::test_exception_name_{index} PASSED"
+                for index in range(30)
+            ],
+            "Unhandled exception during asyncio.run() shutdown",
+            "RuntimeError: shutdown boom",
+            *[f"noise {index}" for index in range(30)],
+            "========================= 1 failed in 0.12s =========================",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            # Prefix marker + interior signal + suffix marker + exit notice.
+            max_lines=4,
+            head_lines=0,
+            tail_lines=0,
+            max_important_lines=10,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "Unhandled exception during asyncio.run() shutdown" in result.text
+    assert "1 failed in 0.12s" not in result.text
+    assert "test_exception_name_" not in result.text
+
+
+def test_line_budget_preserves_task_exception_headers() -> None:
+    headers = (
+        "Task exception was never retrieved",
+        "Exception was never retrieved",
+        "During handling of the above exception, another exception occurred:",
+        "The above exception was the direct cause of the following exception:",
+    )
+
+    for header in headers:
+        raw = "\n".join(
+            [
+                *[f"setup {index}" for index in range(20)],
+                header,
+                *[f"noise {index}" for index in range(20)],
+                "========================= 1 failed in 0.12s =========================",
+            ]
+        )
+
+        result = reduce_text(
+            raw,
+            command="pytest -vv",
+            exit_code=1,
+            options=options(
+                max_chars=10_000,
+                # Prefix marker + interior signal + suffix marker + exit notice.
+                max_lines=4,
+                head_lines=0,
+                tail_lines=0,
+                important_context_lines=0,
+            ),
+        )
+
+        assert result.changed is True
+        assert header in result.text
+        assert "1 failed in 0.12s" not in result.text
+
+
+def test_multi_anchor_recovery_budget_does_not_silently_drop_exact_repro_tail() -> None:
+    raw = "\n".join(
+        [
+            "1 failed",
+            "BaseExceptionGroup: boom",
+            "Task exception was never retrieved",
+            *[f"q{index}" for index in range(11)],
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="pytest -q",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=160,
+        noisegate_max_lines=6,
+        noisegate_head_lines=5,
+        noisegate_tail_lines=2,
+        noisegate_important_context_lines=2,
+        noisegate_max_important_lines=4,
+    )
+
+    assert_fail_open_or_truthful_failure_excerpt(raw, transformed)
+
+
+def test_tight_failed_test_fallback_marks_every_omitted_range_exact_repro() -> None:
+    raw = "\n".join(
+        [
+            "1 failed",
+            "FAILED tests/test_x.py::test_y - AssertionError: boom",
+            "n2xxxxxxxxxx",
+            "n3xxxxxxxxxx",
+            "n4xxxxxxxxxx",
+            "Task exception was never retrieved",
+            "n6",
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="pytest -q",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=180,
+        noisegate_max_lines=4,
+        noisegate_head_lines=4,
+        noisegate_tail_lines=3,
+        noisegate_important_context_lines=1,
+        noisegate_max_important_lines=9,
+    )
+
+    assert transformed == "\n".join(
+        [
+            "[noisegate: omitted 1 lines]",
+            "FAILED tests/test_x.py::test_y - AssertionError: boom",
+            "[noisegate: omitted 5 lines]",
+            "[noisegate: exit_code=1]",
+        ]
+    )
+    assert len(transformed) == 136
+
+
+@pytest.mark.parametrize("max_lines", [3, 4, 5])
+@pytest.mark.parametrize("max_chars", [135, 136, 180])
+@pytest.mark.parametrize(
+    "secondary_header",
+    [
+        "Task exception was never retrieved",
+        "BaseExceptionGroup: secondary boom",
+        "During handling of the above exception, another exception occurred:",
+        "The above exception was the direct cause of the following exception:",
+    ],
+)
+def test_tight_failed_test_fallback_boundaries_are_truthfully_marked_or_fail_open(
+    max_lines: int,
+    max_chars: int,
+    secondary_header: str,
+) -> None:
+    raw = "\n".join(
+        [
+            "1 failed",
+            "FAILED tests/test_x.py::test_y - AssertionError: boom",
+            "n2xxxxxxxxxx",
+            "n3xxxxxxxxxx",
+            "n4xxxxxxxxxx",
+            secondary_header,
+            "n6",
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="pytest -q",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=max_chars,
+        noisegate_max_lines=max_lines,
+        noisegate_head_lines=4,
+        noisegate_tail_lines=3,
+        noisegate_important_context_lines=1,
+        noisegate_max_important_lines=9,
+    )
+
+    assert_fail_open_or_truthful_failure_excerpt(raw, transformed)
+    if transformed is not None and transformed != raw:
+        assert len(transformed) <= max_chars
+        assert len(transformed.splitlines()) <= max_lines
+
+
+@pytest.mark.parametrize(
+    ("lines", "max_chars"),
+    [
+        (["prefix", "ValueError: boom", "tail"], len("ValueError: boom")),
+        (
+            [
+                "prefix",
+                "FAILED tests/test_x.py::test_y - AssertionError: boom",
+                "ValueError: boom",
+                "tail",
+            ],
+            len("FAILED tests/test_x.py::test_y - AssertionError: boom\nValueError: boom"),
+        ),
+    ],
+    ids=("single_anchor", "contiguous_anchors"),
+)
+def test_concrete_failure_fallback_rejects_unmarked_interior_subset(
+    lines: list[str],
+    max_chars: int,
+) -> None:
+    excerpt = engine._concrete_failure_excerpt_for_notices(
+        "\n".join(lines),
+        options(max_chars=max_chars, max_lines=2),
+    )
+
+    assert excerpt is None
+
+
+def test_concrete_failure_direct_fit_source_remains_unmarked() -> None:
+    raw = "\n".join(
+        [
+            "FAILED tests/test_x.py::test_y - AssertionError: boom",
+            "ValueError: boom",
+        ]
+    )
+
+    excerpt = engine._concrete_failure_excerpt_for_notices(
+        raw,
+        options(max_chars=len(raw), max_lines=2),
+    )
+
+    assert excerpt == raw
+    assert "[noisegate: omitted" not in excerpt
+
+
+@pytest.mark.parametrize("max_lines", [5, 6, 7])
+@pytest.mark.parametrize("max_chars", [120, 160])
+def test_multi_anchor_recovery_budget_respects_adjacent_boundaries(
+    max_lines: int,
+    max_chars: int,
+) -> None:
+    raw = "\n".join(
+        [
+            "1 failed",
+            "BaseExceptionGroup: boom",
+            "Task exception was never retrieved",
+            *[f"q{index}" for index in range(11)],
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="pytest -q",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=max_chars,
+        noisegate_max_lines=max_lines,
+        noisegate_head_lines=5,
+        noisegate_tail_lines=2,
+        noisegate_important_context_lines=2,
+        noisegate_max_important_lines=4,
+    )
+
+    assert_fail_open_or_truthful_failure_excerpt(raw, transformed)
+    if transformed is not None:
+        assert len(transformed) <= max_chars
+        assert len(transformed.splitlines()) <= max_lines
+
+
+@pytest.mark.parametrize(
+    "secondary_header",
+    [
+        "Task exception was never retrieved",
+        "During handling of the above exception, another exception occurred:",
+        "The above exception was the direct cause of the following exception:",
+    ],
+)
+def test_multi_anchor_exception_headers_do_not_silently_drop_tail(
+    secondary_header: str,
+) -> None:
+    raw = "\n".join(
+        [
+            "1 failed",
+            "BaseExceptionGroup: boom",
+            secondary_header,
+            *[f"tail-{index}" for index in range(11)],
+        ]
+    )
+
+    transformed = transform_terminal_output(
+        command="pytest -q",
+        output=raw,
+        exit_code=1,
+        noisegate_max_chars=160,
+        noisegate_max_lines=6,
+        noisegate_head_lines=5,
+        noisegate_tail_lines=2,
+        noisegate_important_context_lines=2,
+        noisegate_max_important_lines=4,
+    )
+
+    assert_fail_open_or_truthful_failure_excerpt(raw, transformed)
+
+
+def test_multi_anchor_direct_fit_without_omitted_range_remains_unmarked() -> None:
+    lines = [
+        "BaseExceptionGroup: boom",
+        "Task exception was never retrieved",
+    ]
+
+    excerpt = engine._line_budgeted_important_excerpt(
+        lines,
+        list(range(len(lines))),
+        options(
+            max_chars=160,
+            max_lines=4,
+            important_context_lines=0,
+        ),
+        engine.TEST_PATTERNS,
+    )
+
+    assert excerpt == "\n".join(lines)
+    assert "[noisegate: omitted" not in excerpt
+
+
+def test_line_budget_prefers_chained_exception_header_over_adjacent_e_lines() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(20)],
+            "E       ValueError: first failure",
+            "During handling of the above exception, another exception occurred:",
+            "E       RuntimeError: second failure",
+            *[f"noise {index}" for index in range(20)],
+            "========================= 1 failed in 0.12s =========================",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            # Prefix marker + interior signal + suffix marker + exit notice.
+            max_lines=4,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "During handling of the above exception" in result.text
+    assert "1 failed in 0.12s" not in result.text
+
+
+def test_char_budget_prefers_chained_exception_header_at_truthful_fit() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(20)],
+            "ValueError: first failure",
+            "During handling of the above exception, another exception occurred:",
+            "RuntimeError: second failure",
+            *[f"noise {index}" for index in range(20)],
+            "========================= 1 failed in 0.12s =========================",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=152,
+            max_lines=80,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "During handling of the above exception" in result.text
+    assert "ValueError: first failure" not in result.text
+
+
+def test_line_budget_ranks_base_exception_group_as_detail() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(20)],
+            "BaseExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)",
+            *[f"noise {index}" for index in range(20)],
+            "FAILED tests/test_widget.py::test_widget - BaseExceptionGroup",
+            *[f"teardown {index}" for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            # Prefix marker + interior signal + suffix marker + exit notice.
+            max_lines=4,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "BaseExceptionGroup: unhandled errors" in result.text
+    assert "FAILED tests/test_widget.py::test_widget" not in result.text
+
+
+def test_base_exception_group_header_ranks_above_pytest_summary() -> None:
+    summary = "FAILED tests/test_widget.py::test_widget - BaseExceptionGroup"
+    header = "BaseExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)"
+
+    assert engine._failure_detail_sort_key(header, 1) < engine._failure_detail_sort_key(
+        summary,
+        0,
+    )
+
+
+def test_char_budget_prefers_base_exception_group_header_over_earlier_summary() -> None:
+    raw = "\n".join(
+        [
+            "FAILED tests/test_widget.py::test_widget - BaseExceptionGroup",
+            *[f"noise {index}" for index in range(20)],
+            "BaseExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)",
+            *[f"teardown {index}" for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            # The two markers, header, and exit notice occupy exactly 154 characters.
+            max_chars=154,
+            max_lines=80,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "BaseExceptionGroup: unhandled errors" in result.text
+    assert "FAILED tests/test_widget.py::test_widget" not in result.text
+
+
+def test_exception_group_tree_header_ranks_above_pytest_summary() -> None:
+    raw = "\n".join(
+        [
+            "FAILED tests/test_widget.py::test_widget - BaseExceptionGroup",
+            *[f"noise {index}" for index in range(20)],
+            "  | BaseExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)",
+            *[f"teardown {index}" for index in range(20)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        exit_code=1,
+        options=options(
+            # The indented header makes the truthful four-line excerpt exactly 158 chars.
+            max_chars=158,
+            max_lines=80,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "| BaseExceptionGroup: unhandled errors" in result.text
+    assert "FAILED tests/test_widget.py::test_widget" not in result.text
+
+
+def test_line_budget_prefers_pytest_pass_summary_over_progress_line() -> None:
+    raw = "\n".join(
+        [
+            *[
+                f"tests/test_widget.py::test_ok_{index} PASSED [ {index}%]"
+                for index in range(20)
+            ],
+            "========================= 40 passed in 1.23s =========================",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        options=options(
+            max_chars=10_000,
+            max_lines=3,
+            head_lines=0,
+            tail_lines=0,
+            max_important_lines=10,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "40 passed in 1.23s" in result.text
+    assert "tests/test_widget.py::test_ok_0 PASSED" not in result.text
+
+
 def test_first_pattern_match_short_circuits_after_first_matching_pattern() -> None:
     match = _first_pattern_match("FIRST then SECOND", (re.compile("FIRST"), re.compile("SECOND")))
 
@@ -322,6 +2189,20 @@ def test_important_line_reducer_handles_high_volume_repeated_failures() -> None:
     assert "[noisegate: omitted" in result.text
 
 
+def test_ranked_pattern_matches_carry_line_rank_metadata() -> None:
+    matches = engine._ranked_pattern_line_matches(
+        "E       AssertionError: dense failure\n",
+        engine.CRITICAL_PATTERNS,
+    )
+
+    assert matches
+    assert matches[0].line_index == 0
+    assert engine._rank_for_span_match(
+        matches[0],
+        engine._LineLayout(lines=[], offsets=[]),
+    ) == 0
+
+
 def test_terminal_file_read_commands_are_protected_by_default() -> None:
     raw = numbered("file line", 100)
 
@@ -339,6 +2220,294 @@ def test_terminal_file_read_commands_are_protected_by_default() -> None:
             options=options(max_chars=120),
         )
         assert result.changed is False
+        assert result.text == raw
+        assert result.metadata["reducer"] == "protected_file_read"
+
+
+def test_source_like_terminal_file_display_commands_are_protected() -> None:
+    raw = source_like_python()
+
+    commands = (
+        "cat -- src/example.py",
+        "head -n 200 src/example.py",
+        "tail -n +1 src/example.py",
+        "sed -n -e '1,200p' src/example.py",
+        "cat 'src/A&B.py'",
+        "cat 'src/A>B.py'",
+        "nl -ba src/example.py",
+        "bat --paging=never src/example.py",
+    )
+    for command in commands:
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            options=options(max_chars=220, max_lines=20),
+        )
+        assert result.changed is False, command
+        assert result.text == raw
+        assert result.metadata["reducer"] == "protected_file_read"
+
+
+@pytest.mark.parametrize(
+    ("command", "exact_read"),
+    (
+        ("fd -e py --exec=cat", True),
+        ("fdfind -e py --exec-batch=cat", True),
+        ("fd --exec='cat'", True),
+        ("fd '--exec=cat'", True),
+        ("fd --exec=/bin/cat", True),
+        ("fdfind --exec-batch=/usr/bin/cat", True),
+        ("fd --exec=cat -- .", True),
+        ("fd --exec=/tmp/cat", False),
+        ("fd --exec=//host/share/cat", False),
+        ("fd -e py --exec=pytest", False),
+        ("fd -x echo --exec=cat", False),
+        ("fd --exec echo --exec-batch=cat", False),
+        ("fdfind -X printf --exec=cat", False),
+        ("fd -- . --exec=cat", False),
+    ),
+)
+def test_fd_attached_exec_consumers_preserve_only_exact_file_reads(
+    command: str,
+    exact_read: bool,
+) -> None:
+    raw = source_like_python()
+
+    result = reduce_text(
+        raw,
+        command=command,
+        tool_name="terminal",
+        options=options(max_chars=220, max_lines=20),
+    )
+
+    if exact_read:
+        assert result.changed is False, command
+        assert result.text == raw
+        assert result.metadata["command_class"] == "file_read"
+    else:
+        assert result.changed is True
+        assert result.text != raw
+        assert result.metadata["command_class"] != "file_read"
+
+
+def test_fd_attached_exec_does_not_swallow_later_compactable_output() -> None:
+    source = "\n".join(
+        ["# exact source output", *[f"def exact_{index}(): return {index}" for index in range(80)]]
+    )
+    raw = source + "\n" + "\n".join(
+        [
+            *[f"uv resolver chatter {index:03d}" for index in range(50)],
+            "  × No solution found when resolving dependencies:",  # noqa: RUF001
+            "  ╰─▶ requirements are unsatisfiable.",
+            *[f"backtracking {index:03d}" for index in range(50)],
+        ]
+    )
+
+    for command in (
+        "fd --exec=cat && uv run pytest -q",
+        "fd --exec=cat && cd repo && uv run pytest -q",
+        "fd --exec=cat && export MODE=test && uv run pytest -q",
+        "fdfind --exec-batch=cat; uv run pytest -q",
+        "uv run fd --exec=cat && uv run pytest -q",
+        "sh -c 'fd --exec=cat' && uv run pytest -q",
+        "sh -c 'cd . && fd --exec=cat' && uv run pytest -q",
+        "uv run sh -c 'cd . && uv run sh -c \"fd --exec=cat\"' && uv run pytest -q",
+        "sh -c 'fd --exec=cat; exit 1' || uv run pytest -q",
+        "uv run sh -c 'uv run sh -c \"fd --exec=cat\"' && uv run pytest -q",
+        "fd --exec=cat && false || true && uv run pytest -q",
+        "fd --exec=cat && (exit 0) && uv run pytest -q",
+        "fd --exec=cat && (exit 0; false) && uv run pytest -q",
+        "fd --exec=cat && uv run pytest -q >/dev/null",
+    ):
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=options(
+                max_chars=260,
+                max_lines=8,
+                head_lines=1,
+                tail_lines=1,
+                important_context_lines=0,
+            ),
+        )
+
+        assert result.changed is True, command
+        assert result.metadata["command_class"] == "python_package", command
+        assert result.metadata["reducer"] == "python_package", command
+        assert "No solution found when resolving dependencies" in result.text, command
+        assert "[noisegate: exit_code=1]" in result.text, command
+
+    exact_fixture = "\n".join(
+        [
+            "UV_FAILURE_FIXTURE = '''",
+            "  × No solution found when resolving dependencies:",  # noqa: RUF001
+            "  ╰─▶ requirements are unsatisfiable.",
+            "'''",
+            *[f"def exact_{index}(): return {index}" for index in range(80)],
+        ]
+    )
+    for command, exit_code in (
+        ("fd --exec=cat && false && uv run pytest -q", 1),
+        ("fd --exec=cat && { false; } && uv run pytest -q", 1),
+        ("fd --exec=cat && command false && uv run pytest -q", 1),
+        ("fd --exec=cat && exit 1 && uv run pytest -q", 1),
+        ("fd --exec=cat && exit 1 || uv run pytest -q", 1),
+        ("fd --exec=cat && (exit 1) && uv run pytest -q", 1),
+        ("fd --exec=cat && (exit 1; true) && uv run pytest -q", 1),
+        ("fd --exec=cat && ! true && uv run pytest -q", 1),
+        ("fd --exec=cat && false >/dev/null && uv run pytest -q", 1),
+        ("fd --exec=cat && exit 1 >/dev/null && uv run pytest -q", 1),
+        ("fd --exec=cat && ! true >/dev/null && uv run pytest -q", 1),
+        ("fd --exec=cat && test -f definitely-missing && uv run pytest -q", 1),
+        (
+            "fd --exec=cat && cd /definitely/missing 2>/dev/null && uv run pytest -q",
+            1,
+        ),
+        (
+            "fd --exec=cat && export 1BAD=value 2>/dev/null && uv run pytest -q",
+            1,
+        ),
+        (
+            "fd --exec=cat && export MODE=test 2>/dev/null && uv run pytest -q",
+            1,
+        ),
+        ("fd --exec=cat && env cd repo && uv run pytest -q", 127),
+        ("fd --exec=cat && ./cd repo && uv run pytest -q", 1),
+        ("fd --exec=cat && source ./setup.sh && uv run pytest -q", 1),
+        ("fd --exec=cat && . ./setup.sh && uv run pytest -q", 1),
+        ("fd --exec=cat & false && uv run pytest -q", 1),
+        ("fd --exec=cat && uv run pytest -q 2>/dev/null", 1),
+        ("fd --exec=cat && { uv run pytest -q; } 2>/dev/null", 1),
+        ("fd --exec=cat && uv run pytest -q >/dev/null", 0),
+    ):
+        result = reduce_text(
+            exact_fixture,
+            command=command,
+            tool_name="terminal",
+            exit_code=exit_code,
+            options=options(max_chars=220, max_lines=7, head_lines=1, tail_lines=1),
+        )
+
+        assert result.changed is False, command
+        assert result.text == exact_fixture, command
+        assert result.metadata["command_class"] == "file_read", command
+        assert result.metadata["reducer"] == "protected_file_read", command
+
+    for command, setup_error in (
+        (
+            "fd --exec=cat && source /definitely/missing && uv run pytest -q",
+            "bash: line 1: /definitely/missing: No such file or directory",
+        ),
+        (
+            "fd --exec=cat && . /definitely/missing && uv run pytest -q",
+            "bash: line 1: /definitely/missing: No such file or directory",
+        ),
+        (
+            "fd --exec=cat && . /definitely/missing && uv run pytest -q",
+            "/bin/sh: 1: .: cannot open /definitely/missing: No such file",
+        ),
+        (
+            "fd --exec=cat && popd && uv run pytest -q",
+            "bash: line 1: popd: directory stack empty",
+        ),
+        (
+            "fd --exec=cat && cd one two && uv run pytest -q",
+            "bash: line 1: cd: too many arguments",
+        ),
+        (
+            "fd --exec=cat && export SHELLOPTS=value && uv run pytest -q",
+            "bash: line 1: SHELLOPTS: readonly variable",
+        ),
+        (
+            "fd --exec=cat && export SHELLOPTS=value && uv run pytest -q",
+            "-bash: SHELLOPTS: readonly variable",
+        ),
+        (
+            "fd --exec=cat && export PPID=1 && uv run pytest -q",
+            "ash: PPID: readonly variable",
+        ),
+    ):
+        setup_failure_output = exact_fixture + "\n" + setup_error
+        result = reduce_text(
+            setup_failure_output,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=options(max_chars=220, max_lines=7, head_lines=1, tail_lines=1),
+        )
+
+        assert result.changed is False, command
+        assert result.text == setup_failure_output, command
+        assert result.metadata["command_class"] == "file_read", command
+        assert result.metadata["reducer"] == "protected_file_read", command
+
+
+def test_shell_substitution_file_display_commands_are_not_file_read() -> None:
+    raw = source_like_python()
+
+    for command in (
+        "cat $(pytest -q)",
+        "cat `pytest -q`",
+        "cat \"$(pytest -q)\"",
+        "cat 'file\\'; pytest -q",
+        "nl -ba src/foo.py\npytest -q",
+        "nl -ba src/foo.py\r\npytest -q",
+    ):
+        assert engine.classify_command(command, raw) != "file_read", command
+
+
+def test_sed_search_scripts_are_not_file_read_passthroughs() -> None:
+    raw = source_like_python()
+
+    assert engine.classify_command("sed -n '/ERROR/p' build.log", raw) != "file_read"
+
+
+def test_git_show_line_range_option_is_not_file_read_passthrough() -> None:
+    raw = source_like_python()
+
+    assert engine.classify_command("git show -L 1,10:src/foo.py HEAD", raw) != "file_read"
+
+
+def test_v4a_patch_snippet_inside_noisy_log_is_not_patch_passthrough() -> None:
+    raw = "\n".join(
+        [
+            "FAILED tests/test_patch_docs.py::test_example",
+            "Here is an example patch snippet in the failure output:",
+            "*** Begin Patch",
+            "*** Update File: src/example.py",
+            "+def fixture():",
+            *[f"noisy failure filler {index:03d} FAILED ERROR Traceback" for index in range(90)],
+            "*** End Patch",
+            "========================= 1 failed in 1.23s =========================",
+        ]
+    )
+
+    result = reduce_text(raw, command="pytest -q", options=options(max_chars=280, max_lines=20))
+
+    assert result.changed is True
+    assert result.metadata["command_class"] == "pytest"
+    assert result.metadata["reducer"] != "protected_patch"
+
+
+def test_git_show_path_source_read_is_protected() -> None:
+    raw = source_like_python()
+
+    for command in (
+        "git show HEAD:src/example.py",
+        "git show 1234:src/example.py",
+        "git show :src/example.py",
+    ):
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            options=options(max_chars=220, max_lines=20, preserve_diffs=False),
+        )
+
+        assert result.changed is False, command
         assert result.text == raw
         assert result.metadata["reducer"] == "protected_file_read"
 
@@ -362,6 +2531,119 @@ def test_git_diff_is_protected_by_default() -> None:
     assert result.changed is False
     assert result.text == raw
     assert result.metadata["reducer"] == "protected_diff"
+
+
+def test_v4a_patch_payload_with_failure_like_text_is_protected_by_default() -> None:
+    raw = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Add File: src/failure_fixture.py",
+            "+def fixture():",
+            "+    return 'FAILED ERROR Traceback npm ERR! Dockerfile'",
+            *[f"+source patch filler {index:03d} FAILED ERROR Traceback" for index in range(100)],
+            "*** End Patch",
+        ]
+    )
+
+    result = reduce_text(raw, command="", options=options(max_chars=400, max_lines=30))
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reducer"] == "protected_patch"
+
+
+def test_v4a_patch_payload_stays_exact_when_diff_passthrough_is_disabled() -> None:
+    raw = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Add File: src/failure_fixture.py",
+            "+def fixture():",
+            "+    return 'FAILED ERROR Traceback npm ERR! Dockerfile'",
+            *[f"+source patch filler {index:03d} FAILED ERROR Traceback" for index in range(100)],
+            "*** End Patch",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="",
+        options=options(max_chars=400, max_lines=30, preserve_diffs=False),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reducer"] == "protected_patch"
+
+
+def test_v4a_patch_containing_diff_stays_exact_when_diff_passthrough_is_disabled() -> None:
+    raw = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Update File: src/example.py",
+            "+diff --git a/src/example.py b/src/example.py",
+            "+--- a/src/example.py",
+            "++++ b/src/example.py",
+            "+@@ -1,2 +1,2 @@",
+            *[f"+source patch filler {index:03d} FAILED ERROR Traceback" for index in range(100)],
+            "*** End Patch",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="",
+        options=options(max_chars=400, max_lines=30, preserve_diffs=False),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reducer"] == "protected_patch"
+
+
+def test_v4a_patch_from_diff_like_command_stays_exact_when_diff_passthrough_is_disabled() -> None:
+    raw = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Add File: src/example.py",
+            "+def fixture():",
+            *[f"+source patch filler {index:03d} FAILED ERROR Traceback" for index in range(100)],
+            "*** End Patch",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="git show --patch HEAD",
+        options=options(max_chars=400, max_lines=30, preserve_diffs=False),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reducer"] == "protected_patch"
+
+
+def test_file_read_patch_payload_stays_exact_when_diff_passthrough_is_disabled() -> None:
+    raw = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Add File: src/failure_fixture.py",
+            "+def fixture():",
+            "+    return 'FAILED ERROR Traceback npm ERR! Dockerfile'",
+            *[f"+source patch filler {index:03d} FAILED ERROR Traceback" for index in range(100)],
+            "*** End Patch",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="cat patches/source.patch",
+        tool_name="terminal",
+        options=options(max_chars=400, max_lines=30, preserve_diffs=False),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reducer"] == "protected_file_read"
 
 
 def test_git_log_patch_output_is_protected_by_default() -> None:
@@ -499,15 +2781,362 @@ def test_pytest_reducer_preserves_failure_context() -> None:
     assert "[noisegate: omitted" in result.text
 
 
-def test_search_reducer_keeps_first_and_last_matches() -> None:
+def test_uv_pytest_resolution_failure_uses_python_package_reducer() -> None:
+    resolver_detail = (
+        "  ╰─▶ Because no version of private-lib matches >=2 and your project depends "
+        "on private-lib>=2, the requirements are unsatisfiable."
+    )
+    resolver_output = "\n".join(
+        [
+            *[f"checking candidate {index:03d}" for index in range(60)],
+            "  × No solution found when resolving dependencies:",  # noqa: RUF001
+            resolver_detail,
+            *[f"backtracking candidate {index:03d}" for index in range(60)],
+        ]
+    )
+
+    for command in (
+        "uv run --with private-lib pytest -q",
+        "bash -lc 'uv run --with private-lib pytest -q'",
+        "cd repo && uv run --with private-lib pytest -q",
+        "bash -lc 'cd repo && uv run --with private-lib pytest -q'",
+    ):
+        result = reduce_text(
+            resolver_output,
+            command=command,
+            exit_code=1,
+            options=options(
+                max_chars=280,
+                max_lines=6,
+                head_lines=1,
+                tail_lines=1,
+                important_context_lines=1,
+            ),
+        )
+
+        assert result.changed is True, command
+        assert result.metadata["command_class"] == "python_package", command
+        assert result.metadata["reducer"] == "python_package", command
+        assert "No solution found when resolving dependencies" in result.text, command
+
+    ordinary_pytest = "\n".join(
+        [
+            "=================================== FAILURES ===================================",
+            "FAILED tests/test_many.py::test_signal",
+            "E       AssertionError: boom",
+            *[f"pytest noise {index}" for index in range(40)],
+        ]
+    )
+    ordinary_result = reduce_text(
+        ordinary_pytest,
+        command="uv run --with private-lib pytest -q",
+        exit_code=1,
+        options=options(max_chars=280, max_lines=6),
+    )
+
+    assert ordinary_result.metadata["command_class"] == "pytest"
+    assert ordinary_result.metadata["reducer"] == "pytest"
+    assert "AssertionError: boom" in ordinary_result.text
+
+
+def test_uv_pytest_resolution_failure_beats_generic_failed_noise_at_tiny_budget() -> None:
+    raw = "\n".join(
+        [
+            *[f"checking candidate {index:03d}" for index in range(30)],
+            "DEBUG fetch failed for optional metadata cache; retrying",
+            *[f"retry noise {index:03d}" for index in range(15)],
+            "  × No solution found when resolving dependencies:",  # noqa: RUF001
+            "  ╰─▶ requirements are unsatisfiable.",
+            *[f"backtracking candidate {index:03d}" for index in range(30)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="uv run pytest -q",
+        exit_code=1,
+        options=options(
+            # The two markers, resolver signal, and exit notice are exactly 135 chars.
+            max_chars=135,
+            max_lines=4,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.metadata["command_class"] == "python_package"
+    assert "No solution found when resolving dependencies" in result.text
+    assert "[noisegate: exit_code=1]" in result.text
+
+
+def test_uv_pytest_literal_resolver_text_does_not_mask_real_test_failure() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup noise {index:03d}" for index in range(50)],
+            "application log: No solution found when resolving dependencies",
+            *[f"middle noise {index:03d}" for index in range(30)],
+            "=================================== FAILURES ===================================",
+            "E       TypeError: actual production regression",
+            "FAILED src/pkg/test_real.py::test_real_bug - TypeError: actual production regression",
+            *[f"teardown noise {index:03d}" for index in range(50)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="uv run pytest -q",
+        exit_code=1,
+        options=options(
+            max_chars=280,
+            max_lines=6,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.metadata["command_class"] == "pytest"
+    assert "TypeError: actual production regression" in result.text
+    assert "FAILED src/pkg/test_real.py::test_real_bug" in result.text
+
+    passing_output = "\n".join(
+        [
+            *[f"setup noise {index:03d}" for index in range(50)],
+            "  × No solution found when resolving dependencies:",  # noqa: RUF001
+            *[f"captured noise {index:03d}" for index in range(50)],
+            "1 passed in 0.03s",
+        ]
+    )
+    passing_result = reduce_text(
+        passing_output,
+        command="uv run pytest -q",
+        exit_code=0,
+        options=options(max_chars=180, max_lines=5, head_lines=1, tail_lines=1),
+    )
+
+    assert passing_result.metadata["command_class"] == "pytest"
+    assert "1 passed in 0.03s" in passing_result.text
+
+    collection_output = "\n".join(
+        [
+            *[f"setup noise {index:03d}" for index in range(30)],
+            "  × No solution found when resolving dependencies:",  # noqa: RUF001
+            *[f"middle noise {index:03d}" for index in range(20)],
+            "ERROR pkg/feature/test_collect.py - RuntimeError: actual collection regression",
+            *[f"teardown noise {index:03d}" for index in range(30)],
+        ]
+    )
+    collection_result = reduce_text(
+        collection_output,
+        command="uv run pytest -q",
+        exit_code=1,
+        options=options(max_chars=110, max_lines=3, head_lines=1, tail_lines=1),
+    )
+
+    assert collection_result.metadata["command_class"] == "pytest"
+    assert "RuntimeError: actual collection regression" in collection_result.text
+
+
+def test_pytest_reducer_keeps_exception_and_failed_node_under_tight_budget() -> None:
+    for exception_line in (
+        "AssertionError: expected signal, got noise",
+        "ModuleNotFoundError: missing",
+        "ImportError: cannot import name x",
+        "TypeError: bad",
+    ):
+        raw = "\n".join(
+            [
+                *[f"pytest setup noise {index}" for index in range(100)],
+                "Traceback (most recent call last):",
+                '  File "tests/test_demo.py", line 3, in test_signal',
+                exception_line,
+                "FAILED tests/test_demo.py::test_signal",
+                *[f"pytest teardown noise {index}" for index in range(100)],
+            ]
+        )
+
+        result = reduce_text(
+            raw,
+            command="pytest -q",
+            exit_code=1,
+            options=NoisegateOptions(
+                max_chars=400,
+                max_lines=8,
+                head_lines=1,
+                tail_lines=1,
+                important_context_lines=1,
+            ),
+        )
+
+        assert result.changed is True, exception_line
+        assert result.metadata["reducer"] == "pytest", exception_line
+        assert exception_line in result.text, exception_line
+        assert "FAILED tests/test_demo.py::test_signal" in result.text, exception_line
+
+
+def test_common_python_traceback_exception_survives_non_pytest_reducers() -> None:
+    raw = "\n".join(
+        [
+            *[f"noise {index}" for index in range(120)],
+            "Traceback (most recent call last):",
+            '  File "app.py", line 1, in <module>',
+            "ModuleNotFoundError: No module named 'missing_pkg'",
+            *[f"after {index}" for index in range(80)],
+        ]
+    )
+    commands = {
+        "python app.py": "generic_critical",
+        "pip install .": "python_package",
+        "docker logs api": "docker_logs",
+        "docker build .": "docker_build",
+    }
+
+    for command, reducer in commands.items():
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=NoisegateOptions(
+                max_chars=220,
+                max_lines=8,
+                head_lines=1,
+                tail_lines=1,
+                important_context_lines=1,
+            ),
+        )
+
+        assert result.changed is True, command
+        assert result.metadata["reducer"] == reducer, command
+        assert "Traceback (most recent call last):" in result.text, command
+        assert "ModuleNotFoundError: No module named 'missing_pkg'" in result.text, command
+
+
+def test_tiny_traceback_budget_keeps_concrete_failure_and_exit_notice() -> None:
+    raw = "\n".join(
+        [
+            *[f"noise before {index}" for index in range(100)],
+            "Traceback (most recent call last):",
+            '  File "tests/test_demo.py", line 3, in test_signal',
+            "ModuleNotFoundError: No module named missing_pkg",
+            "FAILED tests/test_demo.py::test_signal",
+            *[f"noise after {index}" for index in range(100)],
+        ]
+    )
+    commands = {
+        "pytest -q": "pytest",
+        "python app.py": "generic_critical",
+        "pip install .": "python_package",
+        "docker logs api": "docker_logs",
+        "docker build .": "docker_build",
+    }
+
+    for command, reducer in commands.items():
+        for max_lines in (3, 4, 5, 6):
+            result = reduce_text(
+                raw,
+                command=command,
+                tool_name="terminal",
+                exit_code=1,
+                options=NoisegateOptions(
+                    max_chars=360,
+                    max_lines=max_lines,
+                    head_lines=1,
+                    tail_lines=1,
+                    important_context_lines=1,
+                ),
+            )
+
+            case = f"{command} max_lines={max_lines}"
+            if max_lines == 3:
+                # Even one interior line needs two omission markers plus the exit notice.
+                assert result.changed is False, case
+                assert result.text == raw, case
+                continue
+            assert result.changed is True, case
+            assert result.metadata["reducer"] == reducer, case
+            assert "[noisegate: exit_code=1]" in result.text, case
+            if max_lines == 4:
+                # Keeping both signals needs two markers + two signals + the exit notice.
+                assert (
+                    "ModuleNotFoundError: No module named missing_pkg" in result.text
+                    or "FAILED tests/test_demo.py::test_signal" in result.text
+                ), case
+                continue
+            assert "ModuleNotFoundError: No module named missing_pkg" in result.text, case
+            assert "FAILED tests/test_demo.py::test_signal" in result.text, case
+
+
+def test_plain_exception_root_cause_beats_generic_unhandled_banner() -> None:
+    raw = "\n".join(
+        [
+            *[f"noise {index}" for index in range(80)],
+            "Unhandled exception",
+            "Exception: root cause",
+            *[f"tail {index}" for index in range(80)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="python app.py",
+        tool_name="terminal",
+        exit_code=1,
+        options=NoisegateOptions(
+            max_chars=160,
+            # Prefix marker + interior signal + suffix marker + exit notice.
+            max_lines=4,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=1,
+        ),
+    )
+
+    assert result.changed is True
+    assert "Exception: root cause" in result.text
+    assert "[noisegate: exit_code=1]" in result.text
+
+
+def test_program_output_piped_to_cat_still_compacts_as_runtime_failure() -> None:
+    raw = "\n".join(
+        [
+            *[f"noise {index}" for index in range(80)],
+            "Traceback (most recent call last):",
+            '  File "app.py", line 1, in <module>',
+            "ModuleNotFoundError: No module named 'missing_pkg'",
+            *[f"tail {index}" for index in range(80)],
+        ]
+    )
+
+    for command in ("python app.py | cat", "python app.py | head -100"):
+        result = reduce_text(
+            raw,
+            command=command,
+            tool_name="terminal",
+            exit_code=1,
+            options=NoisegateOptions(
+                max_chars=220,
+                max_lines=8,
+                head_lines=1,
+                tail_lines=1,
+                important_context_lines=1,
+            ),
+        )
+
+        assert result.changed is True, command
+        assert result.metadata["command_class"] == "generic", command
+        assert "ModuleNotFoundError: No module named 'missing_pkg'" in result.text, command
+
+
+def test_search_output_is_source_context_and_stays_exact() -> None:
     raw = "\n".join(f"src/file_{index}.py:match {index}" for index in range(1, 40))
 
     result = reduce_text(raw, command="rg match src", options=options())
 
-    assert result.changed is True
-    assert result.metadata["reducer"] == "search"
-    assert "src/file_1.py:match 1" in result.text
-    assert "src/file_39.py:match 39" in result.text
+    assert result.changed is False
+    assert result.metadata["reducer"] == "protected_source_search"
+    assert result.text == raw
 
 
 def test_bypass_marker_leaves_text_unchanged() -> None:
@@ -705,6 +3334,105 @@ def test_recovery_notices_fail_open_when_important_line_cannot_fit() -> None:
     assert result.metadata["reason"] == "reducer_no_output"
 
 
+@pytest.mark.parametrize("unit", ["lines", "chars"])
+def test_recovery_shortening_fails_open_when_diagnostic_and_exit_cannot_fit(
+    unit: str,
+) -> None:
+    notice = f"[noisegate: omitted 123 {unit}]"
+    raw = "\n".join(
+        [
+            notice,
+            *[f"pre-{index}" for index in range(8)],
+            "ValueError: boom",
+            *[f"post-{index}" for index in range(8)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=options(
+            max_chars=80,
+            max_lines=10,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+
+
+def test_failed_output_remaps_upstream_line_coverage_and_keeps_exit_notice() -> None:
+    raw = "\n".join(
+        [
+            "pre-0-" + ("x" * 30),
+            "pre-1-" + ("x" * 30),
+            "[noisegate: omitted 8 lines]",
+            "middle-0-" + ("x" * 30),
+            "middle-1-" + ("x" * 30),
+            "ValueError: boom",
+            *[f"tail-{index}-" + ("x" * 30) for index in range(4)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            max_lines=6,
+            head_lines=1,
+            tail_lines=1,
+            important_context_lines=0,
+        ),
+    )
+
+    body = "\n".join(
+        line
+        for line in result.text.splitlines()
+        if line != "[noisegate: exit_code=1]"
+    )
+    assert result.changed is True
+    assert "ValueError: boom" in result.text.splitlines()
+    assert "[noisegate: exit_code=1]" in result.text.splitlines()
+    assert engine._represented_line_coverage(body) == engine._represented_line_coverage(raw)
+
+
+def test_upstream_omission_evidence_may_compact_when_exit_notice_already_fits() -> None:
+    for prefix in ([], ["externalized_ref=foo"]):
+        for unit in ("lines", "chars"):
+            notice = f"[noisegate: omitted 3 {unit}]"
+            raw = "\n".join(
+                [
+                    *prefix,
+                    notice,
+                    "ValueError: boom",
+                    *[f"post-{index}" for index in range(12)],
+                ]
+            )
+
+            result = reduce_text(
+                raw,
+                command="pytest -q",
+                exit_code=1,
+                options=options(
+                    max_chars=130,
+                    max_lines=7,
+                    head_lines=1,
+                    tail_lines=1,
+                    important_context_lines=0,
+                ),
+            )
+
+            assert result.changed is True
+            assert result.text.splitlines().count(notice) == 1
+            assert "[noisegate: exit_code=1]" in result.text.splitlines()
+
+
 def test_artifact_enabled_failure_line_that_cannot_fit_fails_open() -> None:
     raw = "\n".join(
         [
@@ -730,6 +3458,89 @@ def test_artifact_enabled_failure_line_that_cannot_fit_fails_open() -> None:
     assert result.changed is False
     assert result.text == raw
     assert result.metadata["reason"] == "reducer_no_output"
+
+
+def test_artifact_path_does_not_turn_char_marker_collision_into_a_gain(tmp_path) -> None:
+    raw = "HEAD-a\n[noisegate: omitted 32 chars]\nb-TAIL"
+    artifact_dir = tmp_path / "artifacts"
+
+    result = reduce_text(
+        raw,
+        command="pytest -q",
+        options=options(
+            max_chars=42,
+            max_lines=50,
+            head_lines=50,
+            tail_lines=50,
+            artifact_enabled=True,
+            artifact_dir=artifact_dir,
+        ),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert not artifact_dir.exists()
+
+
+def test_duplicate_tail_remap_survives_exit_and_artifact_notice_path(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budgets = capture_alignment_budgets(monkeypatch)
+    spent_when_stored: list[int] = []
+    store_artifact = engine._store_artifact
+
+    def tracked_store_artifact(
+        text: str,
+        artifact_options: NoisegateOptions,
+    ) -> dict[str, engine.JsonValue]:
+        budget = engine._SOURCE_ALIGNMENT_WORK_BUDGET.get()
+        assert budget is not None
+        spent_when_stored.append(budget.spent)
+        return store_artifact(text, artifact_options)
+
+    monkeypatch.setattr(engine, "_store_artifact", tracked_store_artifact)
+    raw = "\n".join(
+        [
+            "same",
+            "[noisegate: omitted 100 lines]",
+            *[f"filler-{index}-" + ("x" * 80) for index in range(5)],
+            "same",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="make noisy",
+        exit_code=7,
+        options=options(
+            max_chars=400,
+            max_lines=4,
+            head_lines=0,
+            tail_lines=1,
+            artifact_enabled=True,
+            artifact_dir=tmp_path,
+        ),
+    )
+
+    output_lines = result.text.splitlines()
+    assert result.changed is True
+    assert output_lines[:3] == [
+        "[noisegate: omitted 106 lines]",
+        "same",
+        "[noisegate: exit_code=7]",
+    ]
+    assert output_lines[3].startswith("[noisegate artifact: id=")
+    assert engine._represented_line_coverage("\n".join(output_lines[:2])) == 107
+    artifact = result.metadata["artifact"]
+    assert isinstance(artifact, dict)
+    artifact_id = artifact["id"]
+    assert isinstance(artifact_id, str)
+    assert engine.ArtifactStore(tmp_path).read(artifact_id) == raw
+    assert len(budgets) == 1
+    assert spent_when_stored == [budgets[0].spent]
+    assert budgets[0].alignment_calls > 1
+    assert budgets[0].exhausted is False
 
 
 def test_important_line_reducer_tight_line_cap_preserves_middle_failure() -> None:
@@ -762,6 +3573,59 @@ def test_important_line_reducer_tight_line_cap_preserves_middle_failure() -> Non
     assert "FAILED" in result.text or "AssertionError" in result.text
 
 
+@pytest.mark.parametrize(
+    ("command", "long_signal", "short_signal"),
+    [
+        ("pytest -q", "ValueError: " + ("x" * 30), "TypeError: short"),
+        ("npm test", "ValueError: " + ("x" * 30), "TypeError: short"),
+        ("docker build .", "ValueError: " + ("x" * 30), "TypeError: short"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("max_chars", "max_lines"),
+    [(80, 50), (10_000, 3)],
+    ids=("max_chars", "max_lines"),
+)
+def test_lcm_priority_uses_shorter_signal_when_marked_excerpt_fits(
+    command: str,
+    long_signal: str,
+    short_signal: str,
+    max_chars: int,
+    max_lines: int,
+) -> None:
+    raw = "\n".join(
+        [
+            "externalized_ref=foo",
+            *[f"filler-{index}" for index in range(10)],
+            long_signal,
+            "filler-last",
+            short_signal,
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command=command,
+        options=options(
+            max_chars=max_chars,
+            max_lines=max_lines,
+            head_lines=0,
+            tail_lines=0,
+            important_context_lines=0,
+            max_important_lines=2,
+        ),
+    )
+
+    assert result.changed is True
+    assert result.text == "\n".join(
+        [
+            "externalized_ref=foo",
+            "[noisegate: omitted 12 lines]",
+            short_signal,
+        ]
+    )
+
+
 def test_final_budget_enforcement_preserves_middle_failure_under_line_cap() -> None:
     lines = [f"setup {index}" for index in range(20)]
     lines += [
@@ -786,6 +3650,77 @@ def test_final_budget_enforcement_preserves_middle_failure_under_line_cap() -> N
     assert result.changed is True
     assert len(result.text.splitlines()) <= 5
     assert "FAILED" in result.text or "AssertionError" in result.text
+
+
+def test_marked_excerpt_second_budget_pass_preserves_exact_repro_coverage() -> None:
+    raw = "\n".join(
+        [
+            "tests/test_x.py::test_y FAILED [100%]",
+            "f61-1",
+            "BaseExceptionGroup: boom",
+            "Task exception was never retrieved",
+            "f61-4",
+            "f61-5",
+            "FAILED tests/test_x.py::test_y - AssertionError: boom",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="python noisy.py",
+        exit_code=0,
+        options=NoisegateOptions(
+            max_chars=138,
+            max_lines=6,
+            head_lines=4,
+            tail_lines=4,
+            important_context_lines=2,
+            max_important_lines=10,
+        ),
+    )
+
+    assert engine._represented_line_coverage(result.text) == len(raw.splitlines())
+    if result.changed:
+        assert len(result.text) <= 138
+        assert len(result.text.splitlines()) <= 6
+
+
+@pytest.mark.parametrize(
+    ("max_chars", "max_lines"),
+    [(10_000, 5), (138, 6)],
+    ids=("line_cap", "char_cap"),
+)
+def test_marked_excerpt_budget_rewrite_requires_equal_represented_coverage(
+    max_chars: int,
+    max_lines: int,
+) -> None:
+    marked = "\n".join(
+        [
+            "tests/test_x.py::test_y FAILED [100%]",
+            "f61-1",
+            "BaseExceptionGroup: boom",
+            "Task exception was never retrieved",
+            "[noisegate: omitted 2 lines]",
+            "FAILED tests/test_x.py::test_y - AssertionError: boom",
+        ]
+    )
+    rewrite = engine._enforce_final_budget(
+        marked,
+        NoisegateOptions(
+            max_chars=max_chars,
+            max_lines=max_lines,
+            head_lines=4,
+            tail_lines=4,
+            important_context_lines=2,
+            max_important_lines=10,
+        ),
+        preserve_patterns=engine.CRITICAL_PATTERNS,
+    )
+
+    assert rewrite is None or (
+        engine._represented_line_coverage(rewrite)
+        == engine._represented_line_coverage(marked)
+    )
 
 
 def test_recovery_notices_do_not_emit_partial_important_markers() -> None:
@@ -929,6 +3864,28 @@ def test_tight_important_excerpt_does_not_slice_numeric_marker_suffixes() -> Non
     assert result.metadata["reason"] == "reducer_no_output"
 
 
+def test_char_budget_fails_open_instead_of_count_only_pytest_summary() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index} " + ("x" * 20) for index in range(10)],
+            "E       AssertionError: " + ("x" * 90),
+            *[f"noise {index} " + ("y" * 20) for index in range(10)],
+            "========================= 1 failed in 0.12s =========================",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="pytest -vv",
+        options=options(max_chars=100, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reason"] == "reducer_no_output"
+    assert result.metadata["attempted_reducer"] == "pytest"
+
+
 def test_node_reducer_tight_budget_fails_open_when_node_error_line_cannot_fit() -> None:
     raw = "\n".join(
         [
@@ -948,6 +3905,184 @@ def test_node_reducer_tight_budget_fails_open_when_node_error_line_cannot_fit() 
     assert result.changed is False
     assert result.text == raw
     assert result.metadata["reason"] == "reducer_no_output"
+
+
+def test_node_char_budget_preserves_python_exception_over_warning() -> None:
+    raw = "\n".join(
+        [
+            "warning package.json: deprecated dependency",
+            *[f"build noise {index} " + ("x" * 20) for index in range(12)],
+            "Exception: plugin crashed",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="npm test",
+        exit_code=1,
+        options=options(max_chars=120, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 120
+    assert "Exception: plugin crashed" in result.text
+    assert "deprecated dependency" not in result.text
+
+
+def test_node_recovery_notice_budget_preserves_python_exception_line() -> None:
+    raw = "\n".join(
+        [
+            "warning package.json: deprecated dependency",
+            *[f"build noise {index} " + ("x" * 20) for index in range(8)],
+            "Exception: plugin crashed",
+            *[f"tail noise {index} " + ("y" * 20) for index in range(8)],
+        ]
+    )
+
+    for max_chars in (120, 130, 140, 170, 200):
+        result = reduce_text(
+            raw,
+            command="npm test",
+            exit_code=1,
+            options=options(max_chars=max_chars, max_lines=80, head_lines=0, tail_lines=0),
+        )
+
+        if result.changed:
+            assert "Exception: plugin crashed" in result.text
+            assert "[noisegate: exit_code=1]" in result.text
+        else:
+            assert result.text == raw
+            assert result.metadata["reason"] == "no_gain"
+
+
+def test_node_char_budget_fails_open_instead_of_warning_when_error_cannot_fit() -> None:
+    raw = "\n".join(
+        [
+            "WARNING deprecated package",
+            *[f"build noise {index} " + ("x" * 20) for index in range(10)],
+            "Error: central failure detail " + ("z" * 40),
+            *[f"tail noise {index} " + ("y" * 20) for index in range(10)],
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="npm test",
+        exit_code=1,
+        options=options(max_chars=80, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["reason"] == "reducer_no_output"
+    assert result.metadata["attempted_reducer"] == "node"
+
+
+def test_node_line_budget_prefers_error_detail_over_count_summary() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index}" for index in range(30)],
+            "Error: Cannot find module './missing'",
+            *[f"build noise {index}" for index in range(30)],
+            "3 failed",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="npm test",
+        exit_code=1,
+        options=options(
+            max_chars=10_000,
+            # Prefix marker + interior signal + suffix marker + exit notice.
+            max_lines=4,
+            head_lines=0,
+            tail_lines=0,
+            max_important_lines=10,
+            important_context_lines=0,
+        ),
+    )
+
+    assert result.changed is True
+    assert "Cannot find module './missing'" in result.text
+    assert "3 failed" not in result.text
+
+
+def test_node_char_budget_preserves_pattern_priority_when_ranks_tie() -> None:
+    raw = "\n".join(
+        [
+            "warning package.json: deprecated dependency",
+            *[f"build noise {index}" for index in range(20)],
+            "npm ERR! Cannot find module './missing'",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="npm test",
+        exit_code=1,
+        options=options(max_chars=120, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 120
+    assert "npm ERR! Cannot find module './missing'" in result.text
+    assert "deprecated dependency" not in result.text
+
+
+def test_node_char_budget_prefers_npm_error_over_count_summary() -> None:
+    raw = "\n".join(
+        [
+            *[f"setup {index} " + ("x" * 20) for index in range(10)],
+            "npm ERR! Cannot find module './missing'",
+            *[f"build noise {index} " + ("y" * 20) for index in range(10)],
+            "3 failed",
+        ]
+    )
+
+    result = reduce_text(
+        raw,
+        command="npm test",
+        exit_code=1,
+        # This stage's two markers, npm signal, and exit notice are exactly 122 chars.
+        options=options(max_chars=122, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert len(result.text) <= 122
+    assert "npm ERR! Cannot find module './missing'" in result.text
+    assert "3 failed" not in result.text
+
+
+def test_preserving_pattern_char_path_reuses_line_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = "\n".join(
+        [
+            *("warning " + ("x" * 160) for _ in range(50)),
+            "npm ERR! Cannot find module './missing'",
+        ]
+    )
+    calls = 0
+    original = engine._line_layout
+
+    def counted_line_layout(text: str) -> engine._LineLayout:
+        nonlocal calls
+        calls += 1
+        return original(text)
+
+    monkeypatch.setattr(engine, "_line_layout", counted_line_layout)
+
+    result = reduce_text(
+        raw,
+        command="npm test",
+        exit_code=1,
+        options=options(max_chars=120, max_lines=80, head_lines=0, tail_lines=0),
+    )
+
+    assert result.changed is True
+    assert "npm ERR! Cannot find module './missing'" in result.text
+    assert calls == 1
 
 
 def test_direct_node_command_preserves_error_line() -> None:

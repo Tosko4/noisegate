@@ -51,22 +51,32 @@ Noisegate gives you two surfaces:
 It knows how to reduce common noisy outputs:
 
 - `pytest` and `unittest`
+- `apt` / `apt-get`, `pip`, and `uv` package-install/update logs, including resolver failures before a `uv run` command starts
 - `npm`, `pnpm`, and `yarn`
 - `git status` and `git log`
-- search output from `rg`, `grep`, `ag`, and `ack`
-- Docker build-style logs
+- Docker build-style logs and explicit `docker logs`, `docker service logs`, and `docker compose logs` output
+- Hermes background `process` poll/log/wait payloads when the underlying command or diagnostic content identifies a known noisy stream, including Docker, journalctl, `systemctl status`, dmesg, and follow-mode tail output from known log targets, while keeping process metadata intact; commandless non-diagnostic previews, followed source/config files, and `systemctl show` properties stay exact
 - generic long output with deterministic head/tail fallback
 
 And it refuses to touch things that should stay exact:
 
-- file reads
+- file reads, including `fd` / `fdfind` execution forms that directly display matching files when no later noisy command owns the captured output
 - patches and diffs
+- source/code search output from `rg`, `grep`, `ag`, and `ack`
 - skill documents
 - memory, LCM, Hindsight, MCP, search, and web extraction results
-- LCM/Hindsight/session retrieval CLI output such as `lcm expand`, `lcm grep`, `hindsight recall`, and `session_search`
+- terminal retrieval output from LCM, Hindsight, memory, and session-search commands, including path-qualified retrieval helpers
 - unknown future tools unless explicitly allowed
 
 That last bit matters. A compactor that damages retrieved context is worse than no compactor.
+
+Hermes-LCM stays a separate recovery layer. Noisegate does not depend on it and does not replace it:
+`lcm_*` tool results stay exact, `externalized_ref` metadata is left alone, and compacted
+terminal-style output preserves LCM externalized payload placeholders such as
+`[Externalized tool output: ... ref=...]`. The early terminal hook still disables Noisegate raw
+artifacts, so pre-redaction terminal output is not persisted just because an LCM ref appears.
+
+The maintainer checklist lives in [`docs/product-contract.md`](docs/product-contract.md). Product changes should improve context value and safety boundaries, not just make output shorter.
 
 ## Install or update
 
@@ -222,7 +232,13 @@ If capture is truncated, Noisegate adds this marker:
 [noisegate: capture truncated]
 ```
 
-`reduce-json` accepts either a Hermes-like envelope with a `result` string or a direct JSON tool result. Bad JSON fails open and is written back unchanged.
+`reduce-json` accepts a Hermes-like envelope with a `result` string, a nested `result` object, or a direct JSON tool result. Bad JSON fails open and is written back unchanged; non-text result values such as lists and `null` remain valid JSON and pass through unchanged. Mixed payloads can compact both the nested result and direct top-level text fields, but JSON-string results stay parseable and the complete serialized envelope is returned unchanged unless the final form is smaller.
+
+Envelope-shaped payloads belong on the CLI path. The Hermes plugin hook expects the host to pass `tool_name` separately, but blank hook calls may honor an embedded compactable `tool_name` or infer terminal behavior only from terminal-like direct payloads. Explicit host call arguments are authoritative for named hook calls. Across CLI envelopes, protected exact-output intent from usable `command`, `cmd`, `shell_command`, `code`, or quoted `argv` aliases wins over stale noisy aliases; blank aliases do not mask a usable command.
+
+For exit hints, a non-zero `exit`, `exit_code`, `returncode`, or `return_code` wins over a failed/error status, and a failed/error status wins over numeric zero. Existing `noisegate` metadata is never overwritten: transformed direct payloads fall back to `_noisegate`, then add further leading underscores until a free key is available.
+
+`reduce-json` treats the complete serialized envelope as its artifact decision boundary. With artifact mode enabled it first computes a private no-write preview and accepts only a smaller final envelope. When that accepted envelope needs exactly one raw artifact, Noisegate performs the artifact-writing pass and delivers its recovery ID. Envelopes that would need multiple raw artifacts still compact inline but skip artifact storage as one conservative unit, so a later field cannot leave an earlier orphan behind. An outer no-gain decision returns the original payload without creating an orphaned raw artifact or a recovery ID that was never delivered.
 
 Use `--metadata` (or `--debug`) on `reduce`, `reduce-json`, or `wrap` when you need to explain a compaction decision without changing stdout. Diagnostics are written as one JSON object on stderr. `reduce` and `wrap` include the chosen `command_class`, reducer or attempted reducer, unchanged reason code, and chars/lines saved. `reduce-json` reports envelope-level size metrics, includes reducer details when it directly reduces a plain `result` string, exposes that field's sizes under `field_*` keys, and leaves field-level reducer details in the transformed JSON metadata when compaction happens inside nested tool-result JSON.
 
@@ -241,13 +257,17 @@ Install and enable Noisegate for Hermes, then stop dumping terminal walls into c
 Operational rules:
 
 1. Use Noisegate for noisy terminal/tool output, not for exact source material.
-2. Do not compact file reads, patches, diffs, retrieved context, skill docs, memory results, LCM/Hindsight retrieval results, MCP results, or web extraction output.
-3. It is fine to compact indexing/import/API retry spam from terminal commands, including LCM import/doctor logs. Retrieval evidence and expanded raw payloads stay raw.
-4. Do not treat Noisegate as a raw-output archive. Raw artifacts are off by default.
-5. Keep Hermes-LCM optional. Noisegate must work without it.
-6. Do not write raw terminal output into Hindsight.
-7. If compaction fails, preserve the original output.
-8. Before committing, run the quality gate and scan the diff for secrets and personal/private data.
+2. Do not compact file reads, patches, diffs, retrieved context, skill docs, memory results, MCP results, or web extraction output.
+   Treat code-search output (`rg`, `grep`, `ag`, `ack`) as source context and leave it exact.
+   LCM/Hindsight/memory/session retrieval commands also stay exact when invoked through `hermes` or a retrieval helper such as `lcm_expand` or `session_search`.
+   Maintenance output such as `hermes lcm import`, `hermes lcm doctor --reindex`, embedding/index progress, and API retry logs remains compactable.
+3. Keep MCP stdio/HTTP outputs protected by default. Huge listings only become compactable through a future explicit allowlist; exact source, resources, schemas, rows, snapshots, stack traces, discovery metadata, and error/log output stay protected.
+4. For generic `tool_call` wrappers, classify by the real wrapped tool name when one is available; otherwise fail closed and keep the output exact.
+5. Do not treat Noisegate as a raw-output archive. Raw artifacts are off by default, and secret/header-looking output is refused even when artifacts are enabled.
+6. Keep Hermes-LCM optional. Noisegate must work without it.
+7. Do not write raw terminal output into Hindsight.
+8. If compaction fails, preserve the original output.
+9. Before committing, run the quality gate and scan the diff for secrets and personal/private data.
 
 Safe smoke test for a lane or installation:
 
@@ -304,11 +324,17 @@ web_search
 web_extract
 execute_code
 search_files
-git diff / unified diffs
+simple direct terminal file-display commands (`cat`, `sed -n`, `head`, `tail`, `less`, `more`, `nl`, `bat`, `git show REV:path`)
+rg / grep / ag / ack source search
+git diff / unified diffs / V4A patches
 unknown future tools
 ```
 
-Terminal output from retrieval commands such as `hermes lcm expand`, `hermes lcm grep`, `hindsight recall`, `hindsight reflect`, and `session_search` is also passed through unchanged. Terminal maintenance logs such as embedding batches, vector-index builds, API retry/rate-limit loops, and LCM import/doctor progress can still be compacted.
+`execute_code` is protected even when its printed output looks like compactable test, dependency, package-manager, or log spam. That boundary is deliberate: `execute_code` only returns script stdout, and stdout can be source code, JSON, configs, diffs, copied web excerpts, or other exact context. If a script intentionally wants compaction for a known noisy command, use an explicit command-aware route instead, such as the `terminal` tool, `noisegate wrap -- <command>`, or a `reduce-json` envelope labeled as a noisy command/tool. When in doubt, keep `execute_code` raw.
+
+MCP is intentionally boring by default: `mcp_*` and `mcp__*` results are exact evidence, not compaction fodder. This includes GitHub source and file content, resources, database rows, Playwright snapshots, Sentry stack traces, prompt/tool schemas, dynamic tool-discovery metadata, and MCP error/log output. A future explicit allowlist may opt in specific large listing shapes without weakening those exact-evidence defaults.
+
+When a host emits a generic `tool_call` wrapper, Noisegate uses the wrapped tool name when the wrapper supplies one. A wrapper around `terminal` follows terminal compaction behavior; a wrapper around `mcp_github_list_issues` remains protected. Missing or unknown wrapped names fail closed and stay exact. Duplicate or conflicting identities, detached argument maps, conflicting command hints, malformed JSON, cyclic/shared structures, and over-budget nesting also stay exact.
 
 Bypass controls:
 
@@ -330,7 +356,7 @@ NOISEGATE_ARTIFACT_SIZE_CAP=1000000  # max stored raw-output bytes per artifact
 
 `noisegate doctor` reports ignored or fallback environment values, so typos like `NOISEGATE_ARTIFACTS=maybe` do not fail silently.
 
-Hermes calls `transform_terminal_output` before its built-in terminal redaction pass. Noisegate still compacts inline terminal output there, but it disables raw artifact storage on that early hook so pre-redaction output is not persisted. Artifact planning also refuses obvious secret-bearing output, so accidental API-key/token/password material is not written into the artifact store.
+Hermes calls `transform_terminal_output` before its built-in terminal redaction pass. Noisegate still compacts inline terminal output there, but it disables raw artifact storage on that early hook so pre-redaction output is not persisted.
 
 ## Artifacts
 
@@ -343,6 +369,7 @@ When artifact mode is enabled, Noisegate writes the original output to a private
 - default size cap of 1,000,000 bytes
 - content-addressed IDs shaped like `ng_<sha256-prefix>`
 - path containment and symlink traversal checks
+- refusal of secret-, credential-, cookie-, authorization-header-, and API-key-looking raw output (including spaced labels such as `API Key:`), scanning the complete payload before storage
 
 Retrieve an artifact:
 

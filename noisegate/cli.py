@@ -6,15 +6,48 @@ import json
 import os
 import shlex
 import sys
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from ._version import __version__
 from .artifacts import ArtifactError, ArtifactStore
-from .engine import NoisegateOptions, _is_compactable_tool_name, env_diagnostics, reduce_text
+from .engine import (
+    _SOURCE_ALIGNMENT_WORK_BUDGET,
+    NoisegateOptions,
+    _is_compactable_tool_name,
+    _raise_if_source_alignment_work_exhausted,
+    _reduce_text_in_operation,
+    _source_alignment_work_operation,
+    _SourceAlignmentWorkExhausted,
+    env_diagnostics,
+    reduce_text,
+)
 from .installer import DEFAULT_PACKAGE_SPEC, InstallHermesError, install_hermes
-from .plugin import transform_tool_result
+from .json_utils import DuplicateJSONKeyError, strict_json_loads
+from .plugin import (
+    TERMINAL_TOOL_NAMES,
+    WRAPPER_TOOL_NAMES,
+    _artifact_preview_plan,
+    _artifact_preview_plan_matches_serialized_output,
+    _artifact_preview_plan_notice_present_in_text,
+    _artifact_preview_plan_with_owner_prefix,
+    _ArtifactNoticeOwnerStep,
+    _ArtifactPreviewPlan,
+    _command_sources_from_payload,
+    _commands_from_source,
+    _extract_exit_code,
+    _nested_json_text_requires_exact,
+    _resolve_wrapped_call,
+    _select_command,
+    _store_artifact_preview_plan,
+    _tool_names_from_payload,
+    _transform_tool_result_in_operation,
+)
+from .plugin import (
+    _payload_tool_name as _strict_payload_tool_name,
+)
 from .wrap import DEFAULT_MAX_CAPTURE_BYTES, WrappedCommandInterrupted, run_wrapped_command
 
 
@@ -126,8 +159,17 @@ def cmd_reduce(args: argparse.Namespace) -> int:
 def cmd_reduce_json(args: argparse.Namespace) -> int:
     raw = sys.stdin.read()
     try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
+        with _source_alignment_work_operation():
+            return _cmd_reduce_json_with_budget(args, raw)
+    except Exception:
+        sys.stdout.write(raw)
+        return 0
+
+
+def _cmd_reduce_json_with_budget(args: argparse.Namespace, raw: str) -> int:
+    try:
+        parsed = strict_json_loads(raw)
+    except (json.JSONDecodeError, RecursionError, ValueError):
         sys.stdout.write(raw)
         _maybe_print_metadata(
             args,
@@ -138,12 +180,64 @@ def cmd_reduce_json(args: argparse.Namespace) -> int:
     options = _options_from_args(args)
     if isinstance(parsed, dict) and isinstance(parsed.get("noisegate"), dict):
         options = options.with_mapping(parsed["noisegate"])
-
     metadata: dict[str, Any] = {}
     try:
-        output = _reduce_json_value(parsed, raw, options, metadata_out=metadata)
+        if options.artifact_enabled:
+            preview_metadata: dict[str, Any] = {}
+            preview_plans: list[_ArtifactPreviewPlan] = []
+            preview = _reduce_json_value(
+                parsed,
+                raw,
+                options,
+                metadata_out=preview_metadata,
+                defer_artifact_store=True,
+                artifact_plans_out=preview_plans,
+            )
+            _raise_if_source_alignment_work_exhausted()
+            if preview == raw:
+                output = raw
+                metadata = preview_metadata
+                _discard_preview_artifact_plans(metadata)
+            elif not all(
+                _artifact_preview_plan_matches_serialized_output(plan, preview)
+                for plan in preview_plans
+            ):
+                output = _reduce_json_value(
+                    parsed,
+                    raw,
+                    options.with_mapping({"artifacts": False}),
+                    metadata_out=metadata,
+                )
+            elif len(preview_plans) == 1:
+                _raise_if_source_alignment_work_exhausted()
+                if _store_artifact_preview_plan(preview_plans[0], options):
+                    output = preview
+                    metadata = preview_metadata
+                else:
+                    output = raw
+                    metadata = preview_metadata
+                    _discard_preview_artifact_plans(
+                        metadata,
+                        reason="artifact_store_failed",
+                    )
+            elif len(preview_plans) > 1:
+                output = _reduce_json_value(
+                    parsed,
+                    raw,
+                    options.with_mapping({"artifacts": False}),
+                    metadata_out=metadata,
+                )
+            else:
+                output = preview
+                metadata = preview_metadata
+        else:
+            output = _reduce_json_value(parsed, raw, options, metadata_out=metadata)
+        _raise_if_source_alignment_work_exhausted()
+    except _SourceAlignmentWorkExhausted:
+        raise
     except Exception:
         output = raw
+        metadata = {}
     sys.stdout.write(output)
     if metadata:
         metadata = _json_metadata_with_envelope_metrics(metadata, raw, output, options)
@@ -306,76 +400,780 @@ def cmd_artifacts_verify(args: argparse.Namespace) -> int:
     return 2 if failed else 0
 
 
+def _discard_preview_artifact_plans(
+    value: Any,
+    *,
+    reason: str = "outer_no_gain",
+) -> None:
+    if isinstance(value, dict):
+        artifact = value.get("artifact")
+        if isinstance(artifact, dict) and artifact.get("stored") is True:
+            replacement: dict[str, Any] = {
+                "stored": False,
+                "reason": reason,
+            }
+            size_bytes = artifact.get("size_bytes")
+            if isinstance(size_bytes, int) and not isinstance(size_bytes, bool):
+                replacement["size_bytes"] = size_bytes
+            value["artifact"] = replacement
+        for child in value.values():
+            _discard_preview_artifact_plans(child, reason=reason)
+    elif isinstance(value, list):
+        for child in value:
+            _discard_preview_artifact_plans(child, reason=reason)
+
+
 def _reduce_json_value(
     parsed: Any,
     raw: str,
     options: NoisegateOptions,
     *,
     metadata_out: dict[str, Any] | None = None,
+    defer_artifact_store: bool = False,
+    artifact_plans_out: list[_ArtifactPreviewPlan] | None = None,
 ) -> str:
-    hook_kwargs = _options_to_hook_kwargs(options)
-    if isinstance(parsed, dict) and isinstance(parsed.get("result"), str):
-        tool_name = str(
-            parsed.get("tool_name")
-            or parsed.get("toolName")
-            or parsed.get("tool")
-            or ""
+    local_metadata: dict[str, Any] | None = {} if metadata_out is not None else None
+    local_plans: list[_ArtifactPreviewPlan] | None = (
+        [] if artifact_plans_out is not None else None
+    )
+
+    def reduce_value() -> str:
+        output = _reduce_json_value_with_budget(
+            parsed,
+            raw,
+            options,
+            metadata_out=local_metadata,
+            defer_artifact_store=defer_artifact_store,
+            artifact_plans_out=local_plans,
         )
-        call_args = parsed.get("args") or parsed.get("arguments") or {}
-        if not isinstance(call_args, dict):
-            call_args = {}
-        result_text = parsed["result"]
-        transformed = transform_tool_result(
-            result_text,
-            tool_name=tool_name,
-            args=call_args,
-            **hook_kwargs,
-        )
-        if (
-            transformed is None
-            and _is_compactable_tool_name(tool_name)
-            and not _is_json_text(result_text)
-        ):
-            command = str(call_args.get("command") or parsed.get("command") or "")
-            reduced = reduce_text(
-                result_text,
-                command=command,
-                tool_name=tool_name,
-                source="reduce-json",
-                options=options,
-            )
-            if metadata_out is not None:
-                metadata_out.update(_debug_metadata(reduced.metadata, result_text, reduced.text))
-            transformed = reduced.text if reduced.changed else None
-        if transformed is not None:
-            parsed = dict(parsed)
-            parsed["result"] = transformed
-            return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+        _raise_if_source_alignment_work_exhausted()
+        if metadata_out is not None and local_metadata:
+            metadata_out.update(local_metadata)
+        if artifact_plans_out is not None and local_plans:
+            artifact_plans_out.extend(local_plans)
+        return output
+
+    if _SOURCE_ALIGNMENT_WORK_BUDGET.get() is not None:
+        return reduce_value()
+    try:
+        with _source_alignment_work_operation():
+            return reduce_value()
+    except Exception:
         return raw
 
-    tool_name = ""
-    if isinstance(parsed, dict):
-        tool_name = str(
-            parsed.get("tool_name")
-            or parsed.get("toolName")
-            or parsed.get("tool")
-            or ""
+
+def _reduce_json_value_with_budget(
+    parsed: Any,
+    raw: str,
+    options: NoisegateOptions,
+    *,
+    metadata_out: dict[str, Any] | None = None,
+    defer_artifact_store: bool = False,
+    artifact_plans_out: list[_ArtifactPreviewPlan] | None = None,
+) -> str:
+    hook_kwargs = _options_to_hook_kwargs(options)
+
+    def tool_transform(
+        result: str,
+        *,
+        artifact_plans_out: list[_ArtifactPreviewPlan] | None = None,
+        **kwargs: Any,
+    ) -> str | None:
+        return _transform_tool_result_in_operation(
+            result,
+            defer_artifact_store=defer_artifact_store,
+            artifact_plans_out=artifact_plans_out,
+            **kwargs,
         )
-        if not tool_name and _looks_terminal_payload(parsed):
-            tool_name = "terminal"
-    transformed = transform_tool_result(raw, tool_name=tool_name, **hook_kwargs)
-    return transformed if transformed is not None else raw
+
+    call_args: dict[str, Any] = _envelope_call_args(parsed) if isinstance(parsed, dict) else {}
+    tool_name = ""
+    explicit_tool_name = ""
+    resolved_wrapper_identity = False
+    if isinstance(parsed, dict):
+        explicit_tool_name = _envelope_tool_name(parsed)
+        wrapper_alias = parsed.get("name")
+        if isinstance(wrapper_alias, str) and wrapper_alias.strip():
+            wrapper_alias = wrapper_alias.strip()
+            if (
+                explicit_tool_name in WRAPPER_TOOL_NAMES
+                or wrapper_alias in WRAPPER_TOOL_NAMES
+            ):
+                if explicit_tool_name and wrapper_alias != explicit_tool_name:
+                    return raw
+                explicit_tool_name = wrapper_alias
+            elif not explicit_tool_name:
+                return raw
+        elif "name" in parsed and not explicit_tool_name:
+            return raw
+        if explicit_tool_name in WRAPPER_TOOL_NAMES:
+            resolved_wrapper = _resolve_wrapped_call(parsed)
+            if resolved_wrapper is None:
+                return raw
+            resolved_wrapper_identity = True
+            tool_name = resolved_wrapper.tool_name
+            call_args = dict(resolved_wrapper.call_args)
+            wrapper_tool_names = _tool_names_from_payload(
+                call_args,
+                root_name_is_wrapper_owned=True,
+            )
+            if len(wrapper_tool_names) > 1 or (
+                wrapper_tool_names and tool_name not in wrapper_tool_names
+            ):
+                return raw
+            wrapper_commands = {
+                command
+                for source in _command_sources_from_payload(call_args)
+                for command in _commands_from_source(source)
+            }
+            if len(wrapper_commands) > 1:
+                return raw
+            if wrapper_commands:
+                call_args["command"] = next(iter(wrapper_commands))
+        else:
+            tool_name = explicit_tool_name or _payload_tool_name(parsed, call_args)
+        if tool_name and not _is_compactable_tool_name(tool_name):
+            return raw
+    if isinstance(parsed, dict) and "result" in parsed:
+        result_value = parsed["result"]
+        json_encoded_result = False
+        if isinstance(result_value, str):
+            try:
+                json_encoded_result = _nested_json_text_requires_exact(result_value)
+            except (DuplicateJSONKeyError, json.JSONDecodeError, ValueError, RecursionError):
+                return raw
+        result_mapping = _result_mapping(result_value)
+        result_has_explicit_identity = bool(
+            isinstance(result_mapping, dict) and _envelope_tool_name(result_mapping)
+        )
+        allow_result_root_label = bool(
+            explicit_tool_name
+            or resolved_wrapper_identity
+            or result_has_explicit_identity
+        )
+        if (
+            isinstance(result_mapping, dict)
+            and "name" in result_mapping
+            and not allow_result_root_label
+        ):
+            return raw
+        nested_tool_name = _embedded_result_tool_name(
+            result_value,
+            allow_root_label=allow_result_root_label,
+        )
+        preserve_wrapped_json_result = (
+            resolved_wrapper_identity
+            and json_encoded_result
+            and tool_name not in TERMINAL_TOOL_NAMES
+        )
+        if (
+            nested_tool_name
+            and tool_name
+            and nested_tool_name != tool_name
+            and not preserve_wrapped_json_result
+        ):
+            return raw
+        nested_transform_tool_name = tool_name
+        transformed: str | None = None
+        injected_exit_keys: tuple[str, ...] = ()
+        replace_with_json_value = False
+        result_plans: list[_ArtifactPreviewPlan] = []
+        local_result_plans: list[_ArtifactPreviewPlan] = []
+        result_metadata: dict[str, Any] = {}
+
+        if isinstance(result_value, str) and not preserve_wrapped_json_result:
+            result_input, injected_exit_keys = _result_transform_input(result_value, parsed)
+            result_call_args = _merge_wrapper_and_result_call_args(
+                call_args,
+                _result_call_args(result_value),
+            )
+            if result_call_args is None:
+                return raw
+            result_exit_code = _result_exit_code(result_value, parsed, tool_name)
+            selected_command = _select_command(
+                result_value,
+                result_call_args,
+                *_result_command_sources(result_value, parsed),
+                exit_code=result_exit_code,
+            )
+            if selected_command:
+                result_call_args = {**result_call_args, "command": selected_command}
+            transformed = tool_transform(
+                result_input,
+                tool_name=nested_transform_tool_name,
+                args=result_call_args,
+                noisegate_exit_code=result_exit_code,
+                artifact_plans_out=local_result_plans,
+                **cast(Any, hook_kwargs),
+            )
+            if transformed is not None and injected_exit_keys:
+                transformed = _remove_injected_exit_hints_from_json_text(
+                    transformed,
+                    injected_exit_keys,
+                )
+            if transformed is not None:
+                result_owner = (
+                    _ArtifactNoticeOwnerStep("result", parse_json=True),
+                )
+                result_plans.extend(
+                    _artifact_preview_plan_with_owner_prefix(plan, result_owner)
+                    for plan in local_result_plans
+                )
+            if (
+                transformed is None
+                and _is_compactable_tool_name(tool_name)
+                and not _is_json_text(result_value)
+            ):
+                command = selected_command or _envelope_command(call_args)
+                reduced = _reduce_text_in_operation(
+                    result_value,
+                    command=command,
+                    tool_name=tool_name,
+                    source="reduce-json",
+                    exit_code=result_exit_code,
+                    options=options,
+                    defer_artifact_store=defer_artifact_store,
+                )
+                result_metadata.update(
+                    _debug_metadata(reduced.metadata, result_value, reduced.text)
+                )
+                if reduced.changed:
+                    transformed = reduced.text
+                    if defer_artifact_store:
+                        artifact = reduced.metadata.get("artifact")
+                        if isinstance(artifact, dict) and artifact.get("stored") is True:
+                            plan = _artifact_preview_plan(
+                                result_value,
+                                reduced.metadata,
+                                artifact_dir=options.artifact_dir,
+                                owner_path=(_ArtifactNoticeOwnerStep("result"),),
+                            )
+                            if plan is None or not _artifact_preview_plan_notice_present_in_text(
+                                plan,
+                                reduced.text,
+                            ):
+                                inline = _reduce_text_in_operation(
+                                    result_value,
+                                    command=command,
+                                    tool_name=tool_name,
+                                    source="reduce-json",
+                                    exit_code=result_exit_code,
+                                    options=options.with_mapping({"artifacts": False}),
+                                    defer_artifact_store=defer_artifact_store,
+                                )
+                                result_metadata.clear()
+                                result_metadata.update(
+                                    _debug_metadata(
+                                        inline.metadata,
+                                        result_value,
+                                        inline.text,
+                                    )
+                                )
+                                transformed = inline.text if inline.changed else None
+                            else:
+                                result_plans.append(plan)
+        elif isinstance(result_value, dict):
+            nested_input, injected_exit_keys = _result_transform_input(result_value, parsed)
+            result_call_args = _merge_wrapper_and_result_call_args(
+                call_args,
+                _result_call_args(result_value),
+            )
+            if result_call_args is None:
+                return raw
+            result_exit_code = _result_exit_code(result_value, parsed, tool_name)
+            selected_command = _select_command(
+                nested_input,
+                result_call_args,
+                *_result_command_sources(result_value, parsed),
+                exit_code=result_exit_code,
+            )
+            if selected_command:
+                result_call_args = {**result_call_args, "command": selected_command}
+            transformed = tool_transform(
+                nested_input,
+                tool_name=nested_transform_tool_name,
+                args=result_call_args,
+                noisegate_exit_code=result_exit_code,
+                artifact_plans_out=local_result_plans,
+                **cast(Any, hook_kwargs),
+            )
+            replace_with_json_value = True
+            if transformed is not None:
+                result_owner = (_ArtifactNoticeOwnerStep("result"),)
+                result_plans.extend(
+                    _artifact_preview_plan_with_owner_prefix(plan, result_owner)
+                    for plan in local_result_plans
+                )
+
+        if transformed is not None:
+            parsed = dict(parsed)
+            if replace_with_json_value:
+                try:
+                    transformed_value = strict_json_loads(transformed)
+                except json.JSONDecodeError:
+                    return raw
+                if isinstance(transformed_value, dict):
+                    _remove_injected_exit_hints(transformed_value, injected_exit_keys)
+                parsed["result"] = transformed_value
+            else:
+                parsed["result"] = transformed
+            candidate = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+            if _has_direct_text_payload(parsed):
+                direct_plans: list[_ArtifactPreviewPlan] = []
+                direct_transformed = _transform_direct_payload_preserving_json_result(
+                    parsed,
+                    tool_name=tool_name,
+                    call_args=call_args,
+                    normalize_wrapper_identity=resolved_wrapper_identity,
+                    hook_kwargs=hook_kwargs,
+                    tool_transform=tool_transform,
+                    artifact_plans_out=direct_plans,
+                )
+                if direct_transformed is not None and len(direct_transformed) < len(raw):
+                    accepted_plans = [*result_plans, *direct_plans]
+                    if not all(
+                        _artifact_preview_plan_matches_serialized_output(
+                            plan,
+                            direct_transformed,
+                        )
+                        for plan in accepted_plans
+                    ):
+                        return raw
+                    if artifact_plans_out is not None:
+                        artifact_plans_out.extend(accepted_plans)
+                    return direct_transformed
+            if len(candidate) >= len(raw):
+                if metadata_out is not None:
+                    metadata_out.update(result_metadata)
+                return raw
+            if not all(
+                _artifact_preview_plan_matches_serialized_output(plan, candidate)
+                for plan in result_plans
+            ):
+                return raw
+            if artifact_plans_out is not None:
+                artifact_plans_out.extend(result_plans)
+            if metadata_out is not None:
+                metadata_out.update(result_metadata)
+            return candidate
+        if not _has_direct_text_payload(parsed):
+            if metadata_out is not None:
+                metadata_out.update(result_metadata)
+            return raw
+
+    direct_plans: list[_ArtifactPreviewPlan] = []
+    if isinstance(parsed, dict):
+        transformed = _transform_direct_payload_preserving_json_result(
+            parsed,
+            tool_name=tool_name,
+            call_args=call_args,
+            normalize_wrapper_identity=resolved_wrapper_identity,
+            hook_kwargs=hook_kwargs,
+            tool_transform=tool_transform,
+            artifact_plans_out=direct_plans,
+        )
+    else:
+        transformed = tool_transform(
+            raw,
+            tool_name=tool_name,
+            args=call_args,
+            artifact_plans_out=direct_plans,
+            **cast(Any, hook_kwargs),
+        )
+    if transformed is None or len(transformed) >= len(raw):
+        return raw
+    if not all(
+        _artifact_preview_plan_matches_serialized_output(plan, transformed)
+        for plan in direct_plans
+    ):
+        return raw
+    if artifact_plans_out is not None:
+        artifact_plans_out.extend(direct_plans)
+    return transformed
 
 
-def _looks_terminal_payload(payload: dict[Any, Any]) -> bool:
-    return any(key in payload for key in ("stdout", "stderr", "output")) and any(
-        key in payload for key in ("command", "exit", "exit_code", "status")
+def _transform_direct_payload_preserving_json_result(
+    payload: dict[str, Any],
+    *,
+    tool_name: str,
+    call_args: dict[str, Any],
+    normalize_wrapper_identity: bool,
+    hook_kwargs: dict[str, object],
+    tool_transform: Callable[..., str | None],
+    artifact_plans_out: list[_ArtifactPreviewPlan] | None = None,
+) -> str | None:
+    direct_payload = dict(payload)
+    identity_fields: dict[str, Any] = {}
+    if normalize_wrapper_identity:
+        identity_keys = ("tool_name", "toolName", "tool", "name")
+        identity_fields = {
+            key: direct_payload[key]
+            for key in identity_keys
+            if key in direct_payload
+        }
+        for key in identity_keys:
+            direct_payload.pop(key, None)
+        direct_payload["tool_name"] = tool_name
+
+    def restore_wrapper_identity(transformed_payload: dict[str, Any]) -> None:
+        if not normalize_wrapper_identity:
+            return
+        for key in ("tool_name", "toolName", "tool", "name"):
+            transformed_payload.pop(key, None)
+        transformed_payload.update(identity_fields)
+
+    result_value = payload.get("result")
+    if isinstance(result_value, str) and _is_json_text(result_value):
+        direct_payload.pop("result", None)
+        if not _has_direct_text_payload(direct_payload):
+            return None
+        direct_raw = json.dumps(direct_payload, ensure_ascii=False, separators=(",", ":"))
+        transformed = tool_transform(
+            direct_raw,
+            tool_name=tool_name,
+            args=call_args,
+            artifact_plans_out=artifact_plans_out,
+            **cast(Any, hook_kwargs),
+        )
+        if transformed is None:
+            return None
+        try:
+            transformed_payload = strict_json_loads(transformed)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(transformed_payload, dict):
+            return None
+        transformed_payload["result"] = result_value
+        restore_wrapper_identity(transformed_payload)
+        return json.dumps(transformed_payload, ensure_ascii=False, separators=(",", ":"))
+
+    direct_raw = json.dumps(direct_payload, ensure_ascii=False, separators=(",", ":"))
+    transformed = tool_transform(
+        direct_raw,
+        tool_name=tool_name,
+        args=call_args,
+        artifact_plans_out=artifact_plans_out,
+        **cast(Any, hook_kwargs),
+    )
+    if transformed is None or not normalize_wrapper_identity:
+        return transformed
+    try:
+        transformed_payload = strict_json_loads(transformed)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(transformed_payload, dict):
+        return None
+    restore_wrapper_identity(transformed_payload)
+    return json.dumps(transformed_payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _envelope_tool_name(payload: dict[Any, Any]) -> str:
+    return _strict_payload_tool_name(payload)
+
+
+def _payload_tool_name(
+    payload: dict[Any, Any],
+    call_args: dict[str, Any] | None = None,
+) -> str:
+    tool_name = _envelope_tool_name(payload)
+    if not tool_name and (
+        _looks_terminal_payload(payload, call_args)
+        or _looks_terminal_result_payload(payload, call_args)
+    ):
+        return "terminal"
+    return tool_name
+
+
+_EXIT_HINT_KEYS = ("exit", "exit_code", "returncode", "return_code", "status")
+
+
+def _envelope_exit_hint_keys(envelope: dict[Any, Any]) -> tuple[str, ...]:
+    numeric_keys = []
+    for key in ("exit", "exit_code", "returncode", "return_code"):
+        value = envelope.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            numeric_keys.append(key)
+    nonzero_numeric_keys = tuple(key for key in numeric_keys if envelope.get(key) != 0)
+    if nonzero_numeric_keys:
+        return nonzero_numeric_keys
+    status = envelope.get("status")
+    if (
+        isinstance(status, str)
+        and status.lower() in {"failed", "failure", "error", "errored"}
+    ):
+        return ("status",)
+    return tuple(numeric_keys)
+
+
+def _result_transform_input(
+    result_value: Any,
+    envelope: dict[Any, Any],
+) -> tuple[str, tuple[str, ...]]:
+    if isinstance(result_value, dict):
+        payload = dict(result_value)
+    elif isinstance(result_value, str):
+        try:
+            nested = strict_json_loads(result_value)
+        except json.JSONDecodeError:
+            return result_value, ()
+        if not isinstance(nested, dict):
+            return result_value, ()
+        payload = dict(nested)
+    else:
+        return json.dumps(result_value, ensure_ascii=False, separators=(",", ":")), ()
+
+    if any(key in payload for key in _EXIT_HINT_KEYS):
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")), ()
+
+    injected_keys = []
+    for key in _envelope_exit_hint_keys(envelope):
+        payload[key] = envelope[key]
+        injected_keys.append(key)
+    return (
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        tuple(injected_keys),
+    )
+
+
+def _remove_injected_exit_hints_from_json_text(text: str, injected_keys: tuple[str, ...]) -> str:
+    if not injected_keys:
+        return text
+    try:
+        payload = strict_json_loads(text)
+    except json.JSONDecodeError:
+        return text
+    if not isinstance(payload, dict):
+        return text
+    _remove_injected_exit_hints(payload, injected_keys)
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _remove_injected_exit_hints(payload: dict[Any, Any], injected_keys: tuple[str, ...]) -> None:
+    for key in injected_keys:
+        payload.pop(key, None)
+
+
+def _embedded_result_tool_name(result_value: Any, *, allow_root_label: bool) -> str:
+    nested = _result_mapping(result_value)
+    if not isinstance(nested, dict):
+        return ""
+    root_has_explicit_identity = bool(_envelope_tool_name(nested))
+    names = _tool_names_from_payload(
+        nested,
+        root_name_is_wrapper_owned=not (
+            allow_root_label or root_has_explicit_identity
+        ),
+    )
+    if len(names) > 1:
+        raise ValueError("ambiguous embedded result tool identity")
+    return next(iter(names), "")
+
+
+def _result_call_args(result_value: Any) -> dict[str, Any]:
+    nested = _result_mapping(result_value)
+    if not isinstance(nested, dict):
+        return {}
+    commands = {
+        command
+        for source in _command_sources_from_payload(nested)
+        for command in _commands_from_source(source)
+    }
+    if len(commands) > 1:
+        raise ValueError("conflicting result command ownership")
+    return {"command": next(iter(commands))} if commands else {}
+
+
+def _merge_wrapper_and_result_call_args(
+    wrapper_args: dict[str, Any],
+    result_args: dict[str, Any],
+) -> dict[str, Any] | None:
+    commands = {
+        command
+        for source in (wrapper_args, result_args)
+        for command in _commands_from_source(source)
+    }
+    if len(commands) > 1:
+        return None
+    merged = dict(result_args)
+    merged.update(wrapper_args)
+    return merged
+
+
+def _result_mapping(result_value: Any) -> dict[Any, Any] | None:
+    if isinstance(result_value, dict):
+        return result_value
+    if isinstance(result_value, str):
+        try:
+            nested = strict_json_loads(result_value)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(nested, dict):
+            return nested
+    return None
+
+
+def _result_command_sources(
+    result_value: Any,
+    envelope: dict[Any, Any],
+) -> tuple[Mapping[str, Any], ...]:
+    sources: list[Mapping[str, Any]] = []
+    nested = _result_mapping(result_value)
+    for payload in (nested, envelope):
+        if isinstance(payload, dict):
+            sources.extend(_command_sources_from_payload(payload))
+    return tuple(sources)
+
+
+def _result_exit_code(
+    result_value: Any,
+    envelope: dict[Any, Any],
+    tool_name: str,
+) -> int | None:
+    nested = _result_mapping(result_value)
+    if nested is not None:
+        nested_tool_name = _envelope_tool_name(nested) or tool_name
+        exit_code = _preferred_exit_code(nested, nested_tool_name)
+        if exit_code is not None:
+            return exit_code
+    return _preferred_exit_code(envelope, tool_name)
+
+
+def _preferred_exit_code(payload: dict[Any, Any], tool_name: str) -> int | None:
+    keys = _envelope_exit_hint_keys(payload)
+    if not keys:
+        return None
+    key = keys[0]
+    if key == "status":
+        return 1
+    value = payload.get(key)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return _extract_exit_code(payload, tool_name)
+
+
+def _looks_terminal_result_payload(
+    payload: dict[Any, Any],
+    call_args: dict[str, Any] | None = None,
+) -> bool:
+    result = payload.get("result")
+    has_command = _has_command_hint(payload) or _has_command_hint(call_args or {})
+    if isinstance(result, dict):
+        embedded_tool_name = _envelope_tool_name(result)
+        if embedded_tool_name and not _is_compactable_tool_name(embedded_tool_name):
+            return False
+        return _has_direct_text_payload(result) and (
+            has_command
+            or _has_exit_hint(payload)
+            or _has_command_hint(result)
+            or _has_exit_hint(result)
+        )
+    if isinstance(result, str):
+        if (has_command or _has_exit_hint(payload)) and not _is_json_text(result):
+            return True
+        try:
+            nested = strict_json_loads(result)
+        except json.JSONDecodeError:
+            return False
+        return isinstance(nested, dict) and _has_direct_text_payload(nested) and (
+            not (
+                (embedded_tool_name := _envelope_tool_name(nested))
+                and not _is_compactable_tool_name(embedded_tool_name)
+            )
+        ) and (
+            has_command or _has_exit_hint(payload) or _has_exit_hint(nested)
+        )
+    return False
+
+
+def _has_command_hint(payload: dict[Any, Any]) -> bool:
+    for key in ("command", "cmd", "shell_command", "code"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    return _usable_argv(payload.get("argv"))
+
+
+def _usable_argv(argv: object) -> bool:
+    return (
+        isinstance(argv, list)
+        and bool(argv)
+        and all(isinstance(item, str) for item in argv)
+        and bool(argv[0].strip())
+    )
+
+
+def _has_exit_hint(payload: dict[Any, Any]) -> bool:
+    for key in ("exit", "exit_code", "returncode", "return_code"):
+        value = payload.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return True
+    return False
+
+
+def _envelope_call_args(payload: dict[Any, Any]) -> dict[str, Any]:
+    call_args: dict[str, Any] = {}
+    for key in ("args", "arguments"):
+        candidate = payload.get(key)
+        if isinstance(candidate, dict):
+            _merge_call_arg_hints(call_args, candidate)
+    _merge_call_arg_hints(call_args, payload)
+    return call_args
+
+
+def _merge_call_arg_hints(target: dict[str, Any], source: dict[Any, Any]) -> None:
+    if "action" in source:
+        action = source.get("action")
+        if "action" not in target:
+            target["action"] = action
+        elif target["action"] != action:
+            target["action"] = (target["action"], action)
+    if _has_command_hint(target):
+        return
+    for key in ("command", "cmd", "shell_command", "code"):
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            target[key] = value
+    argv = source.get("argv")
+    if _usable_argv(argv):
+        target["argv"] = argv
+
+
+def _envelope_command(values: dict[str, Any]) -> str:
+    for key in ("command", "cmd", "shell_command", "code"):
+        value = values.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    argv = values.get("argv")
+    if _usable_argv(argv):
+        return shlex.join(cast(list[str], argv))
+    return ""
+
+
+def _has_direct_text_payload(payload: dict[Any, Any]) -> bool:
+    return any(
+        isinstance(payload.get(key), str)
+        for key in ("stdout", "stderr", "output", "logs", "text", "content", "message")
+    )
+
+
+def _looks_terminal_payload(
+    payload: dict[Any, Any],
+    call_args: dict[str, Any] | None = None,
+) -> bool:
+    return any(key in payload for key in ("stdout", "stderr", "output")) and (
+        _has_command_hint(payload)
+        or _has_command_hint(call_args or {})
+        or _has_exit_hint(payload)
     )
 
 
 def _is_json_text(value: str) -> bool:
     try:
-        json.loads(value)
+        strict_json_loads(value)
     except json.JSONDecodeError:
         return False
     return True
