@@ -34,7 +34,7 @@ from .engine import (
     _store_artifact,
     classify_command,
 )
-from .json_utils import DuplicateJSONKeyError, strict_json_loads
+from .json_utils import DuplicateJSONKeyError, is_utf8_encodable, strict_json_loads
 
 HookCallback: TypeAlias = Callable[..., str | None]
 
@@ -227,6 +227,8 @@ def _transform_tool_result(
             **kwargs,
         )
         _raise_if_source_alignment_work_exhausted()
+        if transformed is not None and not is_utf8_encodable(transformed):
+            return None
         if transformed is not None and artifact_plans_out is not None and local_plans:
             artifact_plans_out.extend(local_plans)
         return transformed

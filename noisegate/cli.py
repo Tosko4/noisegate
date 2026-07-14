@@ -25,11 +25,12 @@ from .engine import (
     reduce_text,
 )
 from .installer import DEFAULT_PACKAGE_SPEC, InstallHermesError, install_hermes
-from .json_utils import DuplicateJSONKeyError, strict_json_loads
+from .json_utils import DuplicateJSONKeyError, is_utf8_encodable, strict_json_loads
 from .plugin import (
     FIELD_AWARE_WRITE_TOOL_NAMES,
     TERMINAL_TOOL_NAMES,
     WRAPPER_TOOL_NAMES,
+    WRITE_DIAGNOSTIC_FIELDS,
     _artifact_preview_plan,
     _artifact_preview_plan_matches_serialized_output,
     _artifact_preview_plan_notice_present_in_text,
@@ -448,6 +449,8 @@ def _reduce_json_value(
             artifact_plans_out=local_plans,
         )
         _raise_if_source_alignment_work_exhausted()
+        if output != raw and not is_utf8_encodable(output):
+            return raw
         if metadata_out is not None and local_metadata:
             metadata_out.update(local_metadata)
         if artifact_plans_out is not None and local_plans:
@@ -548,6 +551,11 @@ def _reduce_json_value_with_budget(
             except (DuplicateJSONKeyError, json.JSONDecodeError, ValueError, RecursionError):
                 return raw
         result_mapping = _result_mapping(result_value)
+        nested_write_diagnostic_scope = bool(
+            tool_name in FIELD_AWARE_WRITE_TOOL_NAMES
+            and isinstance(result_mapping, dict)
+            and any(field in result_mapping for field in WRITE_DIAGNOSTIC_FIELDS)
+        )
         result_has_explicit_identity = bool(
             isinstance(result_mapping, dict) and _envelope_tool_name(result_mapping)
         )
@@ -767,6 +775,8 @@ def _reduce_json_value_with_budget(
             if metadata_out is not None:
                 metadata_out.update(result_metadata)
             return candidate
+        if nested_write_diagnostic_scope:
+            return raw
         if not _has_direct_text_payload(parsed):
             if metadata_out is not None:
                 metadata_out.update(result_metadata)

@@ -8,6 +8,14 @@ class DuplicateJSONKeyError(json.JSONDecodeError):
     pass
 
 
+def is_utf8_encodable(value: str) -> bool:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def strict_json_loads(value: str) -> Any:
     """Decode JSON while refusing duplicate object keys."""
 

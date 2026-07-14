@@ -319,7 +319,8 @@ Every other value in those results remains exact, including `content`, `source`,
 `diff`, `patch`, `result`, `output`, `text`, generated file content, unrelated
 metadata, and future unknown fields. Direct string results, short/no-gain
 diagnostics, malformed or duplicate-key JSON, nested JSON diagnostic strings,
-unsupported diagnostic value types, and ambiguous tool identities stay unchanged.
+unsupported diagnostic value types, non-finite parsed numbers, non-UTF-8-encodable
+candidates, and ambiguous tool identities stay unchanged.
 This exception is inline-only: diagnostic fields never create raw
 artifacts, even when artifact mode is enabled. Here, exact means the parsed field
 value: when a sibling diagnostic compacts, Noisegate reserializes the outer JSON

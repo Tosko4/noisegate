@@ -711,6 +711,88 @@ def test_write_diagnostics_prioritize_real_tool_formats_over_generic_errors() ->
         assert "ERROR: wrapper noise 000" not in payload[field], case
 
 
+def test_write_diagnostics_keep_scoped_priority_in_tight_character_fallback() -> None:
+    location = "src/service.py:42:17: error: Undefined name `value` [name-defined]"
+    frame = "   42 |     result = value + 1"
+    caret = "      |              ^^^^^"
+    diagnostic = "\n".join(
+        [
+            "ERROR: wrapper failed" + (" x" * 45),
+            *(f"checking module {index:02d}" for index in range(25)),
+            location,
+            frame,
+            caret,
+        ]
+    )
+    complete_excerpt = "\n".join(
+        [
+            "[noisegate: omitted 26 lines]",
+            location,
+            frame,
+            caret,
+        ]
+    )
+    assert len(complete_excerpt) <= 200
+
+    transformed = transform_tool_result(
+        json.dumps({"mypy": diagnostic, "content": "exact source\n"}),
+        tool_name="edit_file",
+        noisegate_max_chars=200,
+        noisegate_max_lines=40,
+        noisegate_important_context_lines=2,
+    )
+
+    payload = parse_hook_result(transformed)
+    assert payload["content"] == "exact source\n"
+    assert location in payload["mypy"]
+    assert frame in payload["mypy"]
+    assert caret in payload["mypy"]
+    assert "ERROR: wrapper failed" not in payload["mypy"]
+
+
+def test_write_diagnostics_override_git_boundary_reducers_when_passthrough_is_off() -> None:
+    location = (
+        "src/service.py:42:17: error: Incompatible types in assignment [assignment]"
+    )
+    diagnostic = "\n".join(
+        [
+            *(f"ERROR: boundary wrapper {index:03d}" for index in range(60)),
+            location,
+            *(f"ERROR: trailing wrapper {index:03d}" for index in range(60)),
+        ]
+    )
+
+    cases = (
+        ("git log --oneline", True),
+        ("git diff -- src/service.py", False),
+    )
+    for command, preserve_diffs in cases:
+        transformed = transform_tool_result(
+            json.dumps(
+                {
+                    "diagnostics": diagnostic,
+                    "command": command,
+                    "source": "exact source\n",
+                }
+            ),
+            tool_name="write_file",
+            noisegate_max_chars=240,
+            noisegate_max_lines=7,
+            noisegate_head_lines=1,
+            noisegate_tail_lines=1,
+            noisegate_important_context_lines=1,
+            noisegate_max_important_lines=2,
+            noisegate_preserve_diffs=preserve_diffs,
+        )
+
+        payload = parse_hook_result(transformed)
+        assert payload["command"] == command
+        assert payload["source"] == "exact source\n"
+        assert location in payload["diagnostics"], command
+        assert "[assignment]" in payload["diagnostics"], command
+        assert "ERROR: boundary wrapper 000" not in payload["diagnostics"], command
+
+
 def test_write_diagnostics_use_scoped_reduction_in_auto_and_head_tail_modes() -> None:
     diagnostic = "\n".join(
         [
@@ -1039,6 +1121,47 @@ def test_write_diagnostic_nonfinite_json_aborts_complete_envelope() -> None:
             )
             is None
         ), constant
+
+
+def test_write_diagnostic_lone_surrogates_fail_open_before_utf8_encoding() -> None:
+    diagnostic = numbered("src/file.py:10:2: error E100 useful diagnostic", 120)
+
+    for escaped_surrogate in (r"\ud800", r"\udfff"):
+        raw = (
+            '{"diagnostics":'
+            f'{json.dumps(diagnostic)},"source":"{escaped_surrogate}"}}'
+        )
+
+        assert (
+            transform_tool_result(
+                raw,
+                tool_name="write_file",
+                noisegate_max_chars=240,
+                noisegate_max_lines=7,
+            )
+            is None
+        ), escaped_surrogate
+
+
+def test_write_diagnostic_valid_non_bmp_unicode_stays_exact_and_utf8_encodable() -> None:
+    diagnostic = numbered("src/file.py:10:2: error E100 useful diagnostic", 120)
+    source = "exact source with non-BMP Unicode: 🧪\n"
+    raw = json.dumps(
+        {"diagnostics": diagnostic, "source": source},
+        ensure_ascii=False,
+    )
+
+    transformed = transform_tool_result(
+        raw,
+        tool_name="write_file",
+        noisegate_max_chars=240,
+        noisegate_max_lines=7,
+    )
+
+    payload = parse_hook_result(transformed)
+    assert payload["source"] == source
+    assert isinstance(transformed, str)
+    transformed.encode("utf-8")
 
 
 def test_tool_call_wrapper_requires_unambiguous_write_identity() -> None:

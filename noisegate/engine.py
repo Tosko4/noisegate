@@ -691,11 +691,18 @@ def _reduce_text(
         return _unchanged(text, "below_threshold", command_class, reason="below_threshold")
 
     preserve_patterns = _preserve_patterns_for_output(command_class, text)
+    first_priority_patterns: tuple[re.Pattern[str], ...] = ()
     if extra_preserve_patterns:
         preserve_patterns = _combine_matching_patterns(
             text,
             preserve_patterns,
             extra_preserve_patterns,
+        )
+        extra_pattern_ids = {id(pattern) for pattern in extra_preserve_patterns}
+        first_priority_patterns = tuple(
+            pattern
+            for pattern in preserve_patterns or ()
+            if id(pattern) in extra_pattern_ids
         )
     exit_notices = _recovery_notices({"exit_code": exit_code})
     reducer_name, compacted = _apply_reducer(
@@ -724,6 +731,7 @@ def _reduce_text(
             compacted,
             options,
             preserve_patterns=preserve_patterns,
+            first_priority_patterns=first_priority_patterns,
         )
     if compacted is not None and _omission_notices(text):
         compacted = _ensure_ranked_diagnostic_after_line_coverage_remap(
@@ -1194,6 +1202,7 @@ def _apply_reducer(
                 options,
                 field_patterns + CRITICAL_PATTERNS + lcm_patterns,
                 priority_patterns=field_priority_patterns + HIGH_SIGNAL_PRIORITY_PATTERNS,
+                first_priority_patterns=field_patterns,
                 exit_code=exit_code,
             )
         if lcm_patterns:
@@ -1210,6 +1219,7 @@ def _apply_reducer(
             options,
             reduction_patterns,
             priority_patterns=field_priority_patterns + HIGH_SIGNAL_PRIORITY_PATTERNS,
+            first_priority_patterns=field_patterns,
             exit_code=exit_code,
         )
     if command_class in {"apt", "python_package"}:
@@ -1218,6 +1228,7 @@ def _apply_reducer(
             options,
             reduction_patterns,
             priority_patterns=field_priority_patterns + PACKAGE_HIGH_SIGNAL_PRIORITY_PATTERNS,
+            first_priority_patterns=field_patterns,
             exit_code=exit_code,
         )
     if command_class == "node":
@@ -1226,6 +1237,7 @@ def _apply_reducer(
             options,
             reduction_patterns,
             priority_patterns=field_priority_patterns + NODE_HIGH_SIGNAL_PRIORITY_PATTERNS,
+            first_priority_patterns=field_patterns,
             exit_code=exit_code,
         )
     if command_class == "docker_build":
@@ -1236,6 +1248,7 @@ def _apply_reducer(
             priority_patterns=(
                 field_priority_patterns + DOCKER_BUILD_HIGH_SIGNAL_PRIORITY_PATTERNS
             ),
+            first_priority_patterns=field_patterns,
             exit_code=exit_code,
         )
     if command_class == "docker_logs":
@@ -1244,6 +1257,7 @@ def _apply_reducer(
             options,
             reduction_patterns,
             priority_patterns=field_priority_patterns + HIGH_SIGNAL_PRIORITY_PATTERNS,
+            first_priority_patterns=field_patterns,
             exit_code=exit_code,
         )
     if command_class == "log_stream":
@@ -1252,6 +1266,7 @@ def _apply_reducer(
             options,
             reduction_patterns,
             priority_patterns=field_priority_patterns + HIGH_SIGNAL_PRIORITY_PATTERNS,
+            first_priority_patterns=field_patterns,
             exit_code=exit_code,
         )
     if command_class == "git_status":
@@ -1260,6 +1275,16 @@ def _apply_reducer(
             options,
             reduction_patterns,
             priority_patterns=field_priority_patterns + HIGH_SIGNAL_PRIORITY_PATTERNS,
+            first_priority_patterns=field_patterns,
+            exit_code=exit_code,
+        )
+    if command_class in {"git_log", "git_diff"} and field_patterns:
+        return command_class, _important_lines(
+            text,
+            options,
+            reduction_patterns,
+            priority_patterns=field_priority_patterns + HIGH_SIGNAL_PRIORITY_PATTERNS,
+            first_priority_patterns=field_patterns,
             exit_code=exit_code,
         )
     if command_class == "git_log":
@@ -1270,6 +1295,7 @@ def _apply_reducer(
             options,
             field_patterns + CRITICAL_PATTERNS + lcm_patterns,
             priority_patterns=field_priority_patterns + HIGH_SIGNAL_PRIORITY_PATTERNS,
+            first_priority_patterns=field_patterns,
             exit_code=exit_code,
         )
     if (
@@ -1573,6 +1599,7 @@ def _important_lines(
     patterns: tuple[re.Pattern[str], ...],
     *,
     priority_patterns: tuple[tuple[re.Pattern[str], ...], ...] = HIGH_SIGNAL_PRIORITY_PATTERNS,
+    first_priority_patterns: tuple[re.Pattern[str], ...] = (),
     exit_code: int | None = None,
 ) -> str | None:
     lines = text.splitlines()
@@ -1584,7 +1611,12 @@ def _important_lines(
             return _char_head_tail_preserving_patterns(
                 text,
                 options,
-                _priority_preservation_patterns(text, patterns, priority_patterns),
+                _priority_preservation_patterns(
+                    text,
+                    patterns,
+                    priority_patterns,
+                    first_priority_patterns=first_priority_patterns,
+                ),
             )
         return _char_head_tail(text, options)
 
@@ -1644,7 +1676,12 @@ def _important_lines(
             return _char_head_tail_preserving_patterns(
                 text,
                 options,
-                _priority_preservation_patterns(text, patterns, priority_patterns),
+                _priority_preservation_patterns(
+                    text,
+                    patterns,
+                    priority_patterns,
+                    first_priority_patterns=first_priority_patterns,
+                ),
             )
         return _char_head_tail(text, options)
     selected_indices = sorted(keep)
@@ -1680,7 +1717,12 @@ def _important_lines(
         return _char_head_tail_preserving_patterns(
             selected,
             options,
-            _priority_preservation_patterns(selected, patterns, priority_patterns),
+            _priority_preservation_patterns(
+                selected,
+                patterns,
+                priority_patterns,
+                first_priority_patterns=first_priority_patterns,
+            ),
         )
     return selected
 
@@ -1718,7 +1760,11 @@ def _priority_preservation_patterns(
     text: str,
     patterns: tuple[re.Pattern[str], ...],
     priority_patterns: tuple[tuple[re.Pattern[str], ...], ...],
+    *,
+    first_priority_patterns: tuple[re.Pattern[str], ...] = (),
 ) -> tuple[re.Pattern[str], ...]:
+    if first_priority_patterns and _first_pattern_match(text, first_priority_patterns):
+        return _lcm_externalized_patterns_for(text) + first_priority_patterns
     if patterns is CRITICAL_PATTERNS or any(pattern in TEST_PATTERNS for pattern in patterns):
         return _preservation_patterns(text, patterns)
     flattened = tuple(pattern for group in priority_patterns for pattern in group)
@@ -2253,6 +2299,7 @@ def _enforce_final_budget(
     options: NoisegateOptions,
     *,
     preserve_patterns: tuple[re.Pattern[str], ...] | None = None,
+    first_priority_patterns: tuple[re.Pattern[str], ...] = (),
 ) -> str | None:
     compacted = text
     if _line_count(compacted) > options.max_lines:
@@ -2261,7 +2308,18 @@ def _enforce_final_budget(
             and _first_pattern_match(compacted, preserve_patterns) is not None
         )
         if has_preserved_match:
-            line_capped = _important_lines(compacted, options, preserve_patterns)
+            priority_patterns = (
+                (first_priority_patterns, *HIGH_SIGNAL_PRIORITY_PATTERNS)
+                if first_priority_patterns
+                else HIGH_SIGNAL_PRIORITY_PATTERNS
+            )
+            line_capped = _important_lines(
+                compacted,
+                options,
+                preserve_patterns,
+                priority_patterns=priority_patterns,
+                first_priority_patterns=first_priority_patterns,
+            )
         else:
             line_capped = _head_tail(compacted, options)
         if line_capped is not None and len(line_capped) < len(compacted):
@@ -2285,10 +2343,16 @@ def _enforce_final_budget(
             and _first_pattern_match(compacted, preserve_patterns) is not None
         )
         if has_preserved_match:
+            char_patterns = (
+                _lcm_externalized_patterns_for(compacted) + first_priority_patterns
+                if first_priority_patterns
+                and _first_pattern_match(compacted, first_priority_patterns)
+                else preserve_patterns
+            )
             char_capped = _char_head_tail_preserving_patterns(
                 compacted,
                 options,
-                preserve_patterns,
+                char_patterns,
             )
         else:
             char_capped = _char_head_tail(compacted, options)

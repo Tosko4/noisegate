@@ -264,6 +264,30 @@ def test_reduce_json_compacts_direct_and_wrapped_write_diagnostics() -> None:
         assert "src/file.py:10:2" in result["diagnostics"], index
 
 
+def test_reduce_json_unsafe_nested_write_diagnostic_aborts_direct_compaction() -> None:
+    diagnostic = numbered("outer.py:10:2: error E100 useful diagnostic", 120)
+    nested = {"warnings": ["unsupported"], "content": "exact nested source\n"}
+
+    for result in (nested, json.dumps(nested)):
+        envelope = {
+            "tool_name": "tool_call",
+            "args": {
+                "name": "write_file",
+                "arguments": {"path": "src/file.py"},
+            },
+            "result": result,
+            "diagnostics": diagnostic,
+            "content": "exact outer source\n",
+            "noisegate": {"max_chars": 240, "max_lines": 7},
+        }
+        raw = json.dumps(envelope)
+
+        proc = run_cli("reduce-json", input_text=raw)
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == raw, type(result).__name__
+
+
 def test_reduce_json_write_diagnostics_keep_direct_strings_and_no_gain_exact() -> None:
     envelopes = (
         {
@@ -327,6 +351,22 @@ def test_reduce_json_write_diagnostic_nonfinite_values_fail_open_exactly() -> No
         raw = (
             '{"tool_name":"write_file","diagnostics":'
             f'{json.dumps(diagnostic)},"unknown":{constant},'
+            '"noisegate":{"max_chars":240,"max_lines":7}}'
+        )
+
+        proc = run_cli("reduce-json", input_text=raw)
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == raw
+
+
+def test_reduce_json_write_diagnostic_lone_surrogates_fail_open_exactly() -> None:
+    diagnostic = numbered("src/file.py:10:2: error E100 useful diagnostic", 120)
+
+    for escaped_surrogate in (r"\ud800", r"\udfff"):
+        raw = (
+            '{"tool_name":"write_file","diagnostics":'
+            f'{json.dumps(diagnostic)},"source":"{escaped_surrogate}",'
             '"noisegate":{"max_chars":240,"max_lines":7}}'
         )
 

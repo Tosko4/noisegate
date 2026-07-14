@@ -30,6 +30,7 @@ Noisegate exists to improve agent context value, not to make output shorter at a
 
 - [ ] Any reducer/plugin/install helper exception preserves original output or exits with a controlled error before side effects.
 - [ ] If metadata, omission notices, or recovery notices would exceed the budget or make JSON larger, the hook returns no change.
+- [ ] Transformed JSON candidates must remain strict valid JSON, UTF-8 encodable, and smaller than the original; otherwise the complete operation fails open unchanged.
 - [ ] Hook failures never block Hermes tool execution.
 
 ### 5. Artifacts are recovery, not an archive
