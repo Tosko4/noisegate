@@ -107,12 +107,17 @@ def test_artifact_store_refuses_permissive_existing_root_without_chmod(tmp_path:
     assert mode(root) == 0o755
 
 
-def test_reduce_text_records_artifact_metadata_when_enabled(tmp_path: Path) -> None:
+def test_reduce_text_records_artifact_metadata_when_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
     raw = numbered("line", 100)
+    artifact_dir = Path("store")
     options = NoisegateOptions(
         max_chars=220,
         artifact_enabled=True,
-        artifact_dir=tmp_path / "store",
+        artifact_dir=artifact_dir,
     )
 
     result = reduce_text(raw, command="pytest", options=options)
@@ -123,8 +128,8 @@ def test_reduce_text_records_artifact_metadata_when_enabled(tmp_path: Path) -> N
     assert artifact["sha256"]
     assert str(artifact["id"]) in result.text
     assert str(artifact["sha256"])[:16] in result.text
-    assert f"noisegate cat --artifact-dir {tmp_path / 'store'} {artifact['id']}" in result.text
-    assert ArtifactStore(tmp_path / "store").read(str(artifact["id"])) == raw
+    assert f"noisegate cat --artifact-dir {artifact_dir} {artifact['id']}" in result.text
+    assert ArtifactStore(artifact_dir).read(str(artifact["id"])) == raw
 
 
 def test_reduce_text_refuses_secret_bearing_artifacts(tmp_path: Path) -> None:
