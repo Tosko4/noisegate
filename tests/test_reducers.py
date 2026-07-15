@@ -1088,6 +1088,40 @@ def test_terminal_memory_retrieval_commands_are_exact(command: str) -> None:
 @pytest.mark.parametrize(
     "command",
     (
+        "hermes sessions list",
+        "hermes sessions browse",
+        "hermes --profile work sessions list --limit 25",
+        "hermes --profile=work sessions browse --source discord",
+        "hermes -p work sessions list",
+        "hermes -pwork sessions browse",
+        "hermes --ignore-user-config --ignore-rules sessions list",
+        "hermes --resume session-123 sessions browse",
+        "hermes -rsession-123 sessions list",
+        "hermes --continue --yolo sessions browse",
+        "hermes -csession-name sessions list",
+        "exec /opt/hermes/bin/hermes --profile work sessions browse",
+        "printf '%s' \"$(hermes --profile work sessions list)\"",
+    ),
+)
+def test_hermes_session_listing_commands_are_exact(command: str) -> None:
+    raw = numbered("session listing evidence", 100)
+
+    result = reduce_text(
+        raw,
+        command=command,
+        tool_name="terminal",
+        options=options(max_chars=120),
+    )
+
+    assert result.changed is False
+    assert result.text == raw
+    assert result.metadata["command_class"] == "memory_retrieval"
+    assert result.metadata["reducer"] == "protected_memory_retrieval"
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
         "hermes --profile work lcm expand 123",
         "hermes --profile=work lcm expand 123",
         "hermes -p work lcm expand 123",
@@ -1167,6 +1201,34 @@ def test_retrieval_phrases_in_arguments_keep_existing_behavior(
     assert result.metadata["command_class"] == expected_class
     assert result.metadata["reducer"] == expected_reducer
     assert result.changed is (expected_class not in {"git_diff", "source_search"})
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "hermes sessions delete session-123",
+        "hermes sessions rename session-123 new-title",
+        "hermes sessions prune --older-than 30",
+        "hermes sessions export sessions.jsonl",
+        "hermes sessions stats",
+        "hermes sessions delete list",
+        "hermes chat -q 'sessions list'",
+        "printf 'sessions list'",
+        "pytest -q -k 'sessions list'",
+    ),
+)
+def test_non_listing_session_commands_do_not_become_retrieval(command: str) -> None:
+    raw = numbered("ordinary session command output", 100)
+
+    result = reduce_text(
+        raw,
+        command=command,
+        tool_name="terminal",
+        options=options(max_chars=120),
+    )
+
+    assert result.changed is True
+    assert result.metadata["command_class"] != "memory_retrieval"
 
 
 def test_nested_retrieval_substitution_inspection_fails_open_at_bound() -> None:
