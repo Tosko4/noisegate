@@ -233,6 +233,63 @@ def test_hermes_hooks_preserve_profiled_retrieval_output_exactly() -> None:
         ), command
 
 
+def test_hermes_hooks_preserve_session_listing_output_exactly() -> None:
+    output = numbered("exact session listing evidence PASSED", 180)
+    commands = (
+        "hermes sessions list",
+        "hermes sessions browse",
+        "hermes --profile work sessions list --limit 25",
+        "hermes -pwork sessions browse --source discord",
+        "exec /opt/hermes/bin/hermes --profile work sessions list",
+        "printf '%s' \"$(hermes --profile work sessions browse)\"",
+    )
+
+    for command in commands:
+        assert (
+            transform_terminal_output(
+                command=command,
+                output=output,
+                noisegate_max_chars=160,
+            )
+            is None
+        ), command
+        assert (
+            transform_tool_result(
+                terminal_result(output, command=command),
+                tool_name="terminal",
+                noisegate_max_chars=160,
+            )
+            is None
+        ), command
+
+
+def test_hermes_hooks_keep_non_listing_session_output_compactable() -> None:
+    output = numbered("Hermes session command progress", 180)
+
+    for command in (
+        "hermes sessions delete session-123",
+        "hermes sessions rename session-123 new-title",
+        "hermes sessions prune --older-than 30",
+        "hermes chat -q 'sessions list'",
+    ):
+        terminal_output = transform_terminal_output(
+            command=command,
+            output=output,
+            noisegate_max_chars=160,
+        )
+        assert isinstance(terminal_output, str), command
+        assert "[noisegate: omitted" in terminal_output, command
+
+        tool_output = transform_tool_result(
+            terminal_result(output, command=command),
+            tool_name="terminal",
+            noisegate_max_chars=160,
+        )
+        payload = parse_hook_result(tool_output)
+        assert payload["noisegate"]["compacted"] is True, command
+        assert "[noisegate: omitted" in payload["stdout"], command
+
+
 def test_hermes_hooks_keep_profiled_maintenance_output_compactable() -> None:
     output = numbered("Hermes maintenance progress", 180)
 
