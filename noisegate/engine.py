@@ -4218,6 +4218,7 @@ def _looks_like_memory_retrieval_command(command: str) -> bool:
                 in {"search", "recall", "reflect", "get", "read", "show", "list"}
             )
             or (group == "session" and action == "search")
+            or (group == "sessions" and action in {"list", "browse"})
         ):
             return True
     return False
