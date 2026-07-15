@@ -73,6 +73,7 @@ def run_cli(
     *args: str,
     input_text: str = "",
     env: dict[str, str] | None = None,
+    cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     full_env = os.environ.copy()
     full_env.update(env or {})
@@ -82,6 +83,7 @@ def run_cli(
         text=True,
         capture_output=True,
         env=full_env,
+        cwd=cwd,
         check=False,
     )
 
@@ -3774,7 +3776,7 @@ def sh_quote(value: str) -> str:
 
 
 def test_cat_cli_accepts_custom_artifact_dir(tmp_path: Path) -> None:
-    artifact_dir = tmp_path / "custom-artifacts"
+    artifact_dir = Path("custom-artifacts")
     reduce_proc = run_cli(
         "reduce",
         "--command",
@@ -3785,13 +3787,14 @@ def test_cat_cli_accepts_custom_artifact_dir(tmp_path: Path) -> None:
         "--artifact-dir",
         str(artifact_dir),
         input_text=numbered("line", 100),
+        cwd=tmp_path,
     )
     assert reduce_proc.returncode == 0, reduce_proc.stderr
     marker = "id=ng_"
     start = reduce_proc.stdout.index(marker) + len("id=")
     artifact_id = reduce_proc.stdout[start:].split(";", 1)[0]
 
-    cat_proc = run_cli("cat", "--artifact-dir", str(artifact_dir), artifact_id)
+    cat_proc = run_cli("cat", "--artifact-dir", str(artifact_dir), artifact_id, cwd=tmp_path)
 
     assert cat_proc.returncode == 0, cat_proc.stderr
     assert cat_proc.stdout == numbered("line", 100)
