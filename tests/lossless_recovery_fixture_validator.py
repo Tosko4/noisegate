@@ -29,8 +29,28 @@ class FixtureValidationError(ValueError):
     """A vector does not conform to the documented test-only format."""
 
 
+def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise FixtureValidationError(f"duplicate JSON object key {key!r}")
+        value[key] = item
+    return value
+
+
+def _reject_nonstandard_constant(value: str) -> None:
+    raise FixtureValidationError(f"non-standard JSON constant {value!r}")
+
+
 def load_fixture_pack(path: Path) -> dict[str, Any]:
-    return _mapping(json.loads(path.read_text(encoding="utf-8")), "fixture root")
+    return _mapping(
+        json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_strict_object,
+            parse_constant=_reject_nonstandard_constant,
+        ),
+        "fixture root",
+    )
 
 
 def validate_fixture_pack(pack: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -45,8 +65,10 @@ def validate_fixture_pack(pack: dict[str, Any]) -> dict[str, dict[str, Any]]:
         },
         "fixture pack",
     )
-    if pack["format_version"] != 1 or pack["central_rule"] != CENTRAL_RULE:
-        raise FixtureValidationError("fixture pack: version or central rule differs")
+    if type(pack["format_version"]) is not int or pack["format_version"] != 1:
+        raise FixtureValidationError("fixture pack: format version must be integer 1")
+    if pack["central_rule"] != CENTRAL_RULE:
+        raise FixtureValidationError("fixture pack: central rule differs")
     if not _string(pack["synthetic_recovery_ref_marker_utf8"], "fixture marker"):
         raise FixtureValidationError("fixture marker must not be empty")
     global_canaries = _canaries(pack["forbidden_pre_redaction_canaries_utf8"], "pack")

@@ -74,6 +74,34 @@ def test_fixture_pack_is_well_formed_and_covers_required_matrix() -> None:
     assert all(case["expected"]["decision"] for case in cases)
 
 
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ('{"format_version": 1, "format_version": 1}', "duplicate JSON object key"),
+        ('{"format_version": NaN}', "non-standard JSON constant"),
+    ],
+)
+def test_fixture_loader_rejects_nonportable_json(
+    tmp_path: Path, payload: str, message: str
+) -> None:
+    fixture = tmp_path / "nonportable.json"
+    fixture.write_text(payload, encoding="utf-8")
+
+    with pytest.raises(FixtureValidationError, match=message):
+        load_fixture_pack(fixture)
+
+
+@pytest.mark.parametrize("value", [True, 1.0])
+def test_fixture_format_version_requires_an_integer_not_a_json_boolean_or_float(
+    value: object,
+) -> None:
+    pack = load_fixture_pack(FIXTURE_PATH)
+    pack["format_version"] = value
+
+    with pytest.raises(FixtureValidationError, match="format version must be integer 1"):
+        validate_fixture_pack(pack)
+
+
 def test_fixture_decisions_are_derived_instead_of_trusting_expected_labels() -> None:
     pack = load_fixture_pack(FIXTURE_PATH)
     mutated = copy.deepcopy(pack)

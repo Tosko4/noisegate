@@ -8,11 +8,13 @@ Noisegate abstraction. All payloads, refs, identifiers, and canaries are synthet
 
 ## Encoding and comparison
 
-`vectors.json` is UTF-8 JSON. A field ending in `_utf8` represents the UTF-8 byte
-sequence obtained by decoding that JSON string and encoding it as UTF-8. Ref
-equality, order, and occurrence counts are compared over those bytes. JSON content
-inside an envelope string is not reparsed by the fixture validator; the complete
-envelope string is the comparison unit.
+`vectors.json` is strict UTF-8 JSON. Duplicate object keys and non-standard
+numeric constants such as `NaN` or `Infinity` are invalid because different JSON
+implementations otherwise disagree about their meaning. A field ending in `_utf8`
+represents the UTF-8 byte sequence obtained by decoding that JSON string and
+encoding it as UTF-8. Ref equality, order, and occurrence counts are compared over
+those bytes. JSON content inside an envelope string is not reparsed by the fixture
+validator; the complete envelope string is the comparison unit.
 
 The `synrec:v1:` prefix is a conspicuous test-only marker that keeps committed
 fixture refs obvious to reviewers. It is not a proposed ref format, and the
