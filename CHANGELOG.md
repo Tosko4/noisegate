@@ -4,6 +4,20 @@ All notable changes to Noisegate are documented here. Release notes are generate
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-15
+
+Noisegate 0.3.0 gets much better at telling noisy execution apart from evidence an agent must be able to trust. Background process logs and oversized write diagnostics can now shrink without flattening process state, generated source, patches, or structured metadata. At the same time, MCP and memory-retrieval paths are handled more conservatively: when ownership or content is ambiguous, Noisegate keeps its hands off.
+
+Artifact storage also gets a tighter bouncer. Secret-, credential-, and private-key-looking output is refused even when artifact mode is enabled. No configuration migration is required, Hermes-LCM remains optional, and the existing fail-open contract stays intact.
+
+### Highlights
+
+- **Process noise, minus the amnesia.** Poll/log/wait output can compact while `session_id`, status, exit details, and useful failure anchors survive.
+- **Source and diagnostics can coexist.** Write/patch results may bound known lint and type-check fields without touching source, diffs, metadata, or unknown values.
+- **Retrieval stays evidence.** MCP, Hindsight, LCM, session, and memory-retrieval output remains exact; indexing and maintenance slop can still compact.
+- **Artifacts are pickier on purpose.** Obvious secrets and private keys are never persisted as recovery artifacts.
+- **Contributing has a front door.** A new contributor guide and PR checklist make the product-fit, safety, testing, and AI-assistance bar explicit before review starts.
+
 ### Added
 
 - Conservative MCP policy coverage now locks `mcp_*` / `mcp__*` results, MCP exact-evidence categories, discovery metadata, and generic wrapper calls to exact-output defaults.
@@ -12,11 +26,17 @@ All notable changes to Noisegate are documented here. Release notes are generate
 
 - Generic `tool_call` wrappers now use the wrapped tool name when it is unambiguous, allowing wrapped terminal noise to compact while wrapped MCP/source tools and ambiguous ownership stay exact.
 - Hermes write/patch-like JSON results may now compact only known diagnostic string fields while preserving source, content, diffs, patches, metadata, and unknown parsed values exactly; the plugin hook and `reduce-json` CLI share this scoped, inline-only contract, reject non-strict or non-UTF-8 candidates, and never store diagnostic artifacts.
+- Memory indexing, import, API-retry, and LCM maintenance progress remains compactable while retrieval and expansion commands are classified as exact evidence.
 - Secret/header-looking raw output is refused for artifact storage even when artifact mode is enabled.
 
 ### Fixed
 
 - Hermes background `process` poll/log/wait payloads now preserve process metadata while safely compacting command- or content-identified Docker, journalctl, `systemctl status`, dmesg, and follow-mode tail streams from known log targets; commandless non-diagnostic previews, followed source/config files, `systemctl show` properties, source, diff, and patch payloads remain exact.
+- LCM, Hindsight, session-search, and memory-retrieval tool and CLI surfaces now pass through unchanged instead of being mistaken for indexing or maintenance noise.
+
+### Documentation
+
+- Added a public contributor guide and pull request checklist covering Noisegate product fit, exact-output and artifact safety, validation evidence, responsible AI assistance, and disclosure boundaries.
 
 ## [0.2.0] - 2026-07-14
 

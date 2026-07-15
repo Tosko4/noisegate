@@ -1,5 +1,5 @@
 name: noisegate
-version: "0.2.0"
+version: "0.3.0"
 description: "Gate the noise. Keep the signal. Deterministic Hermes tool-output compaction."
 provides_hooks:
   - transform_tool_result
