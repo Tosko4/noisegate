@@ -3777,6 +3777,11 @@ def sh_quote(value: str) -> str:
 
 def test_cat_cli_accepts_custom_artifact_dir(tmp_path: Path) -> None:
     artifact_dir = Path("custom-artifacts")
+    pythonpath = str(Path(__file__).resolve().parents[1])
+    existing_pythonpath = os.environ.get("PYTHONPATH")
+    if existing_pythonpath is not None:
+        pythonpath = os.pathsep.join((pythonpath, existing_pythonpath))
+    env = {"PYTHONPATH": pythonpath}
     reduce_proc = run_cli(
         "reduce",
         "--command",
@@ -3787,6 +3792,7 @@ def test_cat_cli_accepts_custom_artifact_dir(tmp_path: Path) -> None:
         "--artifact-dir",
         str(artifact_dir),
         input_text=numbered("line", 100),
+        env=env,
         cwd=tmp_path,
     )
     assert reduce_proc.returncode == 0, reduce_proc.stderr
@@ -3794,7 +3800,14 @@ def test_cat_cli_accepts_custom_artifact_dir(tmp_path: Path) -> None:
     start = reduce_proc.stdout.index(marker) + len("id=")
     artifact_id = reduce_proc.stdout[start:].split(";", 1)[0]
 
-    cat_proc = run_cli("cat", "--artifact-dir", str(artifact_dir), artifact_id, cwd=tmp_path)
+    cat_proc = run_cli(
+        "cat",
+        "--artifact-dir",
+        str(artifact_dir),
+        artifact_id,
+        env=env,
+        cwd=tmp_path,
+    )
 
     assert cat_proc.returncode == 0, cat_proc.stderr
     assert cat_proc.stdout == numbered("line", 100)
