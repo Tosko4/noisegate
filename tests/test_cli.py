@@ -3371,7 +3371,11 @@ def test_cat_cli_reads_artifact(tmp_path: Path) -> None:
 
 
 def test_reduce_cli_store_artifact_prints_recovery_notice(tmp_path: Path) -> None:
-    artifact_dir = tmp_path / "artifacts"
+    artifact_dir = Path("artifacts")
+    pythonpath = str(Path(__file__).resolve().parents[1])
+    existing_pythonpath = os.environ.get("PYTHONPATH")
+    if existing_pythonpath is not None:
+        pythonpath = os.pathsep.join((pythonpath, existing_pythonpath))
     proc = run_cli(
         "reduce",
         "--command",
@@ -3382,6 +3386,8 @@ def test_reduce_cli_store_artifact_prints_recovery_notice(tmp_path: Path) -> Non
         "--artifact-dir",
         str(artifact_dir),
         input_text=numbered("line", 100),
+        env={"PYTHONPATH": pythonpath},
+        cwd=tmp_path,
     )
 
     assert proc.returncode == 0, proc.stderr
