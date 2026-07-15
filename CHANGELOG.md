@@ -8,14 +8,14 @@ All notable changes to Noisegate are documented here. Release notes are generate
 
 Noisegate 0.3.0 gets much better at telling noisy execution apart from evidence an agent must be able to trust. Background process logs and oversized write diagnostics can now shrink without flattening process state, generated source, patches, or structured metadata. At the same time, MCP and memory-retrieval paths are handled more conservatively: when ownership or content is ambiguous, Noisegate keeps its hands off.
 
-Artifact storage also gets a tighter bouncer. Secret-, credential-, private-key-, and terminal-control-looking output is refused even when artifact mode is enabled. No configuration migration is required, Hermes-LCM remains optional, and the existing fail-open contract stays intact.
+Artifact storage also gets a tighter bouncer. Secret-, credential-, and private-key-looking output is refused even when artifact mode is enabled. No configuration migration is required, Hermes-LCM remains optional, and the existing fail-open contract stays intact.
 
 ### Highlights
 
 - **Process noise, minus the amnesia.** Poll/log/wait output can compact while `session_id`, status, exit details, and useful failure anchors survive.
 - **Source and diagnostics can coexist.** Write/patch results may bound known lint and type-check fields without touching source, diffs, metadata, or unknown values.
 - **Retrieval stays evidence.** MCP, Hindsight, LCM, session, and memory-retrieval output remains exact; indexing and maintenance slop can still compact.
-- **Artifacts are pickier on purpose.** Obvious secrets, private keys, and terminal-control payloads are never persisted as recovery artifacts.
+- **Artifacts are pickier on purpose.** Obvious secrets and private keys are never persisted as recovery artifacts.
 - **Contributing has a front door.** A new contributor guide and PR checklist make the product-fit, safety, testing, and AI-assistance bar explicit before review starts.
 
 ### Added
