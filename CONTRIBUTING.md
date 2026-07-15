@@ -158,7 +158,7 @@ Maintainers may close fully automated, duplicate, unverified, out-of-scope, or a
 
 ## Full local quality gate
 
-Run this from the repository root before requesting review:
+Run this from the repository root before requesting review when your environment supports it. The complete gate must pass on the exact pull request head before merge, whether it is run by the contributor or a maintainer:
 
 ```bash
 uv run ruff check .
@@ -173,6 +173,8 @@ git diff --check origin/main...HEAD
 git diff --cached --check
 git diff --check
 ```
+
+For a tiny docs-only or metadata correction, you may request review after a proportionate subset when the omitted commands cannot exercise the changed behavior. List what you ran and identify any relevant required check you could not run; do not describe a partial gate as the full gate passing. Maintainers will still complete or verify the full pre-merge gate.
 
 The contributor check compares commit authors with
 [CONTRIBUTORS.md](CONTRIBUTORS.md). It normalizes GitHub noreply addresses to
@@ -190,9 +192,11 @@ A pull request should contain:
 - a linked issue for non-trivial work;
 - regression coverage for behavior changes;
 - exact validation commands and outcomes;
-- documentation updates, or a short reason why none are needed;
+- documentation updates when user-facing or operator behavior changes;
 - safety and compatibility notes for exact-output, artifacts, hooks, installers, or release behavior;
 - an AI-assistance disclosure when applicable.
+
+These are evidence requirements, not mandatory headings. Use the pull request template when it helps reviewers find the information, but adapt it to the contribution. A typo fix may need only a short explanation and a docs check; a reducer, artifact, installer, workflow, dependency, or release change needs substantially more detail. Omitting an irrelevant section is fine. Omitting evidence needed to judge the actual risk is not.
 
 A useful description follows this shape:
 
@@ -206,14 +210,14 @@ Explain the approach and important boundaries.
 ## Validation
 List exact commands and results.
 
-## Safety and compatibility
+## Safety and compatibility (when relevant)
 Describe exact-output, fail-open, artifact, Hermes, and platform impact.
 
-## Docs
-List updated docs, or explain why no update is needed.
+## Docs (when relevant)
+List updated docs when behavior or operator guidance changes.
 
-## AI assistance
-Name the tool and scope, or write "None".
+## AI assistance (when applicable)
+Name the tool and scope when substantial AI assistance was used.
 ```
 
 Before opening the pull request, inspect what reviewers will see:
@@ -230,6 +234,8 @@ git diff origin/main...HEAD
 ## Review and merge
 
 CI must pass on the current pull request head. Maintainers may also run independent static, security, or AI-assisted review. You do not need to use a particular model or review tool yourself.
+
+Reviews are proportional to the change. Maintainers will assess the contribution as a whole rather than reject it mechanically for a missing heading. When more information is needed, the review should identify the concrete gap, why it matters for this PR, and what would be sufficient to resolve it.
 
 Treat review findings as claims to verify, not instructions to widen the pull request. Fix findings caused by or required for the current change. Report valid unrelated problems separately instead of folding them into the same diff.
 

@@ -1,3 +1,5 @@
+<!-- Use these sections proportionally. For a tiny docs or test-only change, omit or mark clearly irrelevant sections rather than inventing filler. Maintainers care about enough evidence for the actual risk, not template compliance. -->
+
 ## Why
 
 <!-- Describe the real problem, its impact, and the related issue. -->
@@ -16,15 +18,15 @@ command -> result
 
 ## Safety and compatibility
 
-<!-- Cover exact-output, fail-open, artifact, Hermes, platform, installer, or release impact. Write "No impact" only after checking. -->
+<!-- Use this section when the change affects exact-output, fail-open, artifacts, Hermes, platforms, installers, or releases. Otherwise omit it. -->
 
 ## Docs
 
-<!-- List updated docs, or explain why no update is needed. -->
+<!-- Use this section when docs changed or the docs impact needs explanation. Otherwise omit it. -->
 
 ## AI assistance
 
-<!-- Name the tool and what it helped with, or write "None". You remain responsible for the full contribution. -->
+<!-- Use this section when substantial AI assistance was involved. Name the tool and what it helped with. You remain responsible for the full contribution. -->
 
 ## Checklist
 
@@ -32,7 +34,7 @@ command -> result
 - [ ] This change fits Noisegate's Hermes-first compaction mission.
 - [ ] The diff is focused and contains no unrelated cleanup.
 - [ ] I added or updated tests for behavior changes.
-- [ ] I ran the relevant focused tests and the full local quality gate, or listed any command I could not run.
+- [ ] I ran validation proportionate to the change and identified any relevant required check I could not run; I understand the full gate must pass before merge.
 - [ ] I checked whether README or operator docs need an update.
 - [ ] I inspected the diff for secrets, private data, raw logs, and generated artifacts.
 - [ ] I reviewed and understand all AI-assisted code or text in this pull request.
