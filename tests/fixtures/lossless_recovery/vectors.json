@@ -1,0 +1,745 @@
+{
+  "format_version": 1,
+  "central_rule": "Treat every recovery ref as protected structured metadata. After any lossy or final-budget stage, if any required ref is absent, malformed, or differs by even one byte, reject the compact candidate and use the complete canonical sanitized result with no recovery ref.",
+  "synthetic_recovery_ref_marker_utf8": "synrec:v1:",
+  "forbidden_pre_redaction_canaries_utf8": [
+    "SYNTHETIC_PRE_REDACTION_CANARY_GLOBAL_7C91"
+  ],
+  "cases": [
+    {
+      "id": "provider_absent_standalone",
+      "covers": ["provider_absent"],
+      "owner": {
+        "primary": "consumer",
+        "supporting": ["host"],
+        "invariant": "Provider absence leaves ordinary standalone compaction behavior available."
+      },
+      "provider_observation": {
+        "state": "absent",
+        "required_protected_refs_utf8": []
+      },
+      "canonical_sanitized_envelope_utf8": "build line 001\nbuild line 002\nbuild line 003\nbuild complete",
+      "candidate_stages": [
+        {
+          "kind": "post_lossy_transform",
+          "model_visible_copy_utf8": "build line 001\n[noisegate: synthetic omission]\nbuild complete",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "absent",
+            "recovery_refs_utf8": [],
+            "other_semantic_entries": []
+          }
+        }
+      ],
+      "expected": {
+        "decision": "accept_candidate",
+        "selected_source": "last_candidate_stage",
+        "protected_refs_utf8": []
+      },
+      "forbidden_pre_redaction_canaries_utf8": [],
+      "notes": "Noisegate-only operation does not invent a preservation capability or a ref."
+    },
+    {
+      "id": "provider_available_without_preservation",
+      "covers": ["provider_available_no_preservation"],
+      "owner": {
+        "primary": "host",
+        "supporting": ["consumer", "provider"],
+        "invariant": "An available provider may validly publish no preservation metadata for this result."
+      },
+      "provider_observation": {
+        "state": "no_preservation",
+        "required_protected_refs_utf8": []
+      },
+      "canonical_sanitized_envelope_utf8": "install step 1\ninstall step 2\ninstall step 3\ninstalled",
+      "candidate_stages": [
+        {
+          "kind": "post_lossy_transform",
+          "model_visible_copy_utf8": "install step 1\n[noisegate: synthetic omission]\ninstalled",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "absent",
+            "recovery_refs_utf8": [],
+            "other_semantic_entries": []
+          }
+        }
+      ],
+      "expected": {
+        "decision": "accept_candidate",
+        "selected_source": "last_candidate_stage",
+        "protected_refs_utf8": []
+      },
+      "forbidden_pre_redaction_canaries_utf8": [],
+      "notes": "Provider availability alone never authorizes the consumer to synthesize a ref."
+    },
+    {
+      "id": "one_intact_ref",
+      "covers": ["one_intact_ref"],
+      "owner": {
+        "primary": "consumer",
+        "supporting": ["host", "provider"],
+        "invariant": "One published opaque ref survives in protected metadata byte-for-byte."
+      },
+      "provider_observation": {
+        "state": "published",
+        "required_protected_refs_utf8": ["synrec:v1:fixture-alpha-001"]
+      },
+      "canonical_sanitized_envelope_utf8": "test 001 passed\ntest 002 passed\ntest 003 passed\n3 passed",
+      "candidate_stages": [
+        {
+          "kind": "post_lossy_transform",
+          "model_visible_copy_utf8": "test 001 passed\n[noisegate: synthetic omission]\n3 passed",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "well_formed",
+            "recovery_refs_utf8": ["synrec:v1:fixture-alpha-001"],
+            "other_semantic_entries": []
+          }
+        }
+      ],
+      "expected": {
+        "decision": "accept_candidate",
+        "selected_source": "last_candidate_stage",
+        "protected_refs_utf8": ["synrec:v1:fixture-alpha-001"]
+      },
+      "forbidden_pre_redaction_canaries_utf8": [],
+      "notes": "The fixture marker is synthetic; the consumer treats the ref value as opaque bytes."
+    },
+    {
+      "id": "required_ref_missing_after_loss",
+      "covers": ["required_ref_missing"],
+      "owner": {
+        "primary": "host",
+        "supporting": ["consumer"],
+        "invariant": "The host rejects a lossy candidate when required protected metadata is absent."
+      },
+      "provider_observation": {
+        "state": "published",
+        "required_protected_refs_utf8": ["synrec:v1:fixture-alpha-001"]
+      },
+      "canonical_sanitized_envelope_utf8": "compile 001\ncompile 002\ncompile 003\ncompile complete",
+      "candidate_stages": [
+        {
+          "kind": "post_lossy_transform",
+          "model_visible_copy_utf8": "compile 001\n[noisegate: synthetic omission]\ncompile complete",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "well_formed",
+            "recovery_refs_utf8": [],
+            "other_semantic_entries": []
+          }
+        }
+      ],
+      "expected": {
+        "decision": "full_sanitized_fallback",
+        "selected_source": "canonical_sanitized_envelope",
+        "protected_refs_utf8": []
+      },
+      "forbidden_pre_redaction_canaries_utf8": [],
+      "notes": "No recovery-looking notice is emitted when the required ref disappears."
+    },
+    {
+      "id": "one_byte_ref_mutation",
+      "covers": ["one_byte_ref_mutation"],
+      "owner": {
+        "primary": "host",
+        "supporting": ["consumer"],
+        "invariant": "A one-byte ref difference rejects the entire compact candidate."
+      },
+      "provider_observation": {
+        "state": "published",
+        "required_protected_refs_utf8": ["synrec:v1:fixture-alpha-001"]
+      },
+      "canonical_sanitized_envelope_utf8": "resolver line 001\nresolver line 002\nresolution complete",
+      "candidate_stages": [
+        {
+          "kind": "post_lossy_transform",
+          "model_visible_copy_utf8": "resolver line 001\n[noisegate: synthetic omission]\nresolution complete",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "well_formed",
+            "recovery_refs_utf8": ["synrec:v1:fixture-alpha-00X"],
+            "other_semantic_entries": []
+          }
+        }
+      ],
+      "expected": {
+        "decision": "full_sanitized_fallback",
+        "selected_source": "canonical_sanitized_envelope",
+        "protected_refs_utf8": []
+      },
+      "forbidden_pre_redaction_canaries_utf8": [],
+      "notes": "The consumer and host do not repair, normalize, or guess the changed byte."
+    },
+    {
+      "id": "lossy_stage_ref_restoration_still_falls_back",
+      "covers": ["lossy_stage_failure_is_irreversible"],
+      "owner": {
+        "primary": "host",
+        "supporting": ["consumer"],
+        "invariant": "A failed protected-ref observation irreversibly rejects the candidate even if a later lossy stage restores the ref."
+      },
+      "provider_observation": {
+        "state": "published",
+        "required_protected_refs_utf8": ["synrec:v1:fixture-stage-latch-006"]
+      },
+      "canonical_sanitized_envelope_utf8": "pipeline phase 001\npipeline phase 002\npipeline complete",
+      "candidate_stages": [
+        {
+          "kind": "post_lossy_transform",
+          "model_visible_copy_utf8": "pipeline phase 001\npipeline complete",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "well_formed",
+            "recovery_refs_utf8": [],
+            "other_semantic_entries": []
+          }
+        },
+        {
+          "kind": "post_lossy_transform",
+          "model_visible_copy_utf8": "pipeline complete",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "well_formed",
+            "recovery_refs_utf8": ["synrec:v1:fixture-stage-latch-006"],
+            "other_semantic_entries": []
+          }
+        }
+      ],
+      "expected": {
+        "decision": "full_sanitized_fallback",
+        "selected_source": "canonical_sanitized_envelope",
+        "protected_refs_utf8": []
+      },
+      "forbidden_pre_redaction_canaries_utf8": [],
+      "notes": "The derived truth table latches the first failure across every later candidate observation."
+    },
+    {
+      "id": "tiny_budget_truncates_ref",
+      "covers": ["tiny_budget_ref_truncation"],
+      "owner": {
+        "primary": "host",
+        "supporting": ["consumer"],
+        "invariant": "Validation is repeated after the final budget, not only after compaction."
+      },
+      "provider_observation": {
+        "state": "published",
+        "required_protected_refs_utf8": ["synrec:v1:fixture-alpha-001"]
+      },
+      "canonical_sanitized_envelope_utf8": "download 001\ndownload 002\ndownload 003\ndownload complete",
+      "candidate_stages": [
+        {
+          "kind": "post_lossy_transform",
+          "model_visible_copy_utf8": "download 001\n[noisegate: synthetic omission]\ndownload complete",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "well_formed",
+            "recovery_refs_utf8": ["synrec:v1:fixture-alpha-001"],
+            "other_semantic_entries": []
+          }
+        },
+        {
+          "kind": "post_final_budget",
+          "model_visible_copy_utf8": "download complete",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "well_formed",
+            "recovery_refs_utf8": ["synrec:v1:fixture-alpha-00"],
+            "other_semantic_entries": []
+          }
+        }
+      ],
+      "expected": {
+        "decision": "full_sanitized_fallback",
+        "selected_source": "canonical_sanitized_envelope",
+        "protected_refs_utf8": []
+      },
+      "forbidden_pre_redaction_canaries_utf8": [],
+      "notes": "A plausible prefix is still a mutated ref and cannot escape in the fallback."
+    },
+    {
+      "id": "ref_relocated_into_compactable_text",
+      "covers": ["ref_rewrite_or_ambiguous_relocation"],
+      "owner": {
+        "primary": "host",
+        "supporting": ["consumer"],
+        "invariant": "Recovery-looking ordinary text never satisfies protected structured metadata."
+      },
+      "provider_observation": {
+        "state": "published",
+        "required_protected_refs_utf8": ["synrec:v1:fixture-alpha-001"]
+      },
+      "canonical_sanitized_envelope_utf8": "archive step 001\narchive step 002\narchive complete",
+      "candidate_stages": [
+        {
+          "kind": "post_lossy_transform",
+          "model_visible_copy_utf8": "archive complete; copied text synrec:v1:fixture-alpha-001",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "well_formed",
+            "recovery_refs_utf8": [],
+            "other_semantic_entries": []
+          }
+        }
+      ],
+      "expected": {
+        "decision": "full_sanitized_fallback",
+        "selected_source": "canonical_sanitized_envelope",
+        "protected_refs_utf8": []
+      },
+      "forbidden_pre_redaction_canaries_utf8": [],
+      "notes": "Copying or rewriting a ref into compactable text is an ambiguous relocation, not preservation."
+    },
+    {
+      "id": "duplicate_same_ref",
+      "covers": ["duplicate_same_ref"],
+      "owner": {
+        "primary": "host",
+        "supporting": ["consumer", "provider"],
+        "invariant": "A required ref has exactly one ordered protected occurrence; an extra duplicate rejects the candidate."
+      },
+      "provider_observation": {
+        "state": "published",
+        "required_protected_refs_utf8": ["synrec:v1:fixture-alpha-001"]
+      },
+      "canonical_sanitized_envelope_utf8": "package step 001\npackage step 002\npackage complete",
+      "candidate_stages": [
+        {
+          "kind": "post_lossy_transform",
+          "model_visible_copy_utf8": "package step 001\n[noisegate: synthetic omission]\npackage complete",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "well_formed",
+            "recovery_refs_utf8": [
+              "synrec:v1:fixture-alpha-001",
+              "synrec:v1:fixture-alpha-001"
+            ],
+            "other_semantic_entries": []
+          }
+        }
+      ],
+      "expected": {
+        "decision": "full_sanitized_fallback",
+        "selected_source": "canonical_sanitized_envelope",
+        "protected_refs_utf8": []
+      },
+      "forbidden_pre_redaction_canaries_utf8": [],
+      "notes": "Duplicate publication is not normalized or silently deduplicated by the consumer."
+    },
+    {
+      "id": "multiple_distinct_refs_intact",
+      "covers": ["multiple_distinct_refs_intact"],
+      "owner": {
+        "primary": "consumer",
+        "supporting": ["host", "provider"],
+        "invariant": "All distinct required refs survive once each, byte-for-byte and in provider order."
+      },
+      "provider_observation": {
+        "state": "published",
+        "required_protected_refs_utf8": [
+          "synrec:v1:fixture-alpha-001",
+          "synrec:v1:fixture-beta-002"
+        ]
+      },
+      "canonical_sanitized_envelope_utf8": "lane alpha complete\nlane beta complete\nall lanes complete",
+      "candidate_stages": [
+        {
+          "kind": "post_lossy_transform",
+          "model_visible_copy_utf8": "lane alpha complete\n[noisegate: synthetic omission]\nall lanes complete",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "well_formed",
+            "recovery_refs_utf8": [
+              "synrec:v1:fixture-alpha-001",
+              "synrec:v1:fixture-beta-002"
+            ],
+            "other_semantic_entries": []
+          }
+        },
+        {
+          "kind": "post_final_budget",
+          "model_visible_copy_utf8": "all lanes complete",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "well_formed",
+            "recovery_refs_utf8": [
+              "synrec:v1:fixture-alpha-001",
+              "synrec:v1:fixture-beta-002"
+            ],
+            "other_semantic_entries": []
+          }
+        }
+      ],
+      "expected": {
+        "decision": "accept_candidate",
+        "selected_source": "last_candidate_stage",
+        "protected_refs_utf8": [
+          "synrec:v1:fixture-alpha-001",
+          "synrec:v1:fixture-beta-002"
+        ]
+      },
+      "forbidden_pre_redaction_canaries_utf8": [],
+      "notes": "A final budget may reduce visible text only while the complete ordered ref sequence remains exact."
+    },
+    {
+      "id": "one_of_multiple_refs_mutated",
+      "covers": ["one_of_multiple_refs_missing_or_mutated"],
+      "owner": {
+        "primary": "host",
+        "supporting": ["consumer"],
+        "invariant": "One bad member rejects the whole candidate; partial plausible recovery is forbidden."
+      },
+      "provider_observation": {
+        "state": "published",
+        "required_protected_refs_utf8": [
+          "synrec:v1:fixture-alpha-001",
+          "synrec:v1:fixture-beta-002"
+        ]
+      },
+      "canonical_sanitized_envelope_utf8": "task alpha complete\ntask beta complete\n2 tasks complete",
+      "candidate_stages": [
+        {
+          "kind": "post_lossy_transform",
+          "model_visible_copy_utf8": "task alpha complete\n2 tasks complete",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "well_formed",
+            "recovery_refs_utf8": [
+              "synrec:v1:fixture-alpha-001",
+              "synrec:v1:fixture-beta-00X"
+            ],
+            "other_semantic_entries": []
+          }
+        }
+      ],
+      "expected": {
+        "decision": "full_sanitized_fallback",
+        "selected_source": "canonical_sanitized_envelope",
+        "protected_refs_utf8": []
+      },
+      "forbidden_pre_redaction_canaries_utf8": [],
+      "notes": "The intact first ref is also omitted from fallback because partial ref sets are never emitted."
+    },
+    {
+      "id": "provider_failure_before_publication",
+      "covers": ["provider_failure"],
+      "owner": {
+        "primary": "provider",
+        "supporting": ["host"],
+        "invariant": "A failure before verified publication is observed only as full sanitized output with no ref."
+      },
+      "provider_observation": {
+        "state": "failed_before_publication",
+        "required_protected_refs_utf8": []
+      },
+      "canonical_sanitized_envelope_utf8": "safe provider input line 001\nsafe provider input line 002\ncomplete",
+      "candidate_stages": [],
+      "expected": {
+        "decision": "full_sanitized_fallback",
+        "selected_source": "canonical_sanitized_envelope",
+        "protected_refs_utf8": []
+      },
+      "forbidden_pre_redaction_canaries_utf8": [],
+      "notes": "Persistence details are provider-owned; the vector models only the host-visible failure observation."
+    },
+    {
+      "id": "malformed_or_unverified_metadata",
+      "covers": ["malformed_or_unverified_metadata"],
+      "owner": {
+        "primary": "host",
+        "supporting": ["provider", "consumer"],
+        "invariant": "Unusable publication metadata never becomes a required or returned recovery ref."
+      },
+      "provider_observation": {
+        "state": "unusable_metadata",
+        "required_protected_refs_utf8": []
+      },
+      "canonical_sanitized_envelope_utf8": "safe verification input line 001\nsafe verification input line 002\ncomplete",
+      "candidate_stages": [
+        {
+          "kind": "post_lossy_transform",
+          "model_visible_copy_utf8": "safe verification input line 001\ncomplete",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "unverified",
+            "recovery_refs_utf8": ["synrec:v1:unverified-fixture-012"],
+            "other_semantic_entries": []
+          }
+        }
+      ],
+      "expected": {
+        "decision": "full_sanitized_fallback",
+        "selected_source": "canonical_sanitized_envelope",
+        "protected_refs_utf8": []
+      },
+      "forbidden_pre_redaction_canaries_utf8": [],
+      "notes": "The consumer does not reinterpret unverified metadata into a usable ref."
+    },
+    {
+      "id": "json_string_envelope",
+      "covers": ["json_string_envelope"],
+      "owner": {
+        "primary": "consumer",
+        "supporting": ["host"],
+        "invariant": "A JSON string remains an envelope byte sequence while protected metadata stays out-of-band."
+      },
+      "provider_observation": {
+        "state": "published",
+        "required_protected_refs_utf8": ["synrec:v1:fixture-json-string-013"]
+      },
+      "canonical_sanitized_envelope_utf8": "\"line 001\\nline 002\\nline 003\\ncomplete\"",
+      "candidate_stages": [
+        {
+          "kind": "post_lossy_transform",
+          "model_visible_copy_utf8": "\"line 001\\n[noisegate: synthetic omission]\\ncomplete\"",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "well_formed",
+            "recovery_refs_utf8": ["synrec:v1:fixture-json-string-013"],
+            "other_semantic_entries": []
+          }
+        }
+      ],
+      "expected": {
+        "decision": "accept_candidate",
+        "selected_source": "last_candidate_stage",
+        "protected_refs_utf8": ["synrec:v1:fixture-json-string-013"]
+      },
+      "forbidden_pre_redaction_canaries_utf8": [],
+      "notes": "No upstream JSON field name is assumed by this semantic envelope fixture."
+    },
+    {
+      "id": "structured_terminal_process_json",
+      "covers": ["structured_terminal_process_json"],
+      "owner": {
+        "primary": "consumer",
+        "supporting": ["host"],
+        "invariant": "Eligible diagnostic text may compact without coupling recovery metadata to object fields."
+      },
+      "provider_observation": {
+        "state": "published",
+        "required_protected_refs_utf8": ["synrec:v1:fixture-structured-014"]
+      },
+      "canonical_sanitized_envelope_utf8": "{\"command\":\"synthetic build\",\"stdout\":\"step 001\\nstep 002\\nstep 003\",\"stderr\":\"\",\"exit_code\":0}",
+      "candidate_stages": [
+        {
+          "kind": "post_lossy_transform",
+          "model_visible_copy_utf8": "{\"command\":\"synthetic build\",\"stdout\":\"step 001\\n[noisegate: synthetic omission]\\nstep 003\",\"stderr\":\"\",\"exit_code\":0}",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "well_formed",
+            "recovery_refs_utf8": ["synrec:v1:fixture-structured-014"],
+            "other_semantic_entries": []
+          }
+        }
+      ],
+      "expected": {
+        "decision": "accept_candidate",
+        "selected_source": "last_candidate_stage",
+        "protected_refs_utf8": ["synrec:v1:fixture-structured-014"]
+      },
+      "forbidden_pre_redaction_canaries_utf8": [],
+      "notes": "Terminal/process-like fields are fixture content, not frozen host API names."
+    },
+    {
+      "id": "oversized_output_normal_budget",
+      "covers": ["oversized_normal_budget"],
+      "owner": {
+        "primary": "consumer",
+        "supporting": ["host"],
+        "invariant": "A normal lossy budget can reduce oversized visible output while preserving the exact ref."
+      },
+      "provider_observation": {
+        "state": "published",
+        "required_protected_refs_utf8": ["synrec:v1:fixture-oversized-015"]
+      },
+      "canonical_sanitized_envelope_utf8": "progress 001\nprogress 002\nprogress 003\nprogress 004\nprogress 005\nprogress 006\nprogress 007\nprogress 008\nprogress complete",
+      "candidate_stages": [
+        {
+          "kind": "post_lossy_transform",
+          "model_visible_copy_utf8": "progress 001\n[noisegate: synthetic omission of 7 lines]\nprogress complete",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "well_formed",
+            "recovery_refs_utf8": ["synrec:v1:fixture-oversized-015"],
+            "other_semantic_entries": []
+          }
+        },
+        {
+          "kind": "post_final_budget",
+          "model_visible_copy_utf8": "progress 001\n[noisegate: synthetic omission of 7 lines]\nprogress complete",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "well_formed",
+            "recovery_refs_utf8": ["synrec:v1:fixture-oversized-015"],
+            "other_semantic_entries": []
+          }
+        }
+      ],
+      "expected": {
+        "decision": "accept_candidate",
+        "selected_source": "last_candidate_stage",
+        "protected_refs_utf8": ["synrec:v1:fixture-oversized-015"]
+      },
+      "forbidden_pre_redaction_canaries_utf8": [],
+      "notes": "The host validates protected metadata after both modeled stages."
+    },
+    {
+      "id": "oversized_output_extremely_small_budget",
+      "covers": ["extremely_small_budget"],
+      "owner": {
+        "primary": "host",
+        "supporting": ["consumer"],
+        "invariant": "A final budget too small for the exact ref must yield the unbudgeted full-sanitized fallback."
+      },
+      "provider_observation": {
+        "state": "published",
+        "required_protected_refs_utf8": ["synrec:v1:fixture-tiny-016"]
+      },
+      "canonical_sanitized_envelope_utf8": "tiny budget line 001\ntiny budget line 002\ntiny budget line 003\ncomplete",
+      "candidate_stages": [
+        {
+          "kind": "post_lossy_transform",
+          "model_visible_copy_utf8": "tiny budget line 001\ncomplete",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "well_formed",
+            "recovery_refs_utf8": ["synrec:v1:fixture-tiny-016"],
+            "other_semantic_entries": []
+          }
+        },
+        {
+          "kind": "post_final_budget",
+          "model_visible_copy_utf8": "complete",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "absent",
+            "recovery_refs_utf8": [],
+            "other_semantic_entries": []
+          }
+        }
+      ],
+      "expected": {
+        "decision": "full_sanitized_fallback",
+        "selected_source": "canonical_sanitized_envelope",
+        "protected_refs_utf8": []
+      },
+      "forbidden_pre_redaction_canaries_utf8": [],
+      "notes": "The canonical fallback is not truncated to make a recovery notice fit."
+    },
+    {
+      "id": "protected_tool_unchanged",
+      "covers": ["protected_tool_unchanged"],
+      "owner": {
+        "primary": "consumer",
+        "supporting": ["host"],
+        "invariant": "An exact/protected result keeps its model-visible bytes unchanged."
+      },
+      "provider_observation": {
+        "state": "published",
+        "required_protected_refs_utf8": ["synrec:v1:fixture-protected-017"]
+      },
+      "canonical_sanitized_envelope_utf8": "diff --git a/example.txt b/example.txt\n-old exact line\n+new exact line",
+      "candidate_stages": [
+        {
+          "kind": "post_lossy_transform",
+          "model_visible_copy_utf8": "diff --git a/example.txt b/example.txt\n-old exact line\n+new exact line",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "well_formed",
+            "recovery_refs_utf8": ["synrec:v1:fixture-protected-017"],
+            "other_semantic_entries": []
+          }
+        }
+      ],
+      "expected": {
+        "decision": "accept_candidate",
+        "selected_source": "last_candidate_stage",
+        "protected_refs_utf8": ["synrec:v1:fixture-protected-017"]
+      },
+      "forbidden_pre_redaction_canaries_utf8": [],
+      "notes": "Acceptance here means unchanged delivery, not permission to compact a protected tool."
+    },
+    {
+      "id": "unknown_future_tool_fail_open",
+      "covers": ["unknown_tool_fail_open"],
+      "owner": {
+        "primary": "consumer",
+        "supporting": ["host"],
+        "invariant": "An unknown future tool remains exact by default while metadata stays protected."
+      },
+      "provider_observation": {
+        "state": "published",
+        "required_protected_refs_utf8": ["synrec:v1:fixture-unknown-018"]
+      },
+      "canonical_sanitized_envelope_utf8": "unknown-tool exact synthetic result\nline 002\nline 003",
+      "candidate_stages": [
+        {
+          "kind": "post_lossy_transform",
+          "model_visible_copy_utf8": "unknown-tool exact synthetic result\nline 002\nline 003",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "well_formed",
+            "recovery_refs_utf8": ["synrec:v1:fixture-unknown-018"],
+            "other_semantic_entries": []
+          }
+        }
+      ],
+      "expected": {
+        "decision": "accept_candidate",
+        "selected_source": "last_candidate_stage",
+        "protected_refs_utf8": ["synrec:v1:fixture-unknown-018"]
+      },
+      "forbidden_pre_redaction_canaries_utf8": [],
+      "notes": "No unknown tool identity or field is promoted into the compactable allowlist."
+    },
+    {
+      "id": "pre_redaction_canary_excluded",
+      "covers": ["pre_redaction_canary_excluded"],
+      "owner": {
+        "primary": "host",
+        "supporting": ["provider", "consumer"],
+        "invariant": "Sanitization removes the synthetic canary before the canonical envelope and consumer boundary."
+      },
+      "provider_observation": {
+        "state": "absent",
+        "required_protected_refs_utf8": []
+      },
+      "canonical_sanitized_envelope_utf8": "sanitized field=[removed before preservation]\noperation complete",
+      "candidate_stages": [
+        {
+          "kind": "post_lossy_transform",
+          "model_visible_copy_utf8": "sanitized field=[removed before preservation]\noperation complete",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "absent",
+            "recovery_refs_utf8": [],
+            "other_semantic_entries": []
+          }
+        }
+      ],
+      "expected": {
+        "decision": "accept_candidate",
+        "selected_source": "last_candidate_stage",
+        "protected_refs_utf8": []
+      },
+      "forbidden_pre_redaction_canaries_utf8": [
+        "SYNTHETIC_PRE_REDACTION_CANARY_CASE_019"
+      ],
+      "notes": "The vector declares the pre-sanitization canary only in the forbidden-canary control slot."
+    },
+    {
+      "id": "noisegate_artifact_metadata_coexists",
+      "covers": ["noisegate_artifact_metadata_distinct"],
+      "owner": {
+        "primary": "consumer",
+        "supporting": ["host", "provider"],
+        "invariant": "Existing opt-in Noisegate artifact metadata remains a distinct semantic slot from provider refs."
+      },
+      "provider_observation": {
+        "state": "published",
+        "required_protected_refs_utf8": ["synrec:v1:fixture-coexist-020"]
+      },
+      "canonical_sanitized_envelope_utf8": "artifact-compatible line 001\nartifact-compatible line 002\ncomplete",
+      "candidate_stages": [
+        {
+          "kind": "post_lossy_transform",
+          "model_visible_copy_utf8": "artifact-compatible line 001\ncomplete",
+          "protected_structured_metadata": {
+            "recovery_metadata_state": "well_formed",
+            "recovery_refs_utf8": ["synrec:v1:fixture-coexist-020"],
+            "other_semantic_entries": [
+              {
+                "semantic_slot": "existing_noisegate_opt_in_artifact_metadata",
+                "value_utf8": "synthetic-artifact-id:ng_fixture_only_012345"
+              }
+            ]
+          }
+        }
+      ],
+      "expected": {
+        "decision": "accept_candidate",
+        "selected_source": "last_candidate_stage",
+        "protected_refs_utf8": ["synrec:v1:fixture-coexist-020"]
+      },
+      "forbidden_pre_redaction_canaries_utf8": [],
+      "notes": "The consumer does not reinterpret, replace, or merge either recovery mechanism."
+    }
+  ]
+}
