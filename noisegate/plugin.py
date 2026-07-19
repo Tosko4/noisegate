@@ -1023,6 +1023,14 @@ def _transform_terminal_output_with_budget(
                 exit_code = positional[2]
         if not isinstance(output, str):
             return None
+        # This pre-envelope hook may receive a complete machine-readable document;
+        # preserve strict JSON exactly rather than reducing it as generic text.
+        try:
+            strict_json_loads(output)
+        except json.JSONDecodeError:
+            pass
+        else:
+            return None
         options = NoisegateOptions.from_env().with_mapping(kwargs)
         # Hermes calls transform_terminal_output before its built-in terminal
         # redaction pass. Inline compaction is still safe because Hermes redacts

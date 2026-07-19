@@ -4,6 +4,10 @@ All notable changes to Noisegate are documented here. Release notes are generate
 
 ## [Unreleased]
 
+### Fixed
+
+- Complete strict JSON documents crossing the early Hermes terminal-output hook now stay exact instead of being compacted as generic text.
+
 ## [0.3.0] - 2026-07-15
 
 Noisegate 0.3.0 gets much better at telling noisy execution apart from evidence an agent must be able to trust. Background process logs and oversized write diagnostics can now shrink without flattening process state, generated source, patches, or structured metadata. At the same time, MCP and memory-retrieval paths are handled more conservatively: when ownership or content is ambiguous, Noisegate keeps its hands off.

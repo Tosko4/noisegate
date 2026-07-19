@@ -66,6 +66,7 @@ And it refuses to touch things that should stay exact:
 - skill documents
 - memory, LCM, Hindsight, MCP, search, and web extraction results
 - terminal retrieval output from LCM, Hindsight, memory, and session-search commands, including path-qualified retrieval helpers
+- complete strict JSON documents crossing the early terminal-output hook
 - unknown future tools unless explicitly allowed
 
 That last bit matters. A compactor that damages retrieved context is worse than no compactor.

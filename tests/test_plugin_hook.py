@@ -56,6 +56,41 @@ def terminal_result(stdout: str, *, command: str = "pytest", exit_code: int = 0)
     )
 
 
+def coding_agent_result_document(subtype: str) -> str:
+    assert subtype in {"success", "error_max_turns"}
+    payload: dict[str, Any] = {
+        "type": "result",
+        "subtype": subtype,
+        "is_error": subtype != "success",
+        "duration_ms": 12_345,
+        "duration_api_ms": 12_000,
+        "num_turns": 8,
+        "session_id": "session-regression-42",
+        "total_cost_usd": 0.0123,
+        "usage": {"input_tokens": 1_200, "output_tokens": 800},
+    }
+    if subtype == "success":
+        payload["result"] = "Coding-agent result: implementation complete. "
+    else:
+        payload["errors"] = [
+            "Reached the maximum number of turns.",
+            "Coding-agent partial result: implementation incomplete. ",
+        ]
+
+    target_bytes = 14_836 if subtype == "success" else 14_837
+    unpadded = json.dumps(payload, separators=(",", ":"))
+    padding_size = target_bytes - len(unpadded.encode("utf-8"))
+    assert padding_size > 0
+    if subtype == "success":
+        payload["result"] += "x" * padding_size
+    else:
+        payload["errors"][-1] += "x" * padding_size
+
+    document = json.dumps(payload, separators=(",", ":"))
+    assert len(document.encode("utf-8")) == target_bytes
+    return document
+
+
 def parse_hook_result(value: str | None) -> dict[str, Any]:
     assert isinstance(value, str)
     parsed = json.loads(value)
@@ -3808,6 +3843,125 @@ def test_noisegate_mode_off_returns_none() -> None:
     raw = terminal_result(numbered("stdout", 80))
 
     assert transform_tool_result(raw, tool_name="terminal", noisegate_mode="off") is None
+
+
+def test_transform_terminal_output_preserves_strict_json_coding_agent_results() -> None:
+    transformed_cases: list[tuple[str, str]] = []
+    for subtype in ("success", "error_max_turns"):
+        document = coding_agent_result_document(subtype)
+        assert json.loads(document)["subtype"] == subtype
+
+        keyword_result = transform_terminal_output(
+            command="coding-agent",
+            output=document,
+            returncode=0,
+            noisegate_max_chars=4_000,
+        )
+        positional_result = transform_terminal_output(
+            "coding-agent",
+            document,
+            0,
+            noisegate_max_chars=4_000,
+        )
+        if keyword_result is not None:
+            transformed_cases.append((subtype, "keyword"))
+        if positional_result is not None:
+            transformed_cases.append((subtype, "positional"))
+
+    assert transformed_cases == []
+
+
+def test_transform_tool_result_structured_json_terminal_envelope_stays_exact() -> None:
+    for subtype in ("success", "error_max_turns"):
+        document = coding_agent_result_document(subtype)
+        envelope = terminal_result(document, command="coding-agent")
+
+        assert (
+            transform_tool_result(
+                envelope,
+                tool_name="terminal",
+                noisegate_max_chars=4_000,
+            )
+            is None
+        ), subtype
+        assert json.loads(envelope)["stdout"] == document
+
+
+def test_transform_terminal_output_preserves_strict_json_array_document() -> None:
+    array = [
+        {"index": index, "result": "coding-agent detail " + ("x" * 64)}
+        for index in range(180)
+    ]
+    document = " \n" + json.dumps(array, separators=(",", ":")) + "\t "
+    assert isinstance(json.loads(document), list)
+
+    assert (
+        transform_terminal_output(
+            command="coding-agent",
+            output=document,
+            returncode=0,
+            noisegate_max_chars=4_000,
+        )
+        is None
+    )
+
+
+def test_transform_terminal_output_structured_json_guard_keeps_plain_text_compactable() -> None:
+    output = numbered("ordinary coding-agent progress", 300)
+
+    transformed = transform_terminal_output(
+        command="coding-agent",
+        output=output,
+        returncode=0,
+        noisegate_max_chars=300,
+        noisegate_max_lines=10,
+        noisegate_head_lines=2,
+        noisegate_tail_lines=2,
+    )
+
+    assert isinstance(transformed, str)
+    assert len(transformed) < len(output)
+    assert "[noisegate: omitted" in transformed
+
+
+def test_transform_terminal_output_structured_json_guard_keeps_malformed_text_compactable() -> None:
+    output = '{"type":"result","subtype":"success","result":"' + ("x" * 10_000)
+
+    transformed = transform_terminal_output(
+        command="coding-agent",
+        output=output,
+        returncode=0,
+        noisegate_max_chars=300,
+    )
+
+    assert isinstance(transformed, str)
+    assert len(transformed) < len(output)
+    assert "[noisegate: omitted" in transformed
+
+
+def test_transform_terminal_output_structured_json_guard_keeps_jsonl_compactable() -> None:
+    output = "\n".join(
+        json.dumps(
+            {"event": "progress", "index": index, "detail": "x" * 64},
+            separators=(",", ":"),
+        )
+        for index in range(180)
+    )
+    assert all(isinstance(json.loads(line), dict) for line in output.splitlines())
+
+    transformed = transform_terminal_output(
+        command="coding-agent --output-format stream-json",
+        output=output,
+        returncode=0,
+        noisegate_max_chars=300,
+        noisegate_max_lines=10,
+        noisegate_head_lines=2,
+        noisegate_tail_lines=2,
+    )
+
+    assert isinstance(transformed, str)
+    assert len(transformed) < len(output)
+    assert "[noisegate: omitted" in transformed
 
 
 def test_transform_terminal_output_helper_compacts_plain_text() -> None:
