@@ -4,9 +4,29 @@ All notable changes to Noisegate are documented here. Release notes are generate
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-19
+
+Noisegate 0.3.1 is a focused exact-output and contract release. It closes two small but important gaps where structured terminal evidence or Hermes session listings could be mistaken for generic noise, while keeping the existing fail-open and no-artifact defaults intact.
+
+The release also freezes a provider-neutral consumer contract and portable test vectors for future post-redaction lossless recovery. That is a contract and test pack, not a speculative production adapter: the Hermes host seam remains separately owned and must exist before Noisegate can consume it.
+
+### Highlights
+
+- **Strict JSON stays parseable.** A complete JSON document crossing the early terminal hook now passes through byte-exact instead of risking malformed head/tail output.
+- **Session listings stay evidence.** `hermes sessions list` and `hermes sessions browse` are now protected retrieval commands across supported wrappers and hook paths.
+- **Lossless recovery has a frozen target.** Portable vectors define ref integrity, stage ordering, exact fallback, canary containment, and artifact separation without coupling Noisegate to an unaccepted host API.
+- **Release tests travel better.** Artifact recovery tests no longer depend on the host's temporary-path length.
+
 ### Fixed
 
 - Complete strict JSON documents crossing the early Hermes terminal-output hook now stay exact instead of being compacted as generic text.
+- Preserve terminal output from `hermes sessions list` and `hermes sessions browse` as exact retrieval evidence while leaving session mutation and maintenance commands under their existing behavior.
+- Make artifact CLI and recovery tests independent of long pytest temporary roots without weakening recovery-notice budgets or artifact safety.
+
+### Documentation
+
+- Added the provider-neutral post-redaction lossless-recovery consumer contract, language-neutral fixtures, and a strict test-only truth-table validator.
+- Made contribution and incoming-review guidance explicitly risk-aware, with proportionate evidence requirements and stronger untrusted-code safety checks.
 
 ## [0.3.0] - 2026-07-15
 
