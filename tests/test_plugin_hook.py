@@ -3845,6 +3845,37 @@ def test_noisegate_mode_off_returns_none() -> None:
     assert transform_tool_result(raw, tool_name="terminal", noisegate_mode="off") is None
 
 
+def test_transform_terminal_output_disabled_skips_strict_json_parse(monkeypatch: Any) -> None:
+    document = coding_agent_result_document("success")
+    original_strict_json_loads = plugin.strict_json_loads
+    parse_calls = 0
+
+    def counting_strict_json_loads(value: str) -> object:
+        nonlocal parse_calls
+        parse_calls += 1
+        return original_strict_json_loads(value)
+
+    monkeypatch.setattr(plugin, "strict_json_loads", counting_strict_json_loads)
+
+    assert (
+        transform_terminal_output(
+            command="coding-agent",
+            output=document,
+            noisegate_mode="off",
+        )
+        is None
+    )
+
+    monkeypatch.setenv("NOISEGATE_DISABLE", "1")
+    assert transform_terminal_output(command="coding-agent", output=document) is None
+    monkeypatch.delenv("NOISEGATE_DISABLE")
+
+    monkeypatch.setenv("NOISEGATE", "off")
+    assert transform_terminal_output(command="coding-agent", output=document) is None
+
+    assert parse_calls == 0
+
+
 def test_transform_terminal_output_preserves_strict_json_coding_agent_results() -> None:
     transformed_cases: list[tuple[str, str]] = []
     for subtype in ("success", "error_max_turns"):
