@@ -4,6 +4,10 @@ All notable changes to Noisegate are documented here. Release notes are generate
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve complete direct `perseus-vault prepare` terminal output, including JSON envelopes, across both Hermes terminal hook paths while leaving maintenance and non-owning command text compactable.
+
 ## [0.3.1] - 2026-07-19
 
 Noisegate 0.3.1 is a focused exact-output and contract release. It closes two small but important gaps where structured terminal evidence or Hermes session listings could be mistaken for generic noise, while keeping the existing fail-open and no-artifact defaults intact.

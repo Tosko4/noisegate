@@ -664,6 +664,13 @@ def _reduce_text(
             command_class,
             reason="memory_retrieval_passthrough",
         )
+    if command_class == "perseus_prepare":
+        return _unchanged(
+            text,
+            "protected_perseus_prepare",
+            command_class,
+            reason="perseus_prepare_passthrough",
+        )
     if command_class == "patch":
         return _unchanged(text, "protected_patch", command_class, reason="patch_passthrough")
     if command_class == "file_read":
@@ -947,6 +954,8 @@ def classify_command(command: str | None, text: str, *, exit_code: int | None = 
     text_l = text.lower()
     command_variants = _command_intent_variants(command_s)
 
+    if _looks_like_perseus_prepare_command(command_s, exit_code=exit_code):
+        return "perseus_prepare"
     if _looks_like_memory_retrieval_command(command_s):
         return "memory_retrieval"
     if _is_source_search_command(
@@ -4172,6 +4181,54 @@ def _looks_secret_bearing_text(text: str) -> bool:
 def _contains_command(command: str, names: tuple[str, ...]) -> bool:
     tokens = re.split(r"[\s;&|()]+", command)
     return any(name in tokens for name in names)
+
+
+def _is_perseus_prepare_setup_segment(tokens: list[str]) -> bool:
+    return bool(
+        tokens
+        and Path(tokens[0]).name in {"cd", "export"}
+        and not any(_is_unquoted_shell_separator(token) for token in tokens)
+    )
+
+
+def _looks_like_perseus_prepare_command(
+    command: str,
+    *,
+    exit_code: int | None,
+) -> bool:
+    """Recognize direct, visible Perseus prepare output without phrase scanning."""
+
+    segments = _background_segments(command)
+    meaningful = [
+        (index, tokens)
+        for index, (_separator, tokens) in enumerate(segments)
+        if tokens and not _is_perseus_prepare_setup_segment(tokens)
+    ]
+    if len(meaningful) != 1:
+        return False
+    index, tokens = meaningful[0]
+    if any(later_tokens for _separator, later_tokens in segments[index + 1 :]):
+        return False
+    separator = segments[index][0]
+    if separator == "&&":
+        if exit_code != 0:
+            return False
+    elif separator not in {None, ";"}:
+        return False
+    if _tokens_hide_stdout_from_capture(tokens) or any(
+        _is_unquoted_shell_separator(token) for token in tokens
+    ):
+        return False
+
+    normalized = _memory_retrieval_execution_tokens(tokens)
+    shell_command = _shell_wrapped_command(normalized)
+    if shell_command is not None:
+        return _looks_like_perseus_prepare_command(shell_command, exit_code=exit_code)
+    return bool(
+        len(normalized) >= 2
+        and Path(normalized[0]).name.lower() == "perseus-vault"
+        and normalized[1].lower() == "prepare"
+    )
 
 
 def _looks_like_memory_retrieval_command(command: str) -> bool:

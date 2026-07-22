@@ -17,7 +17,7 @@ Noisegate exists to improve agent context value, not to make output shorter at a
 - [ ] Write/patch-like JSON results may compact only explicitly allowlisted diagnostic string fields; source-bearing and unknown fields, including `content`, `source`, `diff`, and `patch`, remain exact as parsed values.
 - [ ] Field-value exactness is not described as byte-for-byte outer-envelope preservation: once a diagnostic compacts, JSON serialization may normalize and collision-safe Noisegate metadata is added.
 - [ ] Direct string write/patch results, short/no-gain diagnostics, unsupported or nested-JSON diagnostic values, invalid or duplicate-key JSON, and ambiguous tool identities fail open unchanged.
-- [ ] Terminal LCM/Hindsight/memory/session retrieval commands stay exact, while maintenance, indexing, and retry progress remains eligible for compaction.
+- [ ] Terminal LCM/Hindsight/memory/session retrieval commands and direct `perseus-vault prepare` output stay exact, while maintenance, indexing, and retry progress remains eligible for compaction.
 - [ ] Complete strict JSON documents crossing `transform_terminal_output` stay exact without schema-specific recognition.
 - [ ] If a command mixes source inspection with words like `ERROR` or `failed`, Noisegate does not reinterpret that source as a build/test failure.
 
