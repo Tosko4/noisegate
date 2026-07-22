@@ -78,7 +78,14 @@ PROCESS_TEXT_FIELDS = (
     "output_preview",
 )
 ALWAYS_PROTECTED_COMMAND_CLASSES = frozenset(
-    {"file_read", "source_search", "patch", "systemctl_show", "memory_retrieval"}
+    {
+        "file_read",
+        "source_search",
+        "patch",
+        "systemctl_show",
+        "memory_retrieval",
+        "perseus_prepare",
+    }
 )
 CONDITIONALLY_PROTECTED_COMMAND_CLASSES = frozenset({"git_diff"})
 EXACT_COMMAND_CLASSES = (
