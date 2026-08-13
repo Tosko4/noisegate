@@ -189,19 +189,40 @@ def _python_from_pip_polyglot_launcher(executable: Path, text: str) -> str | Non
     lines = text.splitlines()
     if len(lines) < 4 or lines[2].strip() != "' '''":
         return None
+    exec_line = lines[1].strip()
+    if not exec_line.startswith("'''exec' "):
+        return None
     for python_name in ("python3", "python"):
         expected_exec = (
             "'''exec' \"$(dirname -- \"$(realpath -- \"$0\")\")\"/"
             f"'{python_name}' \"$0\" \"$@\""
         )
-        if lines[1].strip() != expected_exec:
+        if exec_line != expected_exec:
             continue
         candidate = executable.parent / python_name
         if not candidate.exists():
             return None
         _validate_hermes_python_body(executable, "\n".join(lines[3:]))
         return _validated_python_command(str(candidate))
-    return None
+
+    if not exec_line.endswith(' "$0" "$@"'):
+        return None
+    try:
+        tokens = shlex.split(exec_line)
+    except ValueError:
+        return None
+    if len(tokens) != 4 or tokens[0] != "exec" or tokens[2:] != ["$0", "$@"]:
+        return None
+    candidate = Path(tokens[1])
+    if (
+        not candidate.is_absolute()
+        or candidate.parent != executable.parent
+        or not _looks_like_python(str(candidate))
+        or not candidate.exists()
+    ):
+        return None
+    _validate_hermes_python_body(executable, "\n".join(lines[3:]))
+    return _validated_python_command(str(candidate))
 
 
 def _shell_exec_command(
