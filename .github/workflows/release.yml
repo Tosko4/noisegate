@@ -7,6 +7,11 @@ on:
         description: Semantic version to release, e.g. 0.2.0
         required: true
         type: string
+      recovery:
+        description: Publish an existing frozen tag without changing its tag or GitHub Release
+        required: true
+        default: false
+        type: boolean
   push:
     tags:
       - 'v*'
@@ -36,6 +41,32 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set release variables
+        id: release-vars
+        env:
+          RELEASE_REF: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          echo "tag=v${RELEASE_REF#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout frozen recovery tag
+        if: inputs.recovery == true
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.release-vars.outputs.tag }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify frozen recovery release
+        if: inputs.recovery == true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release-vars.outputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "$TAG^{commit}")"
+          gh release view "$TAG" >/dev/null
+
       - name: Install uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
 
@@ -51,14 +82,6 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --locked --group dev
-
-      - name: Set release variables
-        id: release-vars
-        env:
-          RELEASE_REF: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
-        run: |
-          set -euo pipefail
-          echo "tag=v${RELEASE_REF#v}" >> "$GITHUB_OUTPUT"
 
       - name: Validate release metadata
         env:
@@ -90,7 +113,7 @@ jobs:
           if-no-files-found: error
 
       - name: Create release tag for manual release
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.recovery != true
         env:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
@@ -116,6 +139,7 @@ jobs:
           git push origin "$TAG"
 
       - name: Build release notes
+        if: inputs.recovery != true
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -126,6 +150,7 @@ jobs:
           uv run python scripts/build_release_notes.py "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --output dist/release-notes.md
 
       - name: Publish GitHub Release
+        if: inputs.recovery != true
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_REF: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.version }}
