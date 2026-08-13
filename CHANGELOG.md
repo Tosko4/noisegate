@@ -7,6 +7,7 @@ All notable changes to Noisegate are documented here. Release notes are generate
 ### Fixed
 
 - Preserve complete direct `perseus-vault prepare` terminal output, including JSON envelopes, across both Hermes terminal hook paths while leaving maintenance and non-owning command text compactable.
+- Accept the standard pip/uv polyglot Hermes launcher while still requiring its exact adjacent-venv Python shape and a validated embedded Hermes entrypoint.
 
 ## [0.3.1] - 2026-07-19
 

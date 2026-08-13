@@ -10,7 +10,7 @@ Noisegate itself is a Python Hermes Agent plugin and CLI. The Python package is 
 npx -p noisegate-hermes noisegate install-hermes
 ```
 
-Use the same command for first install and updates. It finds `hermes` on `PATH`, verifies the launcher resolves to a Hermes Python console script or supported Hermes shim inside a virtual environment, installs the matching `noisegate-hermes` Python package there, enables the `noisegate` plugin, removes any stale disabled entry, and runs `noisegate doctor`. Native Windows launchers are opaque binaries, so Noisegate validates those by requiring an adjacent virtual-environment Python.
+Use the same command for first install and updates. It finds `hermes` on `PATH`, verifies the launcher resolves to a Hermes Python console script or supported Hermes shim inside a virtual environment (including the standard pip/uv polyglot shim), installs the matching `noisegate-hermes` Python package there, enables the `noisegate` plugin, removes any stale disabled entry, and runs `noisegate doctor`. Native Windows launchers are opaque binaries, so Noisegate validates those by requiring an adjacent virtual-environment Python.
 
 Preview the exact commands first. Dry-run mode does not run the install/enable/doctor commands and does not restart or reload Hermes:
 
