@@ -533,6 +533,24 @@ def test_manual_release_workflow_respects_protected_main() -> None:
     assert "git push origin \"$TAG\"" in text
 
 
+def test_release_recovery_reuses_frozen_tag_without_mutating_release() -> None:
+    root = Path(__file__).resolve().parents[1]
+    text = (root / ".github" / "workflows" / "release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "recovery:" in text
+    checkout_tag = text.index("Checkout frozen recovery tag")
+    install_uv = text.index("Install uv")
+    install_dependencies = text.index("Install dependencies")
+    assert checkout_tag < install_uv < install_dependencies
+    assert "ref: ${{ steps.release-vars.outputs.tag }}" in text
+    assert "if: inputs.recovery != true" in text
+    assert "if: inputs.recovery == true" in text
+    assert 'test "$(git rev-parse HEAD)" = "$(git rev-parse "$TAG^{commit}")"' in text
+    assert 'gh release view "$TAG"' in text
+
+
 
 def test_npm_oidc_publish_uses_supported_node_version() -> None:
     root = Path(__file__).resolve().parents[1]
