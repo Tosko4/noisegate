@@ -159,6 +159,9 @@ def _python_from_launcher(executable: Path, *, seen: set[Path] | None = None) ->
 
 
 def _python_from_shell_launcher(executable: Path, text: str, *, seen: set[Path]) -> str:
+    polyglot_python = _python_from_pip_polyglot_launcher(executable, text)
+    if polyglot_python is not None:
+        return polyglot_python
     assignments = _shell_assignments(text)
     for line in text.splitlines():
         stripped = line.strip()
@@ -180,6 +183,25 @@ def _python_from_shell_launcher(executable: Path, text: str, *, seen: set[Path])
         if target is not None and target.exists():
             return _python_from_launcher(target, seen=seen)
     raise InstallHermesError(f"Unsupported Hermes shell launcher: {executable}")
+
+
+def _python_from_pip_polyglot_launcher(executable: Path, text: str) -> str | None:
+    lines = text.splitlines()
+    if len(lines) < 4 or lines[2].strip() != "' '''":
+        return None
+    for python_name in ("python3", "python"):
+        expected_exec = (
+            "'''exec' \"$(dirname -- \"$(realpath -- \"$0\")\")\"/"
+            f"'{python_name}' \"$0\" \"$@\""
+        )
+        if lines[1].strip() != expected_exec:
+            continue
+        candidate = executable.parent / python_name
+        if not candidate.exists():
+            return None
+        _validate_hermes_python_body(executable, "\n".join(lines[3:]))
+        return _validated_python_command(str(candidate))
+    return None
 
 
 def _shell_exec_command(
@@ -238,6 +260,10 @@ def _shell_exec_command(
 
 def _validate_hermes_python_console_launcher(executable: Path, text: str) -> None:
     body = "\n".join(text.splitlines()[1:])
+    _validate_hermes_python_body(executable, body)
+
+
+def _validate_hermes_python_body(executable: Path, body: str) -> None:
     try:
         tree = ast.parse(body)
     except SyntaxError as exc:

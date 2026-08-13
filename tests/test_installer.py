@@ -373,6 +373,98 @@ def test_build_install_hermes_plan_supports_bash_shim_to_python(
     assert plan.hermes_python == "/opt/hermes/.venv/bin/python3"
 
 
+@pytest.mark.parametrize("python_name", ["python3", "python"])
+def test_build_install_hermes_plan_supports_pip_polyglot_shim(
+    tmp_path: Path,
+    python_name: str,
+) -> None:
+    venv = tmp_path / "hermes-runtime"
+    bin_dir = venv / "bin"
+    bin_dir.mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    python = bin_dir / python_name
+    python.write_bytes(b"")
+    hermes = bin_dir / "hermes"
+    hermes.write_text(
+        "#!/bin/sh\n"
+        f"'''exec' \"$(dirname -- \"$(realpath -- \"$0\")\")\"/'{python_name}' \"$0\" \"$@\"\n"
+        "' '''\n"
+        "# -*- coding: utf-8 -*-\n"
+        "import sys\n"
+        "from hermes_cli.main import main\n"
+        'if __name__ == "__main__":\n'
+        "    sys.exit(main())\n",
+        encoding="utf-8",
+    )
+
+    plan = build_install_hermes_plan(
+        hermes=str(hermes),
+        package_spec="noisegate-hermes==1.2.3",
+        installer="pip",
+    )
+
+    assert plan.hermes_python == str(python)
+    assert plan.install_command == [
+        str(python),
+        "-m",
+        "pip",
+        "install",
+        "noisegate-hermes==1.2.3",
+    ]
+
+
+@pytest.mark.parametrize(
+    "exec_line",
+    [
+        "'''exec' \"$(dirname -- \"$(realpath -- \"$0\")\")\"/'python3' \"$0\"",
+        "'''exec' \"$(dirname -- \"$(realpath -- \"$0\")\")\"/'../python3' \"$0\" \"$@\"",
+        "'''exec' \"$(dirname -- \"$(dirname -- \"$0\")\")\"/'python3' \"$0\" \"$@\"",
+    ],
+)
+def test_build_install_hermes_plan_rejects_polyglot_exec_lookalikes(
+    tmp_path: Path,
+    exec_line: str,
+) -> None:
+    venv = tmp_path / "venv"
+    bin_dir = venv / "bin"
+    bin_dir.mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    (bin_dir / "python3").write_bytes(b"")
+    hermes = bin_dir / "hermes"
+    hermes.write_text(
+        "#!/bin/sh\n"
+        f"{exec_line}\n"
+        "' '''\n"
+        "from hermes_cli.main import main\n"
+        "main()\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(InstallHermesError, match="Unsupported Hermes shell launcher"):
+        build_install_hermes_plan(hermes=str(hermes), installer="pip")
+
+
+def test_build_install_hermes_plan_rejects_non_hermes_polyglot_body(
+    tmp_path: Path,
+) -> None:
+    venv = tmp_path / "venv"
+    bin_dir = venv / "bin"
+    bin_dir.mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    (bin_dir / "python3").write_bytes(b"")
+    hermes = bin_dir / "hermes"
+    hermes.write_text(
+        "#!/bin/sh\n"
+        "'''exec' \"$(dirname -- \"$(realpath -- \"$0\")\")\"/'python3' \"$0\" \"$@\"\n"
+        "' '''\n"
+        "print('not Hermes')\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(InstallHermesError, match="not a Hermes Python console script"):
+        build_install_hermes_plan(hermes=str(hermes), installer="pip")
+
+
 def test_build_install_hermes_plan_rejects_absolute_system_python_shebang(
     tmp_path: Path,
 ) -> None:

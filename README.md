@@ -90,9 +90,7 @@ Most users want this:
 uvx --from noisegate-hermes noisegate install-hermes
 ```
 
-Use the same command for first install and updates.
-
-It finds `hermes` on `PATH`, verifies that the launcher points at a Hermes Python console script or supported Hermes shim inside a virtual environment, installs `noisegate-hermes` there, enables the `noisegate` plugin, removes any stale `plugins.disabled` entry for `noisegate`, and runs `noisegate doctor`. Native Windows launchers are opaque binaries, so Noisegate validates those by requiring an adjacent virtual-environment Python.
+Use the same command for first install and updates. It finds `hermes` on `PATH`, verifies that the launcher points at a Hermes Python console script or supported Hermes shim inside a virtual environment (including the standard pip/uv polyglot shim), installs `noisegate-hermes` there, enables the `noisegate` plugin, removes any stale `plugins.disabled` entry for `noisegate`, and runs `noisegate doctor`. Native Windows launchers are opaque binaries, so Noisegate validates those by requiring an adjacent virtual-environment Python.
 
 Preview the exact commands first. Dry-run mode does not run the install/enable/doctor commands and does not restart or reload Hermes:
 
