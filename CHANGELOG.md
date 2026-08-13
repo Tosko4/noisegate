@@ -4,6 +4,12 @@ All notable changes to Noisegate are documented here. Release notes are generate
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-08-13
+
+Noisegate 0.3.2 is a small compatibility release for real Hermes installations. It preserves complete Perseus Vault preparation evidence and fixes `install-hermes` for standard pip/uv polyglot launchers without widening the shell parser.
+
+@prismatic7: please update to 0.3.2 and rerun `noisegate install-hermes --dry-run` in the pip/uv environment from #46. If that looks correct, please run the normal installer and confirm `noisegate doctor` passes.
+
 ### Fixed
 
 - Preserve complete direct `perseus-vault prepare` terminal output, including JSON envelopes, across both Hermes terminal hook paths while leaving maintenance and non-owning command text compactable.
