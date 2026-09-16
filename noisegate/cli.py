@@ -181,7 +181,32 @@ def _cmd_reduce_json_with_budget(args: argparse.Namespace, raw: str) -> int:
 
     options = _options_from_args(args)
     if isinstance(parsed, dict) and isinstance(parsed.get("noisegate"), dict):
-        options = options.with_mapping(parsed["noisegate"])
+        raw_mapping = parsed["noisegate"]
+        if isinstance(raw_mapping, dict):
+            # Trust boundary: envelope is untrusted — drop artifact/security keys
+            # Only allow inert compaction knobs from the piped JSON; artifacts
+            # must be enabled via CLI/env (contract §5).
+            blocked_keys = {
+                "artifacts",
+                "artifact_enabled",
+                "store_artifact",
+                "artifact_dir",
+                "artifact_size_cap",
+                "enabled",
+                "mode",
+                "bypass",
+                "raw",
+                "disable",
+            }
+            filtered: dict[str, object] = {}
+            for k, v in raw_mapping.items():
+                nk = str(k).strip().lower().replace("-", "_")
+                if nk.startswith("noisegate_"):
+                    nk = nk.removeprefix("noisegate_")
+                if nk not in blocked_keys:
+                    filtered[k] = v
+            if filtered:
+                options = options.with_mapping(filtered)
     metadata: dict[str, Any] = {}
     try:
         if options.artifact_enabled:
