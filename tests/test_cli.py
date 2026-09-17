@@ -211,6 +211,59 @@ def test_reduce_cli_metadata_stderr_failure_does_not_corrupt_stdout() -> None:
     assert not proc.stdout.endswith(raw)
 
 
+def test_reduce_json_ignores_untrusted_artifact_options(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "attacker-selected"
+    envelope = {
+        "tool_name": "terminal",
+        "args": {"command": "pytest -q"},
+        "result": json.dumps({"stdout": numbered("line", 100), "exit": 0}),
+        "noisegate": {
+            "max_chars": 120,
+            "artifacts": True,
+            "artifact_dir": str(artifact_dir),
+        },
+    }
+
+    proc = run_cli(
+        "reduce-json",
+        input_text=json.dumps(envelope),
+        env={"NOISEGATE_ARTIFACTS": "0"},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "[noisegate: omitted" in proc.stdout
+    assert not artifact_dir.exists()
+
+
+def test_reduce_json_allows_only_inert_envelope_options() -> None:
+    exact_diff = "\n".join(
+        [
+            "diff --git a/app.py b/app.py",
+            "--- a/app.py",
+            "+++ b/app.py",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new",
+            *[f"+exact diff line {index:03d}" for index in range(100)],
+        ]
+    )
+    envelope = {
+        "tool_name": "terminal",
+        "args": {"command": "python emit.py"},
+        "result": json.dumps({"stdout": exact_diff, "exit": 0}),
+        "noisegate": {
+            "max_chars": 120,
+            "preserve_diffs": False,
+            "mode": "off",
+        },
+    }
+
+    proc = run_cli("reduce-json", input_text=json.dumps(envelope))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == envelope
+
+
 def test_reduce_json_rewrites_result_field() -> None:
     envelope = {
         "tool_name": "terminal",

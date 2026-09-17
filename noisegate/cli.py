@@ -183,28 +183,23 @@ def _cmd_reduce_json_with_budget(args: argparse.Namespace, raw: str) -> int:
     if isinstance(parsed, dict) and isinstance(parsed.get("noisegate"), dict):
         raw_mapping = parsed["noisegate"]
         if isinstance(raw_mapping, dict):
-            # Trust boundary: envelope is untrusted — drop artifact/security keys
-            # Only allow inert compaction knobs from the piped JSON; artifacts
-            # must be enabled via CLI/env (contract §5).
-            blocked_keys = {
-                "artifacts",
-                "artifact_enabled",
-                "store_artifact",
-                "artifact_dir",
-                "artifact_size_cap",
-                "enabled",
-                "mode",
-                "bypass",
-                "raw",
-                "disable",
+            # The envelope is untrusted. Keep this as a positive allowlist so a
+            # future security-sensitive option cannot become payload-controlled.
+            inert_keys = {
+                "max_chars",
+                "max_lines",
+                "head_lines",
+                "tail_lines",
+                "important_context_lines",
+                "max_important_lines",
             }
             filtered: dict[str, object] = {}
-            for k, v in raw_mapping.items():
-                nk = str(k).strip().lower().replace("-", "_")
-                if nk.startswith("noisegate_"):
-                    nk = nk.removeprefix("noisegate_")
-                if nk not in blocked_keys:
-                    filtered[k] = v
+            for key, value in raw_mapping.items():
+                normalized = str(key).strip().lower().replace("-", "_")
+                if normalized.startswith("noisegate_"):
+                    normalized = normalized.removeprefix("noisegate_")
+                if normalized in inert_keys:
+                    filtered[key] = value
             if filtered:
                 options = options.with_mapping(filtered)
     metadata: dict[str, Any] = {}
