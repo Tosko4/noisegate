@@ -216,10 +216,14 @@ def _python_from_pip_polyglot_launcher(executable: Path, text: str) -> str | Non
     candidate = Path(tokens[1])
     if (
         not candidate.is_absolute()
-        or candidate.parent != executable.parent
         or not _looks_like_python(str(candidate))
         or not candidate.exists()
     ):
+        return None
+    try:
+        if candidate.parent.resolve() != executable.parent.resolve():
+            return None
+    except OSError:
         return None
     _validate_hermes_python_body(executable, "\n".join(lines[3:]))
     return _validated_python_command(str(candidate))

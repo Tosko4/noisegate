@@ -4,3 +4,4 @@ Noisegate keeps this list intentionally small and human-readable. CI checks git 
 
 - Stephen Schoettler
 - Tosko4
+- ether-btc
