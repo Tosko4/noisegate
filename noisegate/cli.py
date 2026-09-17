@@ -181,7 +181,27 @@ def _cmd_reduce_json_with_budget(args: argparse.Namespace, raw: str) -> int:
 
     options = _options_from_args(args)
     if isinstance(parsed, dict) and isinstance(parsed.get("noisegate"), dict):
-        options = options.with_mapping(parsed["noisegate"])
+        raw_mapping = parsed["noisegate"]
+        if isinstance(raw_mapping, dict):
+            # The envelope is untrusted. Keep this as a positive allowlist so a
+            # future security-sensitive option cannot become payload-controlled.
+            inert_keys = {
+                "max_chars",
+                "max_lines",
+                "head_lines",
+                "tail_lines",
+                "important_context_lines",
+                "max_important_lines",
+            }
+            filtered: dict[str, object] = {}
+            for key, value in raw_mapping.items():
+                normalized = str(key).strip().lower().replace("-", "_")
+                if normalized.startswith("noisegate_"):
+                    normalized = normalized.removeprefix("noisegate_")
+                if normalized in inert_keys:
+                    filtered[key] = value
+            if filtered:
+                options = options.with_mapping(filtered)
     metadata: dict[str, Any] = {}
     try:
         if options.artifact_enabled:
