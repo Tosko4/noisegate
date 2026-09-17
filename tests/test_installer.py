@@ -454,6 +454,44 @@ def test_build_install_hermes_plan_supports_distlib_absolute_polyglot_shim(
     ]
 
 
+def test_build_install_hermes_plan_supports_symlinked_venv_polyglot_shim(
+    tmp_path: Path,
+) -> None:
+    real_venv = tmp_path / "real-venv"
+    real_bin = real_venv / "bin"
+    real_bin.mkdir(parents=True)
+    (real_venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    (real_bin / "python3").write_bytes(b"")
+
+    venv_link = tmp_path / "venv link"
+    venv_link.symlink_to(real_venv, target_is_directory=True)
+    linked_python = venv_link / "bin" / "python3"
+    hermes = real_bin / "hermes"
+    hermes.write_text(
+        "#!/bin/sh\n"
+        f"'''exec' \"{linked_python}\" \"$0\" \"$@\"\n"
+        "' '''\n"
+        "from hermes_cli.main import main\n"
+        "main()\n",
+        encoding="utf-8",
+    )
+
+    plan = build_install_hermes_plan(
+        hermes=str(hermes),
+        package_spec="noisegate-hermes==1.2.3",
+        installer="pip",
+    )
+
+    assert plan.hermes_python == str(linked_python)
+    assert plan.install_command == [
+        str(linked_python),
+        "-m",
+        "pip",
+        "install",
+        "noisegate-hermes==1.2.3",
+    ]
+
+
 @pytest.mark.parametrize(
     "exec_line",
     [
