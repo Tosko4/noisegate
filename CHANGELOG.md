@@ -4,6 +4,25 @@ All notable changes to Noisegate are documented here. Release notes are generate
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-09-17
+
+Noisegate 0.3.3 closes two small but important real-world gaps. `install-hermes` now recognizes a valid distlib polyglot launcher when its virtualenv is reached through a symlink, while still rejecting different-venv and malformed lookalikes. `reduce-json` also restores the artifact trust boundary: piped documents can tune only inline compaction budgets and can no longer enable raw persistence or select artifact paths.
+
+The release path is sturdier too. PyPI metadata 2.5 is accepted, and a partially published immutable tag can be retried through the canonical trusted-publishing workflow without rebuilding or moving that tag.
+
+### Security
+
+- Prevent untrusted `reduce-json` envelopes from enabling artifact persistence, selecting artifact directories or caps, disabling protection, changing mode, or controlling future non-allowlisted options.
+
+### Fixed
+
+- Accept symlink-addressed virtualenvs for validated absolute pip/distlib polyglot Hermes launchers while preserving same-venv and fail-closed checks.
+
+### Release / Packaging
+
+- Accept PyPI metadata 2.5 in the release compatibility gate.
+- Support frozen-tag partial-release recovery through the canonical `release.yml` trusted-publisher identity.
+
 ## [0.3.2] - 2026-08-13
 
 Noisegate 0.3.2 is a small compatibility release for real Hermes installations. It preserves complete Perseus Vault preparation evidence and fixes `install-hermes` for standard pip/uv polyglot launchers without widening the shell parser.
